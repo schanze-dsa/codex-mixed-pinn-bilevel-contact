@@ -156,6 +156,102 @@ def _orthonormal_tangent_basis(normals: np.ndarray) -> Tuple[np.ndarray, np.ndar
     return t1, t2
 
 
+def _fetch_xyz(part_or_asm, node_ids: np.ndarray) -> np.ndarray:
+    """
+    Fetch (N,3) coords for node ids from either PartMesh.nodes_xyz or AssemblyModel.nodes.
+    Local helper (mirrors mesh.surface_utils._fetch_xyz).
+    """
+    if hasattr(part_or_asm, "nodes_xyz"):
+        mapping = part_or_asm.nodes_xyz  # PartMesh
+    else:
+        mapping = part_or_asm.nodes      # AssemblyModel
+    out = np.empty((node_ids.shape[0], 3), dtype=np.float64)
+    for i, nid in enumerate(node_ids):
+        out[i] = mapping[int(nid)]
+    return out
+
+
+def _triangle_gauss_rule(n_pts: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return barycentric points (G,3) and weights (G,) for triangle quadrature.
+    Weights sum to 1.0 (area will be multiplied later).
+    Supported: 1, 3, 7 points.
+    """
+    if n_pts == 1:
+        bary = np.array([[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64)
+        w = np.array([1.0], dtype=np.float64)
+        return bary, w
+    if n_pts == 3:
+        a = 2.0 / 3.0
+        b = 1.0 / 6.0
+        bary = np.array([
+            [a, b, b],
+            [b, a, b],
+            [b, b, a],
+        ], dtype=np.float64)
+        w = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=np.float64)
+        return bary, w
+    if n_pts == 7:
+        a = 0.101286507323456
+        b = 0.797426985353087
+        w1 = 0.125939180544827
+        c = 0.470142064105115
+        d = 0.059715871789770
+        w2 = 0.132394152788506
+        w3 = 0.225000000000000
+        bary = np.array([
+            [a, a, b],
+            [a, b, a],
+            [b, a, a],
+            [c, c, d],
+            [c, d, c],
+            [d, c, c],
+            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+        ], dtype=np.float64)
+        w = np.array([w1, w1, w1, w2, w2, w2, w3], dtype=np.float64)
+        return bary, w
+    raise ValueError(f"Unsupported triangle gauss rule n_pts={n_pts}. Use 1, 3, or 7.")
+
+
+def _mortar_points_on_surface(part_or_asm, ts, n_gauss: int):
+    """
+    Deterministic Gauss-point sampling on each triangle (mortar-style).
+
+    Returns:
+        X   : (N,3) gauss points
+        tri_idx : (N,) triangle indices
+        bary : (N,3) barycentric weights on slave triangles
+        n   : (N,3) triangle normals (unit)
+        w_area : (N,) area weights (sum = total surface area)
+    """
+    bary_gp, w_gp = _triangle_gauss_rule(n_gauss)
+    areas, normals, _ = compute_tri_geometry(part_or_asm, ts)
+
+    tri_node_ids = ts.tri_node_ids
+    T = tri_node_ids.shape[0]
+    G = bary_gp.shape[0]
+
+    tri_xyz = np.empty((T, 3, 3), dtype=np.float64)
+    for i, tri in enumerate(tri_node_ids):
+        tri_xyz[i] = _fetch_xyz(part_or_asm, np.asarray(tri, dtype=np.int64))
+
+    v0 = tri_xyz[:, 0, :]
+    v1 = tri_xyz[:, 1, :]
+    v2 = tri_xyz[:, 2, :]
+
+    b0 = bary_gp[:, 0][None, :, None]
+    b1 = bary_gp[:, 1][None, :, None]
+    b2 = bary_gp[:, 2][None, :, None]
+    X = b0 * v0[:, None, :] + b1 * v1[:, None, :] + b2 * v2[:, None, :]
+    X = X.reshape(T * G, 3)
+
+    tri_idx = np.repeat(np.arange(T, dtype=np.int64), G)
+    bary = np.repeat(bary_gp[None, :, :], T, axis=0).reshape(T * G, 3)
+    n = np.repeat(normals, G, axis=0)
+    w_area = (areas[:, None] * w_gp[None, :]).reshape(T * G)
+    return X, tri_idx, bary, n, w_area
+
+
 def _compute_area_weights(tri_idx: np.ndarray, tri_areas: np.ndarray, n_samples: int) -> np.ndarray:
     """
     Compute per-sample area weights ensuring unbiased Monte Carlo integration on the surface.
@@ -271,6 +367,73 @@ def build_contact_pair_data(
         name=name or f"{slave_key}__{master_key}",
     )
 
+
+def build_contact_pair_data_mortar(
+    asm: AssemblyModel,
+    slave_key: str,
+    master_key: str,
+    n_gauss: int = 3,
+    rng: Optional[np.random.Generator] = None,
+    prefilter_k: int = 8,
+    chunk: int = 4096,
+    pair_id: int = 0,
+    name: str = "",
+    max_points: int = 0,
+) -> ContactPairData:
+    """
+    Mortar-style deterministic contact data:
+    - Use triangle Gauss points on slave surface (no random sampling)
+    - Project to master surface (closest point)
+    - Use per-Gauss-point Lagrange multipliers in ALM (discrete LM field)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    sorted_node_ids = _sorted_node_ids(asm)
+
+    part_s, ts_s, part_m, ts_m = build_contact_surfaces(asm, slave_key, master_key)
+
+    xs, tri_idx_s, bary_s, n_s_dummy, w_area = _mortar_points_on_surface(part_s, ts_s, n_gauss)
+
+    # Optional cap (approximate integral with importance sampling)
+    if max_points and xs.shape[0] > max_points:
+        probs = w_area / (w_area.sum() + 1e-16)
+        idx = rng.choice(xs.shape[0], size=max_points, replace=True, p=probs)
+        xs = xs[idx]
+        tri_idx_s = tri_idx_s[idx]
+        bary_s = bary_s[idx]
+        n_s_dummy = n_s_dummy[idx]
+        # MC estimator: constant weight = total_area / m
+        w_area = np.full((max_points,), float(w_area.sum()) / float(max_points), dtype=np.float64)
+
+    # Project to master surface
+    xm, n_m, tri_idx_m, dist, bary_m = project_points_onto_surface(
+        part_m, ts_m, xs, prefilter_k=prefilter_k, chunk=chunk
+    )
+
+    xs_tri_node_ids = ts_s.tri_node_ids[tri_idx_s.astype(np.int64)]
+    xm_tri_node_ids = ts_m.tri_node_ids[tri_idx_m.astype(np.int64)]
+    xs_node_idx = _map_node_ids_to_idx(sorted_node_ids, xs_tri_node_ids)
+    xm_node_idx = _map_node_ids_to_idx(sorted_node_ids, xm_tri_node_ids)
+
+    t1, t2 = _orthonormal_tangent_basis(n_m)
+
+    n_points = int(xs.shape[0])
+    return ContactPairData(
+        slave_part=part_s.name,
+        master_part=part_m.name,
+        xs=xs, xm=xm, n=n_m, t1=t1, t2=t2, w_area=w_area,
+        xs_node_idx=xs_node_idx,
+        xs_bary=bary_s.astype(np.float32),
+        xm_node_idx=xm_node_idx,
+        xm_bary=bary_m.astype(np.float32),
+        slave_tri_idx=tri_idx_s.astype(np.int64),
+        master_tri_idx=tri_idx_m.astype(np.int64),
+        dist=dist.astype(np.float64),
+        pair_id=(np.full((n_points,), pair_id, dtype=np.int64)),
+        name=name or f"{slave_key}__{master_key}",
+    )
+
 def build_contact_map(
     asm: AssemblyModel,
     specs: List[ContactPairSpec],
@@ -278,25 +441,122 @@ def build_contact_map(
     seed: Optional[int] = None,
     prefilter_k: int = 8,
     chunk: int = 4096,
+    two_pass: bool = False,
+    mode: str = "sample",  # "sample" | "mortar"
+    mortar_gauss: int = 3,
+    mortar_max_points: int = 0,
 ) -> ContactMap:
     """
     Build ContactMap for a list of pairs. Each pair gets n_points_per_pair samples.
+
+    If two_pass=True, split samples across both directions (slave->master and master->slave),
+    so the total per original pair remains n_points_per_pair.
+
+    If mode="mortar", uses deterministic Gauss points on the slave surface (n_points_per_pair ignored),
+    and per-GP Lagrange multipliers in the ALM operator.
     """
     rng = np.random.default_rng(seed)
     pairs: List[ContactPairData] = []
+    kept = 0
+    skipped = 0
+    mode_norm = str(mode or "sample").strip().lower()
     for pid, spec in enumerate(specs):
-        data = build_contact_pair_data(
-            asm=asm,
-            slave_key=spec.slave_key,
-            master_key=spec.master_key,
-            n_points=n_points_per_pair,
-            rng=rng,
-            prefilter_k=prefilter_k,
-            chunk=chunk,
-            pair_id=pid,
-            name=spec.name or f"pair_{pid}",
-        )
-        pairs.append(data)
+        base_name = spec.name or f"pair_{pid}"
+        any_ok = False
+
+        if mode_norm == "mortar":
+            try:
+                data = build_contact_pair_data_mortar(
+                    asm=asm,
+                    slave_key=spec.slave_key,
+                    master_key=spec.master_key,
+                    n_gauss=mortar_gauss,
+                    rng=rng,
+                    prefilter_k=prefilter_k,
+                    chunk=chunk,
+                    pair_id=kept,
+                    name=base_name,
+                    max_points=mortar_max_points,
+                )
+                if data.xs.shape[0] > 0:
+                    pairs.append(data)
+                    any_ok = True
+            except Exception as exc:
+                print(
+                    f"[contact] Skip pair {spec.slave_key}/{spec.master_key} (mortar): {exc}"
+                )
+        elif two_pass:
+            n_fwd = int(n_points_per_pair // 2)
+            n_rev = int(n_points_per_pair - n_fwd)
+
+            if n_fwd > 0:
+                try:
+                    data = build_contact_pair_data(
+                        asm=asm,
+                        slave_key=spec.slave_key,
+                        master_key=spec.master_key,
+                        n_points=n_fwd,
+                        rng=rng,
+                        prefilter_k=prefilter_k,
+                        chunk=chunk,
+                        pair_id=kept,
+                        name=base_name,
+                    )
+                    if data.xs.shape[0] > 0:
+                        pairs.append(data)
+                        any_ok = True
+                except Exception as exc:
+                    print(
+                        f"[contact] Skip pair {spec.slave_key}/{spec.master_key} (fwd): {exc}"
+                    )
+
+            if n_rev > 0:
+                try:
+                    data = build_contact_pair_data(
+                        asm=asm,
+                        slave_key=spec.master_key,
+                        master_key=spec.slave_key,
+                        n_points=n_rev,
+                        rng=rng,
+                        prefilter_k=prefilter_k,
+                        chunk=chunk,
+                        pair_id=kept,
+                        name=f"{base_name}__rev",
+                    )
+                    if data.xs.shape[0] > 0:
+                        pairs.append(data)
+                        any_ok = True
+                except Exception as exc:
+                    print(
+                        f"[contact] Skip pair {spec.master_key}/{spec.slave_key} (rev): {exc}"
+                    )
+        else:
+            try:
+                data = build_contact_pair_data(
+                    asm=asm,
+                    slave_key=spec.slave_key,
+                    master_key=spec.master_key,
+                    n_points=n_points_per_pair,
+                    rng=rng,
+                    prefilter_k=prefilter_k,
+                    chunk=chunk,
+                    pair_id=kept,
+                    name=base_name,
+                )
+                if data.xs.shape[0] > 0:
+                    pairs.append(data)
+                    any_ok = True
+            except Exception as exc:
+                print(
+                    f"[contact] Skip pair {spec.slave_key}/{spec.master_key}: {exc}"
+                )
+
+        if any_ok:
+            kept += 1
+        else:
+            skipped += 1
+    if skipped > 0:
+        print(f"[contact] Skipped {skipped} invalid pair(s); using {kept} pairs.")
     return ContactMap(pairs=pairs)
 
 
@@ -308,6 +568,10 @@ def resample_contact_map(
     step_index: int,
     prefilter_k: int = 8,
     chunk: int = 4096,
+    two_pass: bool = False,
+    mode: str = "sample",
+    mortar_gauss: int = 3,
+    mortar_max_points: int = 0,
 ) -> ContactMap:
     """
     Convenience function for training loops:
@@ -321,6 +585,10 @@ def resample_contact_map(
         seed=seed,
         prefilter_k=prefilter_k,
         chunk=chunk,
+        two_pass=two_pass,
+        mode=mode,
+        mortar_gauss=mortar_gauss,
+        mortar_max_points=mortar_max_points,
     )
 
 

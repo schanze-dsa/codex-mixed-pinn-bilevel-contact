@@ -436,6 +436,7 @@ class NormalContactALM:
             "cn_min_gap": tf.reduce_min(g),
             "cn_mean_gap": tf.reduce_mean(g),
             "cn_pen_ratio": tf.reduce_mean(tf.cast(g < 0.0, self.dtype)),
+            "R_contact_comp": tf.reduce_sum(w * abs_r),
         }
         return L_cn, stats
 

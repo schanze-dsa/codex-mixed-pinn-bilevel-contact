@@ -187,14 +187,20 @@ class NutTighteningPenalty:
     ) -> tf.Tensor:
         # Rodrigues' rotation formula around axis passing through center.
         a = tf.reshape(axis, (1, 3))
+        a = a / (tf.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
         c = tf.reshape(center, (1, 3))
         r = X - c
-        proj = tf.reduce_sum(r * a, axis=1, keepdims=True) * a
+        a_b = tf.broadcast_to(a, tf.shape(r))
+        proj = tf.reduce_sum(r * a_b, axis=1, keepdims=True) * a_b
         radial = r - proj
         ct = tf.cos(theta)
         st = tf.sin(theta)
-        cross = tf.linalg.cross(a, radial)
-        radial_rot = radial * ct + cross * st + a * (tf.reduce_sum(a * radial, axis=1, keepdims=True)) * (1.0 - ct)
+        cross = tf.linalg.cross(a_b, radial)
+        radial_rot = (
+            radial * ct
+            + cross * st
+            + a_b * (tf.reduce_sum(a_b * radial, axis=1, keepdims=True)) * (1.0 - ct)
+        )
         X_rot = c + proj + radial_rot
         return X_rot - X
 

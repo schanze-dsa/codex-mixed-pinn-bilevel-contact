@@ -89,6 +89,15 @@ class FieldConfig:
     dfem_mode: bool = False           # Enable pure DFEM mode
     n_nodes: Optional[int] = None     # Total number of mesh nodes (required if dfem_mode=True)
     node_emb_dim: int = 64            # Dimension of learnable node embeddings
+    # Finite-domain spectral encoding (deterministic and geometry-aware)
+    use_finite_spectral: bool = False
+    finite_spectral_modes: int = 0
+    finite_spectral_with_distance: bool = True
+    # Engineering semantics from CDB tags (contact/bc/material/mirror)
+    use_engineering_semantics: bool = False
+    semantic_feat_dim: int = 0
+    # Aleatoric uncertainty head (log-variance for displacement components)
+    uncertainty_out_dim: int = 0
 
 @dataclass
 class ModelConfig:
@@ -185,6 +194,55 @@ class GaussianFourierFeatures(tf.keras.layers.Layer):
             return self.in_dim
         n_bands = len(self.sigmas) if self.sigmas else 1
         return n_bands * self.num * 2 + self.in_dim
+
+
+class FiniteSpectralFeatures(tf.keras.layers.Layer):
+    """Deterministic bounded-domain spectral features for geometry generalization."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        modes: int,
+        with_distance: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.in_dim = int(in_dim)
+        self.modes = int(max(0, modes))
+        self.with_distance = bool(with_distance)
+
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        x = tf.cast(x, tf.float32)
+        if self.modes <= 0:
+            return x
+
+        # Normalize to [0,1] in current batch for bounded-domain basis.
+        xmin = tf.reduce_min(x, axis=0, keepdims=True)
+        xmax = tf.reduce_max(x, axis=0, keepdims=True)
+        span = tf.maximum(xmax - xmin, 1e-8)
+        xn = (x - xmin) / span
+
+        bands = []
+        pi = tf.constant(np.pi, dtype=tf.float32)
+        for k in range(1, self.modes + 1):
+            arg = pi * float(k) * xn
+            bands.append(tf.sin(arg))
+            bands.append(tf.cos(arg))
+        if self.with_distance:
+            # Boundary distance in unit box as a cheap finite-domain proxy.
+            d = tf.minimum(xn, 1.0 - xn)
+            bands.append(d)
+        bands.append(xn)
+        return tf.concat(bands, axis=-1)
+
+    @property
+    def out_dim(self) -> int:
+        if self.modes <= 0:
+            return self.in_dim
+        base = self.in_dim * self.modes * 2
+        if self.with_distance:
+            base += self.in_dim
+        return base + self.in_dim
 
 
 class MLP(tf.keras.layers.Layer):
@@ -537,6 +595,8 @@ class DisplacementNet(tf.keras.Model):
         self.cfg = cfg
         self.use_graph = bool(cfg.use_graph)
         self.use_film = bool(getattr(cfg, "use_film", False))
+        self.use_finite_spectral = bool(getattr(cfg, "use_finite_spectral", False))
+        self.use_engineering_semantics = bool(getattr(cfg, "use_engineering_semantics", False))
 
         # Fourier PE (used if not in DFEM mode)
         self.pe = GaussianFourierFeatures(
@@ -546,9 +606,21 @@ class DisplacementNet(tf.keras.Model):
             sigmas=cfg.fourier.sigmas,
             trainable=cfg.fourier.trainable,
         )
+        self.finite_pe = FiniteSpectralFeatures(
+            in_dim=cfg.in_dim_coord,
+            modes=int(getattr(cfg, "finite_spectral_modes", 0)),
+            with_distance=bool(getattr(cfg, "finite_spectral_with_distance", True)),
+        )
+        self._node_semantic_features: Optional[tf.Tensor] = None
 
         # DFEM mode: learnable node embeddings instead of positional encoding
         self.dfem_mode = cfg.dfem_mode
+        base_feat_dim = cfg.node_emb_dim if self.dfem_mode else self.pe.out_dim
+        if self.use_finite_spectral:
+            base_feat_dim += self.finite_pe.out_dim
+        if self.use_engineering_semantics:
+            base_feat_dim += max(0, int(getattr(cfg, "semantic_feat_dim", 0)))
+
         if self.dfem_mode:
             if cfg.n_nodes is None or cfg.n_nodes <= 0:
                 raise ValueError(
@@ -562,14 +634,24 @@ class DisplacementNet(tf.keras.Model):
                 trainable=True,
                 name="node_embeddings"
             )
-            in_dim_total = cfg.node_emb_dim + cfg.cond_dim
+            in_dim_total = base_feat_dim + cfg.cond_dim
         else:
-            in_dim_total = self.pe.out_dim + cfg.cond_dim
-            
-        if not self.use_graph:
-            raise ValueError(
-                "FieldConfig.use_graph=False 已不再支持；请开启 GCN 主干以运行位移网络。"
+            in_dim_total = base_feat_dim + cfg.cond_dim
+
+        # MLP fallback (used when graph is disabled or input is not full mesh)
+        self.mlp_act = _get_activation(cfg.act)
+        self.mlp_layers: list[tf.keras.layers.Layer] = []
+        for _ in range(int(cfg.depth)):
+            self.mlp_layers.append(
+                tf.keras.layers.Dense(
+                    cfg.width,
+                    kernel_initializer="he_uniform",
+                )
             )
+        self.mlp_out = tf.keras.layers.Dense(
+            cfg.out_dim,
+            kernel_initializer="glorot_uniform",
+        )
 
         self.graph_proj = tf.keras.layers.Dense(
             cfg.graph_width,
@@ -612,11 +694,31 @@ class DisplacementNet(tf.keras.Model):
             kernel_initializer="glorot_uniform",
         )
         self.stress_out = None
+        self.stress_out_mlp = None
         if cfg.stress_out_dim > 0:
             self.stress_out = tf.keras.layers.Dense(
                 cfg.stress_out_dim,
                 kernel_initializer="glorot_uniform",
-                name="stress_head",
+                name="stress_head_graph",
+            )
+            self.stress_out_mlp = tf.keras.layers.Dense(
+                cfg.stress_out_dim,
+                kernel_initializer="glorot_uniform",
+                name="stress_head_mlp",
+            )
+        self.uncertainty_out = None
+        self.uncertainty_out_mlp = None
+        if int(getattr(cfg, "uncertainty_out_dim", 0) or 0) > 0:
+            uod = int(cfg.uncertainty_out_dim)
+            self.uncertainty_out = tf.keras.layers.Dense(
+                uod,
+                kernel_initializer="glorot_uniform",
+                name="uncertainty_head_graph",
+            )
+            self.uncertainty_out_mlp = tf.keras.layers.Dense(
+                uod,
+                kernel_initializer="glorot_uniform",
+                name="uncertainty_head_mlp",
             )
         # 全局邻接缓存（可选）
         self._global_knn_idx: Optional[tf.Tensor] = None
@@ -629,7 +731,20 @@ class DisplacementNet(tf.keras.Model):
             self.output_scale = tf.Variable(scale_init, trainable=True, name="output_scale")
         else:
             self.output_scale = tf.cast(scale_init, tf.float32)
-    
+
+    def set_node_semantic_features(self, features: np.ndarray | tf.Tensor):
+        """Attach per-node engineering semantic features (N_nodes, F)."""
+
+        feats = tf.convert_to_tensor(features, dtype=tf.float32)
+        feats = tf.ensure_shape(feats, (None, None))
+        if self.dfem_mode and self.cfg.n_nodes is not None:
+            n = int(self.cfg.n_nodes)
+            if feats.shape.rank is not None and feats.shape[0] is not None and int(feats.shape[0]) != n:
+                raise ValueError(
+                    f"semantic feature rows must match n_nodes={n}, got {int(feats.shape[0])}"
+                )
+        self._node_semantic_features = feats
+
     def prebuild_adjacency(self, X_nodes: tf.Tensor | np.ndarray):
         """
         Pre-build and cache the adjacency graph using node coordinates.
@@ -662,7 +777,8 @@ class DisplacementNet(tf.keras.Model):
         z: tf.Tensor,
         training: bool | None = False,
         return_stress: bool = False,
-    ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor]:
+        return_uncertainty: bool = False,
+    ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor] | Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         x : (N,3) coordinates (already normalized if you采用归一化)
         z : (B,cond_dim) or (cond_dim,)
@@ -711,15 +827,88 @@ class DisplacementNet(tf.keras.Model):
             # x should contain node indices in DFEM mode: (N,) or (N,1) or (N,3) ignored
             # We use implicit indexing: x[i] corresponds to node i
             node_indices = tf.range(N, dtype=tf.int32)
+            if self.cfg.n_nodes is not None and int(self.cfg.n_nodes) > 0:
+                node_indices = tf.math.mod(node_indices, tf.cast(self.cfg.n_nodes, tf.int32))
             x_feat = tf.gather(self.node_embeddings, node_indices)  # (N, node_emb_dim)
+            if self.use_finite_spectral:
+                x_spec = self.finite_pe(tf.cast(x, tf.float32))
+                x_feat = tf.concat([x_feat, tf.cast(x_spec, x_feat.dtype)], axis=-1)
         else:
             # Traditional PINN: positional encoding of coordinates
             x_feat = self.pe(x)  # (N, fourier_dim)
+            if self.use_finite_spectral:
+                x_spec = self.finite_pe(tf.cast(x, tf.float32))
+                x_feat = tf.concat([x_feat, tf.cast(x_spec, x_feat.dtype)], axis=-1)
+
+        if self.use_engineering_semantics and int(getattr(self.cfg, "semantic_feat_dim", 0) or 0) > 0:
+            sem_dim = int(self.cfg.semantic_feat_dim)
+            sem = None
+            if self._node_semantic_features is not None:
+                n_sem = tf.shape(self._node_semantic_features)[0]
+                sem = tf.cond(
+                    tf.equal(n_sem, N),
+                    lambda: self._node_semantic_features,
+                    lambda: tf.zeros((N, sem_dim), dtype=tf.float32),
+                )
+            else:
+                sem = tf.zeros((N, sem_dim), dtype=tf.float32)
+            x_feat = tf.concat([x_feat, tf.cast(sem, x_feat.dtype)], axis=-1)
             
         if x_feat.dtype != feat_dtype:
             x_feat = tf.cast(x_feat, feat_dtype)
         
         h = tf.concat([x_feat, zb], axis=-1)
+
+        def _apply_output(u_out: tf.Tensor, coords: tf.Tensor, hfeat: tf.Tensor):
+            # 输出缩放：网络预测无量纲位移，再映射到物理量级
+            scale = tf.cast(self.output_scale, u_out.dtype)
+            u_out = u_out * scale
+
+            # 可选硬约束：以圆孔为例，在半径内直接将位移投影为 0，减少软约束漏出
+            if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
+                cx, cy = self.cfg.hard_bc_center
+                dx = coords[:, 0] - tf.cast(cx, coords.dtype)
+                dy = coords[:, 1] - tf.cast(cy, coords.dtype)
+                r2 = dx * dx + dy * dy
+                mask = tf.cast(r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2, u_out.dtype)
+                dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
+                u_out = u_out * mask[:, None] * dof_mask
+            sigma_out = None
+            if return_stress:
+                if self.stress_out is None:
+                    raise ValueError("stress head disabled (stress_out_dim<=0)")
+                if (
+                    self.stress_out_mlp is not None
+                    and (hfeat.shape.rank is None or hfeat.shape[-1] != self.cfg.graph_width)
+                ):
+                    sigma_out = self.stress_out_mlp(hfeat)
+                else:
+                    sigma_out = self.stress_out(hfeat)
+            log_var = None
+            if return_uncertainty:
+                if self.uncertainty_out is None:
+                    raise ValueError("uncertainty head disabled (uncertainty_out_dim<=0)")
+                if (
+                    self.uncertainty_out_mlp is not None
+                    and (hfeat.shape.rank is None or hfeat.shape[-1] != self.cfg.graph_width)
+                ):
+                    log_var = self.uncertainty_out_mlp(hfeat)
+                else:
+                    log_var = self.uncertainty_out(hfeat)
+            if return_stress and return_uncertainty:
+                return u_out, sigma_out, log_var
+            if return_stress:
+                return u_out, sigma_out
+            if return_uncertainty:
+                return u_out, log_var
+            return u_out
+
+        def mlp_forward():
+            hcur = h
+            for layer in self.mlp_layers:
+                hcur = self.mlp_act(layer(hcur))
+            u_out = self.mlp_out(hcur)
+            return _apply_output(u_out, x, hcur)
 
         def graph_forward():
             coords = x
@@ -761,28 +950,20 @@ class DisplacementNet(tf.keras.Model):
                     hcur = gamma * hcur + beta
             hcur = self.graph_norm(hcur)
             u_out = self.graph_out(hcur)
+            return _apply_output(u_out, coords, hcur)
 
-            # 输出缩放：网络预测无量纲位移，再映射到物理量级
-            scale = tf.cast(self.output_scale, u_out.dtype)
-            u_out = u_out * scale
-
-            # 可选硬约束：以圆孔为例，在半径内直接将位移投影为 0，减少软约束漏出
-            if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
-                cx, cy = self.cfg.hard_bc_center
-                dx = coords[:, 0] - tf.cast(cx, coords.dtype)
-                dy = coords[:, 1] - tf.cast(cy, coords.dtype)
-                r2 = dx * dx + dy * dy
-                mask = tf.cast(r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2, u_out.dtype)
-                dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
-                u_out = u_out * mask[:, None] * dof_mask
-            if return_stress:
-                if self.stress_out is None:
-                    raise ValueError("stress head disabled (stress_out_dim<=0)")
-                sigma_out = self.stress_out(hcur)
-                return u_out, sigma_out
-            return u_out
-
-        return graph_forward()
+        # --- Decide graph vs MLP ---
+        if not self.use_graph:
+            return mlp_forward()
+        if self._global_knn_idx is None:
+            # No cached adjacency available: fall back to dynamic graph build.
+            return graph_forward()
+        if self._global_knn_n is not None:
+            cached_n = tf.cast(self._global_knn_n, N.dtype)
+        else:
+            cached_n = tf.cast(tf.shape(self._global_knn_idx)[0], N.dtype)
+        use_graph = tf.equal(N, cached_n)
+        return tf.cond(use_graph, graph_forward, mlp_forward)
 
     def set_global_graph(self, coords: tf.Tensor):
         """预计算并缓存全局 kNN 邻接，用于整图前向以避免分块断图。"""
@@ -821,6 +1002,7 @@ class DisplacementModel:
         # Alias stress head for backward compatibility with previously traced graphs
         # that referenced `self.stress_out` directly.
         self.stress_out = self.field.stress_out
+        self.uncertainty_out = self.field.uncertainty_out
 
     def _normalize_inputs(self, X: tf.Tensor, params: Optional[Dict]) -> Tuple[tf.Tensor, tf.Tensor]:
         """Validate/convert inputs and ensure stable shapes for tf.function trace reuse."""
@@ -902,6 +1084,27 @@ class DisplacementModel:
         """
         X, P_hat = self._normalize_inputs(X, params)
         return self._us_fn_compiled(X, P_hat)
+
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _uvar_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        if self.field.uncertainty_out is None:
+            raise ValueError("uncertainty head disabled (uncertainty_out_dim<=0)")
+        z = self.encoder(P_hat)
+        u, log_var = self.field(X, z, return_uncertainty=True)
+        return tf.cast(u, tf.float32), tf.cast(log_var, tf.float32)
+
+    def uvar_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Forward with uncertainty head: returns (u, log_var)."""
+
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._uvar_fn_compiled(X, P_hat)
 
 
 def create_displacement_model(cfg: Optional[ModelConfig] = None) -> DisplacementModel:

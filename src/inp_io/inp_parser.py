@@ -103,6 +103,7 @@ class AssemblyModel:
 
     nodes: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
     elements: Dict[int, List[int]] = field(default_factory=dict)
+    element_types: Dict[int, str] = field(default_factory=dict)
 
     # --------- Summary ---------
     def summary(self) -> Dict[str, Any]:

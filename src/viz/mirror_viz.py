@@ -850,10 +850,18 @@ def plot_mirror_deflection(asm: AssemblyModel,
     # 1) Triangulate surface & collect unique nodes
     ts = resolve_surface_to_tris(asm, surface_key, log_summary=False)
     source_key = (surface_source or "surface").strip().lower()
-    part = asm.parts[ts.part_name]
+    part = asm.parts.get(ts.part_name)
+    if part is None:
+        # Assembly-level surfaces (e.g., SURF154 components) are not part-assigned.
+        # Fall back to assembly nodes so visualization can proceed.
+        class _AsmPart:
+            pass
+        part = _AsmPart()
+        part.nodes_xyz = getattr(asm, "nodes", {})
+        part.node_ids = sorted(part.nodes_xyz.keys()) if part.nodes_xyz else []
 
     # 如果指定了从零件外边界重建表面，则使用覆盖更完整的三角网格（可选仅保留主导法向）
-    if source_key in {"part", "part_top", "part_boundary"}:
+    if source_key in {"part", "part_top", "part_boundary"} and ts.part_name in asm.parts:
         rebuilt = triangulate_part_boundary(part, ts.part_name, log_summary=False)
         if len(rebuilt) > 0:
             if source_key == "part_top":

@@ -103,6 +103,9 @@ class FrictionALMConfig:
     use_smooth_friction: bool = False
     smooth_s0: float = 1.0e-3   # 光滑尺度 s0，量纲与 |s_t| 相同
     smooth_blend: float = 1.0   # 0=严格(ALM), 1=平滑；(0,1) 线性混合
+    use_bipotential_residual: bool = False
+    bipotential_weight: float = 0.0
+    bipotential_eps: float = 1.0e-8
 
     dtype: str = "float32"
 
@@ -497,8 +500,24 @@ class FrictionContactALM:
                 "R_fric_comp": tf.reduce_sum(w_eff * r_norm),
             }
 
+        def _bipotential_residual_terms(tau_use: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+            eps_bi = tf.cast(getattr(self.cfg, "bipotential_eps", 1.0e-8), self.dtype)
+            st_norm = tf.sqrt(tf.reduce_sum(st * st, axis=1) + eps_bi)
+            bi_raw = self.mu_f * p_eff * st_norm - tf.reduce_sum(tau_use * st, axis=1)
+            bi_pos = tf.nn.relu(bi_raw)
+            E_bi = tf.reduce_sum(w_eff * bi_pos * bi_pos)
+            R_bi = tf.reduce_sum(w_eff * bi_pos)
+            return E_bi, R_bi
+
         # 单一路径：平滑
         if use_smooth and not use_alm:
+            if bool(getattr(self.cfg, "use_bipotential_residual", False)) and float(getattr(self.cfg, "bipotential_weight", 0.0)) > 0.0:
+                tau_trial_s = self.lmbda_t + self.k_t * st
+                E_bi, R_bi = _bipotential_residual_terms(tau_trial_s)
+                w_bi = tf.cast(getattr(self.cfg, "bipotential_weight", 0.0), self.dtype)
+                Et_smooth = Et_smooth + w_bi * E_bi
+                stats_s["E_bi"] = E_bi
+                stats_s["R_bi_comp"] = R_bi
             self._last_tau_trial = None
             self._last_tau = None
             self._last_r_norm = r
@@ -506,6 +525,12 @@ class FrictionContactALM:
 
         # 单一路径：ALM
         if use_alm and not use_smooth:
+            if bool(getattr(self.cfg, "use_bipotential_residual", False)) and float(getattr(self.cfg, "bipotential_weight", 0.0)) > 0.0:
+                E_bi, R_bi = _bipotential_residual_terms(tau)
+                w_bi = tf.cast(getattr(self.cfg, "bipotential_weight", 0.0), self.dtype)
+                Et_alm = Et_alm + w_bi * E_bi
+                stats_a["E_bi"] = E_bi
+                stats_a["R_bi_comp"] = R_bi
             self._last_tau_trial = tau_trial
             self._last_tau = tau
             self._last_r_norm = r_norm
@@ -526,6 +551,12 @@ class FrictionContactALM:
             blend_t * tf.reduce_sum(w_eff * r)
             + (1.0 - blend_t) * tf.reduce_sum(w_eff * r_norm)
         )
+        if bool(getattr(self.cfg, "use_bipotential_residual", False)) and float(getattr(self.cfg, "bipotential_weight", 0.0)) > 0.0:
+            E_bi, R_bi = _bipotential_residual_terms(tau)
+            w_bi = tf.cast(getattr(self.cfg, "bipotential_weight", 0.0), self.dtype)
+            Et = Et + w_bi * E_bi
+            stats["E_bi"] = E_bi
+            stats["R_bi_comp"] = R_bi
 
         self._last_tau_trial = tau_trial
         self._last_tau = tau
@@ -577,6 +608,18 @@ class FrictionContactALM:
         denom = tf.reduce_sum(w_eff) + tf.cast(1e-12, self.dtype)
         L_ct = tf.reduce_sum(w_eff * r_norm * r_norm) / denom
 
+        if bool(getattr(self.cfg, "use_bipotential_residual", False)) and float(getattr(self.cfg, "bipotential_weight", 0.0)) > 0.0:
+            eps_bi = tf.cast(getattr(self.cfg, "bipotential_eps", 1.0e-8), self.dtype)
+            st_norm = tf.sqrt(tf.reduce_sum(st * st, axis=1) + eps_bi)
+            bi_raw = self.mu_f * p_eff * st_norm - tf.reduce_sum(tau * st, axis=1)
+            bi_pos = tf.nn.relu(bi_raw)
+            E_bi = tf.reduce_sum(w_eff * bi_pos * bi_pos) / denom
+            w_bi = tf.cast(getattr(self.cfg, "bipotential_weight", 0.0), self.dtype)
+            L_ct = L_ct + w_bi * E_bi
+        else:
+            E_bi = tf.cast(0.0, self.dtype)
+            bi_pos = tf.zeros_like(r_norm)
+
         stick = tf.cast(scale >= 0.999, self.dtype)
         slip = tf.cast(scale < 0.999, self.dtype)
         stats = {
@@ -586,6 +629,8 @@ class FrictionContactALM:
             "tau_trial_mean": tf.reduce_mean(norm_trial),
             "tau_mean": tf.reduce_mean(tf.sqrt(tf.reduce_sum(tau * tau, axis=1))),
             "R_fric_comp": tf.reduce_sum(w_eff * r_norm),
+            "E_bi": E_bi,
+            "R_bi_comp": tf.reduce_sum(w_eff * bi_pos),
         }
 
         self._last_tau_trial = tau_trial

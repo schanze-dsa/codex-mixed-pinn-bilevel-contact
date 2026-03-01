@@ -118,17 +118,29 @@ def _parse_etblock(lines: List[str], start: int) -> Tuple[Dict[int, int], int]:
 def _parse_nblock(lines: List[str], start: int) -> Tuple[Dict[int, Tuple[float, float, float]], int]:
     nodes: Dict[int, Tuple[float, float, float]] = {}
     i = start + 1  # format line
+    
+    # 动态解析格式行，例如 "(3i8,6e16.9)" 或 "(3i9,6e21.13e3)"
+    format_line = lines[i].strip() if i < len(lines) else ""
+    int_width = 9   # 默认值
+    float_width = 21  # 默认值
+    
+    # 匹配格式如 (3i8,6e16.9) 或 (3i9,6e21.13e3)
+    m = re.match(r"\((\d+)i(\d+),\d+e(\d+)", format_line)
+    if m:
+        int_width = int(m.group(2))
+        float_width = int(m.group(3))
+    
     i += 1
-    # 3i9,6e21.13e3
-    int_widths = [9, 9, 9]
-    float_widths = [21] * 6
+    int_widths = [int_width, int_width, int_width]
+    float_widths = [float_width] * 6
+    
     while i < len(lines):
         s = lines[i].strip()
         if not s:
             i += 1
             continue
         # End markers
-        if s.startswith("N,") or s.startswith("EBLOCK") or s.startswith("CMBLOCK") or s.startswith("-1"):
+        if s.startswith("N,") or s.startswith("EBLOCK") or s.startswith("CMBLOCK") or s.startswith("CM,") or s.startswith("-1"):
             break
         head = _parse_fixed_width(lines[i], int_widths)
         nid = _safe_int(head[0])
@@ -154,8 +166,21 @@ def _parse_eblock(
 ) -> Tuple[Dict[int, Tuple[str, List[int]]], int]:
     elements: Dict[int, Tuple[str, List[int]]] = {}
     i = start + 1  # format line
+    
+    # 动态解析格式行，例如 "(19i8)" 或 "(19i10)"
+    format_line = lines[i].strip() if i < len(lines) else ""
+    int_width = 10   # 默认值
+    num_fields = 19  # 默认值
+    
+    # 匹配格式如 (19i8)
+    m = re.match(r"\((\d+)i(\d+)\)", format_line)
+    if m:
+        num_fields = int(m.group(1))
+        int_width = int(m.group(2))
+    
     i += 1
-    widths = [10] * 19
+    widths = [int_width] * num_fields
+    
     while i < len(lines):
         s = lines[i].strip()
         if not s:
@@ -237,6 +262,8 @@ def _etype_name_from_code(code: Optional[int]) -> str:
         return "SOLID185"
     if code == 186:
         return "SOLID186"
+    if code == 154:
+        return "SURF154"
     return f"ET_{code}"
 
 
@@ -269,6 +296,8 @@ def load_cdb(path: str) -> AssemblyModel:
     components: Dict[str, List[int]] = {}
     component_types: Dict[str, str] = {}
     boundaries: List[BoundaryEntry] = []
+    active_cm_name: Optional[str] = None
+    hmname_pending: bool = False
 
     i = 0
     while i < len(lines):
@@ -276,16 +305,63 @@ def load_cdb(path: str) -> AssemblyModel:
         if line.startswith("ETBLOCK"):
             etype_map, i = _parse_etblock(lines, i)
             continue
+        # 支持单独的 ET,tid,code 格式，例如 ET,7,185
+        if line.startswith("ET,"):
+            parts = line.split(",")
+            if len(parts) >= 3:
+                tid = _safe_int(parts[1])
+                code = _safe_int(parts[2])
+                if tid is not None and code is not None:
+                    etype_map[int(tid)] = int(code)
+            i += 1
+            continue
         if line.startswith("NBLOCK"):
             nodes, i = _parse_nblock(lines, i)
             continue
+        # HyperMesh exports component names via comment blocks:
+        # !!HMNAME COMP
+        # !!   <id> "<COMP_NAME>"
+        if line.lstrip().startswith("!!HMNAME") and "COMP" in line.upper():
+            hmname_pending = True
+            i += 1
+            continue
+        if hmname_pending and line.lstrip().startswith("!!"):
+            m = re.search(r'"([^"]+)"', line)
+            if m:
+                name = m.group(1)
+                if name:
+                    # HMNAME appears immediately before EBLOCK in HyperMesh exports,
+                    # so prefer it over any previously pending CM name.
+                    active_cm_name = name
+                    components.setdefault(name, [])
+                    component_types[name] = "ELEM"
+            hmname_pending = False
+            i += 1
+            continue
+        if hmname_pending and not line.lstrip().startswith("!!"):
+            hmname_pending = False
         if line.startswith("EBLOCK"):
-            elements, i = _parse_eblock(lines, i, etype_map)
+            elements_block, i = _parse_eblock(lines, i, etype_map)
+            elements.update(elements_block)  # 合并多个 EBLOCK
+            if active_cm_name:
+                components.setdefault(active_cm_name, []).extend(elements_block.keys())
+                component_types.setdefault(active_cm_name, "ELEM")
+                active_cm_name = None
             continue
         if line.startswith("CMBLOCK"):
             name, ctype, ids, i = _parse_cmblock(lines, i)
             components[name] = ids
             component_types[name] = ctype.upper()
+            continue
+        if line.startswith("CM,"):
+            parts = [p.strip() for p in line.split(",")]
+            name = parts[1] if len(parts) > 1 else ""
+            ctype = parts[2].upper() if len(parts) > 2 else ""
+            if name and ctype == "ELEM":
+                active_cm_name = name
+                components.setdefault(name, [])
+                component_types[name] = "ELEM"
+            i += 1
             continue
         if line.startswith("D,"):
             boundaries.append(BoundaryEntry(raw=line.strip()))
@@ -295,6 +371,12 @@ def load_cdb(path: str) -> AssemblyModel:
 
     model = AssemblyModel()
     model.boundaries = boundaries
+
+    # De-duplicate component element ids
+    for name, ids in list(components.items()):
+        if ids:
+            components[name] = sorted(set(int(v) for v in ids))
+
 
     # Build contact pairs from component names
     contact_pairs: List[ContactPair] = []
@@ -322,6 +404,20 @@ def load_cdb(path: str) -> AssemblyModel:
             continue
         if component_types.get(name, "") != "ELEM":
             continue
+        # Skip pure surface components (e.g., SURF154-only) when building parts.
+        if ids:
+            only_surface = True
+            for eid in ids:
+                etype, _ = elements.get(int(eid), ("", []))
+                et = (etype or "").upper()
+                if et.startswith("CONTA") or et.startswith("TARGE"):
+                    continue
+                if et in {"SURF154", "ET_154"}:
+                    continue
+                only_surface = False
+                break
+            if only_surface:
+                continue
         part_components[name] = ids
 
     # Merge mirror parts if both exist
@@ -332,6 +428,16 @@ def load_cdb(path: str) -> AssemblyModel:
         part_components["MIRROR"] = merged
         del part_components[mirror1]
         del part_components[mirror2]
+
+    # 如果没有任何部件定义（没有 CMBLOCK），创建一个包含所有实体元素的默认部件
+    if not part_components:
+        solid_elem_ids = [
+            eid for eid, (etype, _) in elements.items()
+            if not etype.startswith("CONTA") and not etype.startswith("TARGE")
+        ]
+        if solid_elem_ids:
+            part_components["ALL_SOLID"] = solid_elem_ids
+            print(f"[cdb_parser] 未发现部件定义(CMBLOCK)，创建默认部件 ALL_SOLID: {len(solid_elem_ids)} 个元素")
 
     # Create parts
     for name, elem_ids in part_components.items():
@@ -403,7 +509,7 @@ def load_cdb(path: str) -> AssemblyModel:
         if cand in model.parts:
             mirror_part = cand
             break
-    if mirror_part:
+    if mirror_part and "MIRROR UP" not in model.surfaces:
         # Use one element to seed part resolution; viz can rebuild part_top surface later.
         try:
             part = model.parts[mirror_part]
@@ -427,6 +533,7 @@ def load_cdb(path: str) -> AssemblyModel:
     # Fill nodes/elements at assembly level
     model.nodes = nodes
     model.elements = {eid: conn for eid, (_, conn) in elements.items()}
+    model.element_types = {eid: etype for eid, (etype, _) in elements.items()}
     return model
 
 

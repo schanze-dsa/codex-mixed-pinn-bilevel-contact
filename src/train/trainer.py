@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
 
@@ -8,7 +8,7 @@ trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
   - 单步训练进度条会标注当前阶段，便于观察训练流程。
 """
 from __future__ import annotations
-from train.attach_ties_bcs import attach_ties_and_bcs_from_inp
+from train.attach_ties_bcs import attach_bcs_from_asm
 
 import os
 import sys
@@ -70,20 +70,133 @@ if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
 # ---------- 项目模块 ----------
-from inp_io.inp_parser import load_inp, AssemblyModel
+from inp_io.inp_parser import AssemblyModel
 from inp_io.cdb_parser import load_cdb
 from mesh.volume_quadrature import build_volume_points
 from mesh.contact_pairs import ContactPairSpec, build_contact_map, resample_contact_map
 from physics.material_lib import MaterialLibrary
-from model.pinn_model import create_displacement_model, ModelConfig, DisplacementModel
-from physics.elasticity_energy import ElasticityEnergy, ElasticityConfig
+from model.pinn_model import create_displacement_model, ModelConfig, DisplacementModel, _knn_to_adj
+from physics.elasticity_residual import ElasticityResidual
+from physics.elasticity_config import ElasticityConfig
 from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
-from physics.tie_constraints import TiePenalty, TieConfig
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig, NutSpec
 from model.loss_energy import TotalEnergy, TotalConfig
 from train.loss_weights import LossWeightState, update_loss_weights, combine_loss
 from viz.mirror_viz import plot_mirror_deflection_by_name
+
+
+def _find_node_id_in_boundary_raw(raw: str) -> Optional[int]:
+    """Extract node id from boundary raw text (supports CDB/Abaqus-like formats)."""
+
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    m = re.match(r"^\s*D\s*,\s*([+-]?\d+)", txt, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    for tok in re.split(r"[,\s]+", txt):
+        if not tok:
+            continue
+        try:
+            return int(float(tok))
+        except Exception:
+            continue
+    return None
+
+
+def build_node_semantic_features(
+    asm: AssemblyModel,
+    sorted_node_ids: np.ndarray,
+    part2mat: Mapping[str, str],
+    mirror_surface_name: str = "MIRROR UP",
+) -> np.ndarray:
+    """Build CDB engineering semantic features aligned with sorted global node ids.
+
+    Feature layout (N, 4):
+    - [:,0] contact flag
+    - [:,1] boundary-condition flag
+    - [:,2] mirror-region flag
+    - [:,3] normalized material id (0~1)
+    """
+
+    node_ids = np.asarray(sorted_node_ids, dtype=np.int64).reshape(-1)
+    n = int(node_ids.shape[0])
+    if n == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    node_pos = {int(nid): i for i, nid in enumerate(node_ids.tolist())}
+    feats = np.zeros((n, 4), dtype=np.float32)
+
+    contact_nodes: set[int] = set()
+    cpart = getattr(asm, "parts", {}).get("__CONTACT__")
+    if cpart is not None:
+        contact_nodes.update(int(v) for v in getattr(cpart, "node_ids", []) or [])
+    for nid in contact_nodes:
+        pos = node_pos.get(int(nid))
+        if pos is not None:
+            feats[pos, 0] = 1.0
+
+    for bc in getattr(asm, "boundaries", []) or []:
+        nid = _find_node_id_in_boundary_raw(getattr(bc, "raw", ""))
+        if nid is None:
+            continue
+        pos = node_pos.get(int(nid))
+        if pos is not None:
+            feats[pos, 1] = 1.0
+
+    mirror_nodes: set[int] = set()
+    mirror_key = str(mirror_surface_name or "").strip().upper()
+    for pname, part in getattr(asm, "parts", {}).items():
+        if "MIRROR" in str(pname).upper() or (mirror_key and mirror_key in str(pname).upper()):
+            mirror_nodes.update(int(v) for v in getattr(part, "node_ids", []) or [])
+    for nid in mirror_nodes:
+        pos = node_pos.get(int(nid))
+        if pos is not None:
+            feats[pos, 2] = 1.0
+
+    # material tag as normalized scalar id (stable by sorted unique names)
+    mat_lookup = {}
+    for k, v in (part2mat or {}).items():
+        mat_lookup[str(k).upper()] = str(v)
+    mat_names = sorted(set(mat_lookup.values()))
+    mat_to_id = {name: i for i, name in enumerate(mat_names)}
+    denom = float(max(1, len(mat_names) - 1))
+    # first-hit strategy if nodes belong to multiple parts
+    for pname, part in getattr(asm, "parts", {}).items():
+        up = str(pname).upper()
+        mat_name = mat_lookup.get(up, None)
+        if mat_name is None:
+            continue
+        mid = float(mat_to_id.get(mat_name, 0)) / denom
+        for nid in getattr(part, "node_ids", []) or []:
+            pos = node_pos.get(int(nid))
+            if pos is None:
+                continue
+            if feats[pos, 3] == 0.0:
+                feats[pos, 3] = np.float32(mid)
+
+    return feats
+
+
+def compute_uncertainty_proxy_sigma(
+    u_pred: tf.Tensor,
+    residual_scalar: tf.Tensor,
+    *,
+    proxy_scale: float = 1.0,
+    eps: float = 1.0e-6,
+) -> tf.Tensor:
+    """Build residual-driven sigma proxy from predicted displacement magnitude."""
+
+    u_pred = tf.cast(u_pred, tf.float32)
+    residual_scalar = tf.cast(residual_scalar, tf.float32)
+    umag = tf.sqrt(tf.reduce_sum(tf.square(u_pred), axis=1, keepdims=True) + tf.cast(eps, tf.float32))
+    umag_mean = tf.reduce_mean(umag) + tf.cast(eps, tf.float32)
+    sigma = tf.cast(proxy_scale, tf.float32) * residual_scalar * (umag / umag_mean) + tf.cast(eps, tf.float32)
+    return sigma
 
 
 # ----------------- 配置 -----------------
@@ -113,6 +226,10 @@ class TrainerConfig:
     contact_pairs: List[Dict[str, str]] = field(default_factory=list)
     n_contact_points_per_pair: int = 6000
     contact_seed: int = 1234
+    contact_two_pass: bool = False          # 双向采样（slave->master + master->slave）
+    contact_mode: str = "sample"           # "sample" | "mortar"
+    contact_mortar_gauss: int = 3          # 三角形高斯点数（1/3/7）
+    contact_mortar_max_points: int = 0     # >0 时对每对接触上限采样数（近似）
     contact_rar_enabled: bool = True           # 是否启用接触残差驱动的自适应重采样
     contact_rar_fraction: float = 0.5          # 每次重采样中，多少比例来自残差加权抽样
     contact_rar_temperature: float = 1.0       # >1 平滑、<1 更尖锐
@@ -145,9 +262,7 @@ class TrainerConfig:
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
     preload_n_points_each: int = 800
 
-    # tie / 边界（如需）
-    ties: List[Dict[str, Any]] = field(default_factory=list)
-    bcs: List[Dict[str, Any]] = field(default_factory=list)
+    # boundary conditions
     bc_mode: str = "alm"                    # penalty | hard | alm
     bc_mu: float = 1.0e3                    # ALM 增广系数
     bc_alpha: float = 1.0e4                 # 罚函数/ALM 基础刚度
@@ -184,7 +299,14 @@ class TrainerConfig:
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     tightening_cfg: TighteningConfig = field(default_factory=TighteningConfig)
     total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
-        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0, w_eq=0.0
+        w_int=1.0,
+        w_cn=1.0,
+        w_ct=1.0,
+        w_bc=1.0,
+        w_tight=1.0,
+        w_sigma=1.0,
+        w_eq=1.0,
+        w_reg=1.0e-4,
     ))
 
     # 损失加权（自适应）
@@ -212,11 +334,23 @@ class TrainerConfig:
     lbfgs_history_size: int = 50
     lbfgs_line_search: int = 50
     lbfgs_reuse_last_batch: bool = True
+    uncertainty_loss_weight: float = 0.0
+    uncertainty_sample_points: int = 0
+    uncertainty_proxy_scale: float = 1.0
+    uncertainty_logvar_min: float = -8.0
+    uncertainty_logvar_max: float = 6.0
 
     # 进度条颜色（None 则禁用彩色，使用终端默认色）
     build_bar_color: Optional[str] = "cyan"
     train_bar_color: Optional[str] = "cyan"
     step_bar_color: Optional[str] = "green"
+    # 进度条开关
+    build_bar_enabled: bool = True
+    train_bar_enabled: bool = True
+    step_bar_enabled: bool = False
+    # tqdm 输出控制
+    tqdm_disable: bool = False
+    tqdm_disable_if_not_tty: bool = True
 
     # 精度/随机种子
     mixed_precision: Optional[str] = "mixed_float16"
@@ -229,6 +363,10 @@ class TrainerConfig:
     ckpt_save_retries: int = 3
     ckpt_save_retry_delay_s: float = 1.0
     ckpt_save_retry_backoff: float = 2.0
+    # kNN 图缓存（npz）
+    graph_cache_enabled: bool = True
+    graph_cache_dir: Optional[str] = None
+    graph_cache_name: Optional[str] = None
     viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "smooth"              # 默认使用 Gouraud 平滑着色
@@ -294,11 +432,14 @@ class Trainer:
         self._total_ref: Optional[TotalEnergy] = None
         self._base_weights: Dict[str, float] = {}
         self._loss_keys: List[str] = []
+        self._static_weight_vector: Optional[tf.Tensor] = None
+        self._apply_gradients_kwargs: Dict[str, Any] = {}
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
         self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
         self._contact_hardening_targets: Optional[Dict[str, float]] = None
         self._friction_smooth_state: Optional[str] = None
+        self._tqdm_enabled: bool = self._resolve_tqdm_enabled()
 
         if cfg.preload_specs:
             self._set_preload_dim(len(cfg.preload_specs))
@@ -440,10 +581,9 @@ class Trainer:
         self.model = None
         self.optimizer = None
 
-        self.elasticity: Optional[ElasticityEnergy] = None
+        self.elasticity: Optional[ElasticityResidual] = None
         self.contact: Optional[ContactOperator] = None
         self.tightening: Optional[NutTighteningPenalty] = None
-        self.ties_ops: List[TiePenalty] = []
         self.bcs_ops: List[BoundaryPenalty] = []
         self._cp_specs: List[ContactPairSpec] = []
 
@@ -582,6 +722,34 @@ class Trainer:
             return
         pbar.set_postfix_str(self._wrap_bar_text(text))
 
+    def _step_detail_enabled(self) -> bool:
+        return bool(self._tqdm_enabled and getattr(self.cfg, "step_bar_enabled", False))
+
+    def _format_energy_summary_if_needed(self, parts: Mapping[str, tf.Tensor]) -> str:
+        if not self._step_detail_enabled():
+            return ""
+        return self._format_energy_summary(parts)
+
+    def _resolve_tqdm_enabled(self) -> bool:
+        if getattr(self.cfg, "tqdm_disable", False):
+            return False
+        if getattr(self.cfg, "tqdm_disable_if_not_tty", True):
+            try:
+                if not sys.stderr.isatty():
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _graph_cache_path(self, n_nodes: int) -> str:
+        base = self.cfg.graph_cache_dir or os.path.join(self.cfg.out_dir or "outputs", "graph_cache")
+        os.makedirs(base, exist_ok=True)
+        if self.cfg.graph_cache_name:
+            return os.path.join(base, self.cfg.graph_cache_name)
+        mesh_tag = os.path.splitext(os.path.basename(self.cfg.inp_path))[0]
+        k = int(getattr(self.cfg.model_cfg.field, "graph_k", 0) or 0)
+        return os.path.join(base, f"knn_{mesh_tag}_n{n_nodes}_k{k}.npz")
+
     def _loss_weight_lookup(self) -> Dict[str, float]:
         """Assemble the latest per-term loss weights for logging."""
 
@@ -589,11 +757,14 @@ class Trainer:
             "E_int": getattr(self.cfg.total_cfg, "w_int", 1.0),
             "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
             "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
-            "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
             "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
-            "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+            "E_tight": getattr(self.cfg.total_cfg, "w_tight", 1.0),
             "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
             "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
+            "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
+            "E_bi": getattr(self.cfg.total_cfg, "w_bi", 0.0),
+            "E_ed": getattr(self.cfg.total_cfg, "w_ed", 0.0),
+            "E_unc": getattr(self.cfg, "uncertainty_loss_weight", 0.0),
         }
         if self.loss_state is not None:
             for key, value in self.loss_state.current.items():
@@ -621,15 +792,16 @@ class Trainer:
 
     def _format_energy_summary(self, parts: Mapping[str, tf.Tensor]) -> str:
         display = [
-            ("E_int", "Eint"),
             ("E_cn", "Ecn"),
             ("E_ct", "Ect"),
-            ("E_tie", "Etie"),
+            ("E_bi", "Ebi"),
             ("E_bc", "Ebc"),
-            ("W_pre", "Wpre"),
             ("E_tight", "Etight"),
             ("E_sigma", "Esig"),
             ("E_eq", "Eeq"),
+            ("E_reg", "Ereg"),
+            ("E_ed", "Eed"),
+            ("E_unc", "Eunc"),
         ]
         aliases = {
             "E_cn": ("E_cn", "E_n"),
@@ -645,7 +817,7 @@ class Trainer:
             val = self._extract_part_scalar(parts, *aliases.get(key, (key,)))
             if val is None:
                 continue
-            entries.append(f"{label}={val:.3e}(w={weight:.3g})")
+            entries.append(f"{label}={val:.6e}(w={weight:.6g})")
         return " ".join(entries)
 
     def _format_train_log_postfix(
@@ -681,7 +853,7 @@ class Trainer:
                     try:
                         vals = [float(x) for x in list(rms)[:3]]
                         if vals:
-                            tight_txt = " rms=[" + ",".join(f"{v:.2e}" for v in vals) + "]"
+                            tight_txt = " rms=[" + ",".join(f"{v:.4e}" for v in vals) + "]"
                     except Exception:
                         pass
 
@@ -739,22 +911,22 @@ class Trainer:
             min_gap = _get_stat_float("n_min_gap", "cn_min_gap", "min_gap")
             mean_gap = _get_stat_float("n_mean_gap", "cn_mean_gap", "mean_gap")
 
-            grad_disp = f"grad={grad_val:.2e}"
+            grad_disp = f"grad={grad_val:.4e}"
             rel_pct = rel_pi * 100.0 if rel_pi is not None else None
             rel_disp = (
-                f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+                f"Πrel={rel_pct:.3f}%" if rel_pct is not None else "Πrel=--"
             )
             delta_disp = (
-                f"ΔΠ={rel_delta * 100:+.1f}%" if rel_delta is not None else "ΔΠ=--"
+                f"ΔΠ={rel_delta * 100:+.2f}%" if rel_delta is not None else "ΔΠ=--"
             )
             pen_disp = (
-                f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
+                f"pen={pen_ratio * 100:.2f}%" if pen_ratio is not None else "pen=--"
             )
             stick_disp = (
-                f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
+                f"stick={stick_ratio * 100:.2f}%" if stick_ratio is not None else "stick=--"
             )
             slip_disp = (
-                f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
+                f"slip={slip_ratio * 100:.2f}%" if slip_ratio is not None else "slip=--"
             )
             gap_p01 = None
             if self.contact is not None:
@@ -771,30 +943,40 @@ class Trainer:
 
             gap_terms: List[str] = []
             if min_gap is not None:
-                gap_terms.append(f"gmin={min_gap:.2e}")
+                gap_terms.append(f"gmin={min_gap:.4e}")
             if gap_p01 is not None:
-                gap_terms.append(f"g01={gap_p01:.2e}")
+                gap_terms.append(f"g01={gap_p01:.4e}")
             if mean_gap is not None:
-                gap_terms.append(f"gmean={mean_gap:.2e}")
+                gap_terms.append(f"gmean={mean_gap:.4e}")
             gap_disp = " ".join(gap_terms) if gap_terms else "gmean=--"
+
+            weights = self._loss_weight_lookup()
+            eq_rms = _get_stat_float("eq_rms")
+            reg_rms = _get_stat_float("reg_rms")
+            eq_terms: List[str] = []
+            if weights.get("E_eq", 0.0) > 1e-15:
+                eq_terms.append(f"eqrms={eq_rms:.4e}" if eq_rms is not None else "eqrms=--")
+            if weights.get("E_reg", 0.0) > 1e-15:
+                eq_terms.append(f"regrms={reg_rms:.4e}" if reg_rms is not None else "regrms=--")
+            eq_disp = " ".join(eq_terms)
 
             # Von Mises 应力及屈服比（若提供 yield_strength）
             vm_phys_max = _get_stat_float("stress_vm_phys_max")
             vm_pred_max = _get_stat_float("stress_vm_pred_max")
             vm_ref = vm_phys_max if vm_phys_max is not None else vm_pred_max
             if vm_phys_max is not None and vm_pred_max is not None:
-                vm_disp = f"σvm={vm_phys_max:.2e}(pred={vm_pred_max:.2e})"
+                vm_disp = f"σvm={vm_phys_max:.4e}(pred={vm_pred_max:.4e})"
             elif vm_phys_max is not None:
-                vm_disp = f"σvm={vm_phys_max:.2e}"
+                vm_disp = f"σvm={vm_phys_max:.4e}"
             elif vm_pred_max is not None:
-                vm_disp = f"σvm_pred={vm_pred_max:.2e}"
+                vm_disp = f"σvm_pred={vm_pred_max:.4e}"
             else:
                 vm_disp = ""
             vm_ratio_disp = ""
             if vm_ref is not None and getattr(self.cfg, "yield_strength", None):
                 y = float(self.cfg.yield_strength)
                 if y > 0:
-                    vm_ratio_disp = f"σvm/σy={vm_ref / y:.2f}"
+                    vm_ratio_disp = f"σvm/σy={vm_ref / y:.3f}"
 
             order_txt = ""
             if order is not None:
@@ -822,10 +1004,10 @@ class Trainer:
                     order_txt = " order=?"
             parts_disp = energy_disp or ""
             unit = str(getattr(self.cfg.tightening_cfg, "angle_unit", "deg") or "deg")
-            angle_txt = ",".join(f"{a:.2f}" for a in angles)
+            angle_txt = ",".join(f"{a:.4f}" for a in angles)
             postfix = (
-                f"theta=[{angle_txt}]{unit}{order_txt} Π={pin:.3e} | {parts_disp}{tight_txt} "
-                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {vm_disp} {vm_ratio_disp}"
+                f"theta=[{angle_txt}]{unit}{order_txt} Π={pin:.6e} | {parts_disp}{tight_txt} "
+                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {eq_disp} {vm_disp} {vm_ratio_disp}"
             )
             return postfix, "已记录"
         except Exception:
@@ -1408,18 +1590,21 @@ class Trainer:
 
         print(f"[INFO] Build.start  mesh_path={cfg.inp_path}")
 
-        pb_kwargs = dict(total=len(steps), desc="Build", leave=True)
+        pb_kwargs = dict(
+            total=len(steps),
+            desc="Build",
+            leave=True,
+            disable=not (self._tqdm_enabled and self.cfg.build_bar_enabled),
+        )
         if cfg.build_bar_color:
             pb_kwargs["colour"] = cfg.build_bar_color
         with tqdm(**pb_kwargs) as pb:
-            # 1) Mesh (INP/CDB)
+            # 1) Mesh (CDB only)
             ext = os.path.splitext(cfg.inp_path)[1].lower()
-            if ext == ".cdb":
-                self.asm = load_cdb(cfg.inp_path)
-                mesh_tag = "CDB"
-            else:
-                self.asm = load_inp(cfg.inp_path)
-                mesh_tag = "INP"
+            if ext != ".cdb":
+                raise ValueError(f"[trainer] Only .cdb is supported, got: {cfg.inp_path}")
+            self.asm = load_cdb(cfg.inp_path)
+            mesh_tag = "CDB"
             print(f"[INFO] Loaded {mesh_tag}: surfaces={len(self.asm.surfaces)} "
                   f"elsets={len(self.asm.elsets)} contact_pairs(raw)={len(getattr(self.asm, 'contact_pairs', []))}")
             pb.update(1)
@@ -1460,23 +1645,18 @@ class Trainer:
 
             pb.update(1)
 
-            # 3) 弹性项 —— 改为 DFEM 构造方式
-            # 注意：X_vol / w_vol / mat_id 依然保留在 Trainer 里用于可视化与检查，
-            # 但不再传进 ElasticityEnergy，DFEM 内部自己做子单元积分。
-            self.elasticity = ElasticityEnergy(
+            # 3) Elasticity (residual)
+            self.elasticity = ElasticityResidual(
                 asm=self.asm,
-                part2mat=cfg.part2mat,
+                X_vol=X_vol,
+                w_vol=w_vol,
+                mat_id=mat_id,
+                matlib=self.matlib,
                 materials=cfg.materials,
                 cfg=cfg.elas_cfg,
             )
+            print("[trainer] Elasticity: residual (volume points)")
             pb.update(1)
-            
-            # DFEM integration: update model config with n_nodes from elasticity
-            if hasattr(cfg, 'model_cfg') and hasattr(cfg.model_cfg, 'field'):
-                if getattr(cfg.model_cfg.field, 'dfem_mode', False):
-                    n_nodes = self.elasticity.n_nodes
-                    cfg.model_cfg.field.n_nodes = n_nodes
-                    print(f"[trainer] DFEM mode: set n_nodes={n_nodes} from ElasticityEnergy")
 
             # 4) 接触（优先使用 cfg；否则尝试自动探测）
             self._cp_specs = []
@@ -1502,6 +1682,10 @@ class Trainer:
                         self._cp_specs,
                         cfg.n_contact_points_per_pair,
                         seed=cfg.contact_seed,
+                        two_pass=cfg.contact_two_pass,
+                        mode=cfg.contact_mode,
+                        mortar_gauss=cfg.contact_mortar_gauss,
+                        mortar_max_points=cfg.contact_mortar_max_points,
                     )
                     cat = cmap.concatenate()
                     self.contact = ContactOperator(cfg.contact_cfg)
@@ -1544,7 +1728,7 @@ class Trainer:
             pb.update(1)
 
             # 6) Ties/BCs（如需，可在 cfg 里填充）
-            self.ties_ops, self.bcs_ops = [], []
+            self.bcs_ops = []
             pb.update(1)
 
             # 6.5) 根据预紧特征维度统一 ParamEncoder 输入形状，避免 staged 特征长度变化
@@ -1563,25 +1747,65 @@ class Trainer:
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
-            
-            # Pre-build adjacency using mesh node coordinates (recommended for DFEM energy:
-            # ElasticityEnergy evaluates u on all nodes every step; caching avoids rebuilding kNN each call).
+
+            # Pre-build adjacency with optional npz cache.
             if hasattr(self, "elasticity") and self.elasticity is not None:
                 try:
-                    X_nodes = self.elasticity.X_nodes_tf
-                    self.model.field.prebuild_adjacency(X_nodes)
+                    X_nodes_np = getattr(self.elasticity, "X_nodes", None)
+                    if X_nodes_np is None:
+                        X_nodes_np = self.elasticity.X_nodes_tf.numpy()
+                    n_nodes = int(X_nodes_np.shape[0])
+                    k = int(getattr(cfg.model_cfg.field, "graph_k", 0) or 0)
+                    cache_path = None
+                    loaded = False
+                    if cfg.graph_cache_enabled and n_nodes > 0 and k > 0:
+                        cache_path = self._graph_cache_path(n_nodes)
+                        if os.path.exists(cache_path):
+                            data = np.load(cache_path)
+                            knn_idx = data.get("knn_idx")
+                            if knn_idx is not None and knn_idx.shape == (n_nodes, k):
+                                knn_tf = tf.convert_to_tensor(knn_idx, dtype=tf.int32)
+                                self.model.field._global_knn_idx = knn_tf
+                                self.model.field._global_knn_n = n_nodes
+                                self.model.field._global_adj = _knn_to_adj(knn_tf, n_nodes)
+                                loaded = True
+                                print(f"[graph] Loaded cached kNN: {cache_path}")
+                    if not loaded:
+                        self.model.field.prebuild_adjacency(X_nodes_np)
+                        print(f"[graph] Pre-built kNN: N={n_nodes} k={k}")
+                        if cfg.graph_cache_enabled and cache_path:
+                            try:
+                                knn_idx_np = self.model.field._global_knn_idx.numpy()
+                                np.savez_compressed(cache_path, knn_idx=knn_idx_np)
+                                print(f"[graph] Saved kNN cache: {cache_path}")
+                            except Exception as exc:
+                                print(f"[graph] Cache save failed: {exc}")
                 except Exception as exc:
                     print(f"[trainer] WARNING: 预构建全局邻接失败，将退回动态构图：{exc}")
-                    
-            # Legacy graph precompute (for non-DFEM mode)
-            if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
+
+            # Attach engineering semantics (optional, default-off).
+            if bool(getattr(cfg.model_cfg.field, "use_engineering_semantics", False)):
                 try:
-                    self.model.field.set_global_graph(self.elasticity.X_nodes_tf)
+                    sem_feat = build_node_semantic_features(
+                        self.asm,
+                        sorted_node_ids=self.elasticity.sorted_node_ids,
+                        part2mat=cfg.part2mat,
+                        mirror_surface_name=cfg.mirror_surface_name,
+                    )
+                    expected_dim = int(getattr(cfg.model_cfg.field, "semantic_feat_dim", 0) or 0)
+                    if expected_dim > 0 and sem_feat.shape[1] != expected_dim:
+                        if sem_feat.shape[1] > expected_dim:
+                            sem_feat = sem_feat[:, :expected_dim]
+                        else:
+                            pad = np.zeros((sem_feat.shape[0], expected_dim - sem_feat.shape[1]), dtype=np.float32)
+                            sem_feat = np.concatenate([sem_feat, pad], axis=1)
+                    self.model.field.set_node_semantic_features(sem_feat)
                     print(
-                        f"[graph] 已预计算全局 kNN 邻接: N={getattr(self.elasticity, 'n_nodes', '?')} k={cfg.model_cfg.field.graph_k}"
+                        f"[model] attached engineering semantic features: "
+                        f"{sem_feat.shape[0]}x{sem_feat.shape[1]}"
                     )
                 except Exception as exc:
-                    print(f"[graph] 预计算全局邻接失败，将退回动态构图：{exc}")
+                    print(f"[trainer] WARNING: 语义特征构建/挂载失败，将继续无语义特征训练：{exc}")
             base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
             mp_policy = str(cfg.mixed_precision or "").strip().lower()
             use_loss_scale = mp_policy.startswith("mixed_")
@@ -1589,6 +1813,7 @@ class Trainer:
                 base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
                 print("[trainer] 已启用 LossScaleOptimizer 以配合混合精度训练。")
             self.optimizer = base_optimizer
+            self._apply_gradients_kwargs = self._compute_apply_gradients_kwargs(self.optimizer)
             pb.update(1)
 
             # 8) checkpoint
@@ -1637,9 +1862,7 @@ class Trainer:
         total.attach(
             elasticity=self.elasticity,
             contact=self.contact,
-            preload=None,
             tightening=self.tightening,
-            ties=self.ties_ops,
             bcs=self.bcs_ops,
         )
         return total
@@ -1966,6 +2189,10 @@ class Trainer:
                 self.cfg.n_contact_points_per_pair,
                 base_seed=self.cfg.contact_seed,
                 step_index=step_index,
+                two_pass=self.cfg.contact_two_pass,
+                mode=self.cfg.contact_mode,
+                mortar_gauss=self.cfg.contact_mortar_gauss,
+                mortar_max_points=self.cfg.contact_mortar_max_points,
             )
             cat_uniform = cmap.concatenate()
             cat, rar_note = self._maybe_apply_contact_rar(cat_uniform, step_index)
@@ -2143,6 +2370,59 @@ class Trainer:
             )
         return out
 
+    def _uncertainty_enabled(self) -> bool:
+        if float(getattr(self.cfg, "uncertainty_loss_weight", 0.0) or 0.0) <= 0.0:
+            return False
+        if int(getattr(self.cfg, "uncertainty_sample_points", 0) or 0) <= 0:
+            return False
+        try:
+            out_dim = int(getattr(self.model.field.cfg, "uncertainty_out_dim", 0) or 0)
+        except Exception:
+            out_dim = 0
+        return out_dim > 0 and hasattr(self.model, "uvar_fn") and self.elasticity is not None
+
+    def _compute_uncertainty_proxy_loss_tf(
+        self,
+        params: Dict[str, Any],
+        parts: Dict[str, tf.Tensor],
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        if not self._uncertainty_enabled():
+            z = tf.cast(0.0, tf.float32)
+            return z, {"unc_sigma_mean": z, "unc_proxy_mean": z}
+
+        n_req = int(getattr(self.cfg, "uncertainty_sample_points", 0) or 0)
+        X_all = tf.cast(self.elasticity.X_vol_tf, tf.float32)
+        n = tf.minimum(tf.shape(X_all)[0], tf.cast(n_req, tf.int32))
+        X = X_all[:n]
+
+        u_mean, log_var = self.model.uvar_fn(X, params)
+        lv_min = float(getattr(self.cfg, "uncertainty_logvar_min", -8.0))
+        lv_max = float(getattr(self.cfg, "uncertainty_logvar_max", 6.0))
+        log_var = tf.clip_by_value(tf.cast(log_var, tf.float32), lv_min, lv_max)
+        sigma_pred = tf.exp(0.5 * log_var)
+
+        e_cn = tf.cast(parts.get("E_cn", tf.cast(0.0, tf.float32)), tf.float32)
+        e_ct = tf.cast(parts.get("E_ct", tf.cast(0.0, tf.float32)), tf.float32)
+        e_eq = tf.cast(parts.get("E_eq", tf.cast(0.0, tf.float32)), tf.float32)
+        residual_scalar = tf.sqrt(tf.maximum(e_cn + e_ct + e_eq, 0.0) + 1.0e-12)
+        residual_scalar = residual_scalar / (1.0 + residual_scalar)
+
+        sigma_proxy = compute_uncertainty_proxy_sigma(
+            tf.cast(u_mean, tf.float32),
+            residual_scalar,
+            proxy_scale=float(getattr(self.cfg, "uncertainty_proxy_scale", 1.0)),
+        )
+        sigma_proxy = tf.broadcast_to(sigma_proxy, tf.shape(sigma_pred))
+        loss_main = tf.reduce_mean(tf.square(sigma_pred - sigma_proxy))
+        loss_reg = tf.cast(1.0e-3, tf.float32) * tf.reduce_mean(tf.square(log_var))
+        loss_unc = loss_main + loss_reg
+        stats = {
+            "unc_sigma_mean": tf.reduce_mean(sigma_pred),
+            "unc_proxy_mean": tf.reduce_mean(sigma_proxy),
+            "unc_residual_scalar": residual_scalar,
+        }
+        return loss_unc, stats
+
     def _compute_total_loss(
         self,
         total: TotalEnergy,
@@ -2161,11 +2441,14 @@ class Trainer:
         Pi_raw, parts, stats = total.energy(
             self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
         )
+        if self._uncertainty_enabled():
+            E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
+            parts["E_unc"] = tf.cast(E_unc, tf.float32)
+            stats.update(unc_stats)
         Pi = Pi_raw
         if self.loss_state is not None:
             if adaptive:
                 update_loss_weights(self.loss_state, parts, stats)
-            self._tie_preload_weight_to_internal()
             Pi = combine_loss(parts, self.loss_state)
         reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
         loss = Pi + reg
@@ -2192,6 +2475,10 @@ class Trainer:
         _, parts, stats = total.energy(
             self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
         )
+        if self._uncertainty_enabled():
+            E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
+            parts["E_unc"] = tf.cast(E_unc, tf.float32)
+            stats.update(unc_stats)
 
         # No lock penalty: earlier bolts are free to relax.
 
@@ -2199,66 +2486,10 @@ class Trainer:
         if self.loss_state is not None:
             if adaptive:
                 update_loss_weights(self.loss_state, parts, stats)
-            self._tie_preload_weight_to_internal()
             Pi = combine_loss(parts, self.loss_state)
         reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
         loss = Pi + reg
         return loss, Pi, parts, stats
-
-    def _tie_preload_weight_to_internal(self) -> None:
-        """
-        Keep the external preload work term on the same scale as the internal energy term.
-
-        In the potential-energy formulation Π = U_int - W_pre, weighting W_pre independently
-        is equivalent to implicitly scaling the applied preload P.  We therefore keep
-        W_pre's weight in a fixed ratio to E_int's weight, and avoid using W_pre as a
-        driver term in adaptive weighting.
-        """
-
-        state = self.loss_state
-        if state is None:
-            return
-        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
-        if loss_mode in {"residual", "residual_only", "res"}:
-            return
-
-        focus_terms = getattr(state, "focus_terms", tuple()) or tuple()
-        if "W_pre" in focus_terms:
-            # User explicitly opted in to adapting W_pre; don't override.
-            return
-
-        if "E_int" not in state.current:
-            return
-
-        try:
-            base_int = float(state.base.get("E_int", 0.0) or 0.0)
-            base_pre = float(state.base.get("W_pre", 0.0) or 0.0)
-            cur_int = float(state.current.get("E_int", base_int) or 0.0)
-        except Exception:
-            return
-
-        if base_pre <= 0.0:
-            # Disabled preload term stays disabled.
-            state.current["W_pre"] = 0.0
-            return
-
-        ratio = 1.0
-        if abs(base_int) > 0.0:
-            ratio = base_pre / base_int
-
-        new_pre = max(0.0, cur_int * ratio)
-        min_w = getattr(state, "min_weight", None)
-        max_w = getattr(state, "max_weight", None)
-        if min_w is not None:
-            new_pre = max(float(min_w), new_pre)
-        if max_w is not None:
-            # Match LossWeightState.from_config(): allow base weights to exceed the
-            # global max bound by treating the base as a per-term ceiling.
-            base_cap = float(state.base.get("W_pre", new_pre) or new_pre)
-            eff_max = max(float(max_w), base_cap)
-            new_pre = min(eff_max, new_pre)
-        state.current["W_pre"] = float(new_pre)
-
     # ----------------- tf.function compiled cores -----------------
 
     def _loss_from_parts_and_weights(
@@ -2277,6 +2508,47 @@ class Trainer:
             loss = loss + tf.cast(weights[idx], tf.float32) * tf.cast(val, tf.float32)
         return loss
 
+    @staticmethod
+    def _compute_apply_gradients_kwargs(optimizer: Any) -> Dict[str, Any]:
+        """Detect optimizer kwargs once to avoid per-step reflection overhead."""
+
+        if optimizer is None:
+            return {}
+        try:
+            sig = inspect.signature(optimizer.apply_gradients)
+        except (TypeError, ValueError, AttributeError):
+            return {}
+        if "experimental_aggregate_gradients" in sig.parameters:
+            return {"experimental_aggregate_gradients": False}
+        return {}
+
+    def _build_weight_vector_from_maps(
+        self,
+        weight_map: Mapping[str, Any],
+        sign_map: Optional[Mapping[str, Any]] = None,
+    ) -> tf.Tensor:
+        keys = getattr(self, "_loss_keys", [])
+        if not keys:
+            return tf.zeros((0,), dtype=tf.float32)
+        sign_map = sign_map or {}
+        weights = []
+        for key in keys:
+            w = float(weight_map.get(key, 0.0) or 0.0)
+            sign = float(sign_map.get(key, 1.0))
+            weights.append(w * sign)
+        return tf.convert_to_tensor(weights, dtype=tf.float32)
+
+    def _refresh_static_weight_vector(self):
+        """Refresh cached weight vector for non-adaptive training."""
+
+        if self.loss_state is not None:
+            self._static_weight_vector = None
+            return
+        self._static_weight_vector = self._build_weight_vector_from_maps(
+            getattr(self, "_base_weights", {}),
+            {},
+        )
+
     def _build_weight_vector(self) -> tf.Tensor:
         """Build a weight vector aligned with self._loss_keys (sign applied)."""
         keys = getattr(self, "_loss_keys", [])
@@ -2285,25 +2557,18 @@ class Trainer:
 
         # Choose the source weight dict.
         if self.loss_state is not None:
-            weight_map = self.loss_state.current
-            sign_map = self.loss_state.sign_overrides
-        else:
-            weight_map = getattr(self, "_base_weights", {})
-            sign_map = None
+            return self._build_weight_vector_from_maps(
+                self.loss_state.current,
+                self.loss_state.sign_overrides,
+            )
 
-        if sign_map is None:
-            loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
-            if loss_mode in {"residual", "residual_only", "res"}:
-                sign_map = {"W_pre": 1.0}
-            else:
-                sign_map = {"W_pre": -1.0}
-
-        weights = []
-        for key in keys:
-            w = float(weight_map.get(key, 0.0) or 0.0)
-            sign = float(sign_map.get(key, 1.0)) if sign_map is not None else 1.0
-            weights.append(w * sign)
-        return tf.convert_to_tensor(weights, dtype=tf.float32)
+        cached = getattr(self, "_static_weight_vector", None)
+        if cached is None:
+            self._refresh_static_weight_vector()
+            cached = getattr(self, "_static_weight_vector", None)
+        if cached is None:
+            return tf.zeros((0,), dtype=tf.float32)
+        return cached
 
     @tf.function(reduce_retracing=True)
     def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
@@ -2323,6 +2588,10 @@ class Trainer:
             _, parts, stats = total.energy(
                 self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
             )
+            if self._uncertainty_enabled():
+                E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
+                parts["E_unc"] = tf.cast(E_unc, tf.float32)
+                stats.update(unc_stats)
             loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
             reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
             loss_total = loss_no_reg + reg
@@ -2361,6 +2630,10 @@ class Trainer:
             _, parts, stats = total.energy(
                 self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
             )
+            if self._uncertainty_enabled():
+                E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
+                parts["E_unc"] = tf.cast(E_unc, tf.float32)
+                stats.update(unc_stats)
             # No lock penalty: earlier bolts are free to relax.
 
             loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
@@ -2401,7 +2674,6 @@ class Trainer:
 
         if self.loss_state is not None:
             update_loss_weights(self.loss_state, parts, stats)
-            self._tie_preload_weight_to_internal()
             Pi = combine_loss(parts, self.loss_state)
         else:
             Pi = loss_no_reg
@@ -2436,16 +2708,10 @@ class Trainer:
         if (not loss_finite) or (not grad_norm_finite):
             return Pi, parts, stats, grad_norm
 
-        apply_kwargs = {}
-        try:
-            sig = inspect.signature(opt.apply_gradients)
-            if "experimental_aggregate_gradients" in sig.parameters:
-                apply_kwargs["experimental_aggregate_gradients"] = False
-        except (TypeError, ValueError):
-            # 如果优化器未公开签名或 apply_gradients 被包装，则回退默认行为
-            apply_kwargs = {}
-
-        opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
+        opt.apply_gradients(
+            zip(g_list, v_list),
+            **getattr(self, "_apply_gradients_kwargs", {}),
+        )
 
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
@@ -2527,7 +2793,6 @@ class Trainer:
 
                 if self.loss_state is not None:
                     update_loss_weights(self.loss_state, parts, stats)
-                    self._tie_preload_weight_to_internal()
                     Pi = combine_loss(parts, self.loss_state)
                 else:
                     Pi = loss_no_reg
@@ -2556,15 +2821,10 @@ class Trainer:
                 if not (np.isfinite(loss_val) and grad_norm_finite):
                     continue
 
-                apply_kwargs = {}
-                try:
-                    sig = inspect.signature(opt.apply_gradients)
-                    if "experimental_aggregate_gradients" in sig.parameters:
-                        apply_kwargs["experimental_aggregate_gradients"] = False
-                except (TypeError, ValueError):
-                    apply_kwargs = {}
-
-                opt.apply_gradients(zip(g_list, v_list), **apply_kwargs)
+                opt.apply_gradients(
+                    zip(g_list, v_list),
+                    **getattr(self, "_apply_gradients_kwargs", {}),
+                )
 
             # Stage ALM update (once per stage by default)
             if stage_alm_every > 0 and ((stage_idx + 1) % stage_alm_every == 0):
@@ -2661,6 +2921,7 @@ class Trainer:
             )
             if self.cfg.train_bar_color:
                 lbfgs_kwargs["colour"] = self.cfg.train_bar_color
+            lbfgs_kwargs["disable"] = not (self._tqdm_enabled and self.cfg.train_bar_enabled)
             pbar = tqdm(**lbfgs_kwargs)
 
         train_vars = self._collect_trainable_variables()
@@ -2748,12 +3009,15 @@ class Trainer:
         self.build()
         print(f"[trainer] 当前训练设备：{self.device_summary}")
         total = self._assemble_total()
-        attach_ties_and_bcs_from_inp(
+        self.bcs_ops = attach_bcs_from_asm(
             total=total,
             asm=self.asm,
             cfg=self.cfg,
         )
-        print("[dbg] Tie/BC 已挂载到 total")
+        if self.bcs_ops:
+            print(f"[bc] 已挂载 {len(self.bcs_ops)} 组边界约束")
+        else:
+            print("[bc] 未发现边界约束，跳过挂载")
         self._total_ref = total
 
         # ---- 初始化自适应损失权重状态 ----
@@ -2762,16 +3026,16 @@ class Trainer:
             "E_int": self.cfg.total_cfg.w_int,
             "E_cn": self.cfg.total_cfg.w_cn,
             "E_ct": self.cfg.total_cfg.w_ct,
-            "E_tie": self.cfg.total_cfg.w_tie,
             "E_bc": self.cfg.total_cfg.w_bc,
-            "W_pre": self.cfg.total_cfg.w_pre,
             "E_tight": self.cfg.total_cfg.w_tight,
             "E_sigma": self.cfg.total_cfg.w_sigma,
             "E_eq": getattr(self.cfg.total_cfg, "w_eq", 0.0),
             "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
+            "E_bi": getattr(self.cfg.total_cfg, "w_bi", 0.0),
+            "E_ed": getattr(self.cfg.total_cfg, "w_ed", 0.0),
+            "E_unc": getattr(self.cfg, "uncertainty_loss_weight", 0.0),
             "path_penalty_total": getattr(self.cfg.total_cfg, "path_penalty_weight", 0.0),
             "fric_path_penalty_total": getattr(self.cfg.total_cfg, "fric_path_penalty_weight", 0.0),
-            # 残差项默认权重为 0，需要的话再在 config 里改
             "R_fric_comp": 0.0,
             "R_contact_comp": 0.0,
         }
@@ -2779,11 +3043,7 @@ class Trainer:
         self._loss_keys = list(base_weights.keys())
 
         adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
-        loss_mode = str(getattr(self.cfg.total_cfg, "loss_mode", "energy") or "energy").strip().lower()
-        if loss_mode in {"residual", "residual_only", "res"}:
-            sign_overrides = {"W_pre": 1.0}
-        else:
-            sign_overrides = {"W_pre": -1.0}
+        sign_overrides = {}
         if adaptive_enabled:
             scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
             focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
@@ -2802,22 +3062,34 @@ class Trainer:
             )
         else:
             self.loss_state = None
+        self._refresh_static_weight_vector()
         if self.cfg.lbfgs_enabled:
             train_desc = "Adam阶段 (1/2)"
         else:
             train_desc = "训练"
-        train_pb_kwargs = dict(total=self.cfg.max_steps, desc=train_desc, leave=True)
+        train_pb_kwargs = dict(
+            total=self.cfg.max_steps,
+            desc=train_desc,
+            leave=True,
+            disable=not (self._tqdm_enabled and self.cfg.train_bar_enabled),
+        )
+        step_detail_enabled = self._step_detail_enabled()
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color
         with tqdm(**train_pb_kwargs) as p_train:
             for step in range(1, self.cfg.max_steps + 1):
                 # 子进度条：本 step 的 4 个动作
-                step_pb_kwargs = dict(total=4, leave=False)
+                step_pb_kwargs = dict(
+                    total=4,
+                    leave=False,
+                    disable=not step_detail_enabled,
+                )
                 if self.cfg.step_bar_color:
                     step_pb_kwargs["colour"] = self.cfg.step_bar_color
                 with tqdm(**step_pb_kwargs) as p_step:
                     # 1) 接触重采样
-                    self._set_pbar_desc(p_step, f"step {step}: 接触重采样")
+                    if step_detail_enabled:
+                        self._set_pbar_desc(p_step, f"step {step}: 接触重采样")
                     t0 = time.perf_counter()
                     contact_note = "跳过"
                     if self.contact is None:
@@ -2827,17 +3099,18 @@ class Trainer:
                         if self.cfg.incremental_mode and self.cfg.stage_resample_contact:
                             contact_note = "阶段内重采样"
                         else:
-                            should_resample = step == 1
-                            if not should_resample and self.cfg.resample_contact_every > 0:
+                            should_resample = False
+                            if self.cfg.resample_contact_every and self.cfg.resample_contact_every > 0:
                                 should_resample = (
-                                    (step - 1) % self.cfg.resample_contact_every == 0
+                                    step == 1
+                                    or (step - 1) % self.cfg.resample_contact_every == 0
                                 )
 
                             if should_resample:
                                 contact_note = self._resample_contact(step)
                             else:
                                 if self.cfg.resample_contact_every <= 0:
-                                    contact_note = "跳过 (沿用首步采样)"
+                                    contact_note = "跳过 (沿用构建采样)"
                                 else:
                                     remaining = self.cfg.resample_contact_every - (
                                         (step - 1) % self.cfg.resample_contact_every
@@ -2845,14 +3118,16 @@ class Trainer:
                                     contact_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("resample", elapsed))
-                    self._set_pbar_postfix(
-                        p_step,
-                        f"{contact_note} | {self._format_seconds(elapsed)}"
-                    )
+                    if step_detail_enabled:
+                        self._set_pbar_postfix(
+                            p_step,
+                            f"{contact_note} | {self._format_seconds(elapsed)}"
+                        )
                     p_step.update(1)
 
                     # 2) 前向 + 反传（随机采样三螺栓预紧力）
-                    self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
+                    if step_detail_enabled:
+                        self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
                     preload_case = self._sample_preload_case()
                     # 动态提升接触惩罚/ALM 参数（软→硬）
@@ -2885,38 +3160,40 @@ class Trainer:
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
                     grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
-                    rel_pct = rel_pi * 100.0 if rel_pi is not None else None
-                    rel_txt = (
-                        f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
-                    )
-                    d_txt = (
-                        f"ΔΠ={rel_delta * 100:+.1f}%"
-                        if rel_delta is not None
-                        else "ΔΠ=--"
-                    )
-                    ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
-                    order_txt = ""
-                    if order_np is not None:
-                        order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
-                    energy_summary = self._format_energy_summary(parts)
-                    energy_txt = f" | {energy_summary}" if energy_summary else ""
-                    if vol_note:
-                        energy_txt += f" | {vol_note}"
-                    train_note = (
-                        f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
-                        f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
-                        f"grad={grad_val:.2e} {ema_txt}"
-                    )
-                    if step == 1:
-                        train_note += " | 首轮包含图追踪/缓存构建"
-                    self._set_pbar_postfix(
-                        p_step,
-                        f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
-                    )
+                    if step_detail_enabled:
+                        rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+                        rel_txt = (
+                            f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+                        )
+                        d_txt = (
+                            f"ΔΠ={rel_delta * 100:+.1f}%"
+                            if rel_delta is not None
+                            else "ΔΠ=--"
+                        )
+                        ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
+                        order_txt = ""
+                        if order_np is not None:
+                            order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
+                        energy_summary = self._format_energy_summary_if_needed(parts)
+                        energy_txt = f" | {energy_summary}" if energy_summary else ""
+                        if vol_note:
+                            energy_txt += f" | {vol_note}"
+                        train_note = (
+                            f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
+                            f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
+                            f"grad={grad_val:.2e} {ema_txt}"
+                        )
+                        if step == 1:
+                            train_note += " | 首轮包含图追踪/缓存构建"
+                        self._set_pbar_postfix(
+                            p_step,
+                            f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
+                        )
                     p_step.update(1)
 
                     # 3) ALM 更新
-                    self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
+                    if step_detail_enabled:
+                        self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
                     t0 = time.perf_counter()
                     alm_note = "跳过"
                     if self.contact is None:
@@ -2936,14 +3213,16 @@ class Trainer:
                         alm_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("alm", elapsed))
-                    self._set_pbar_postfix(
-                        p_step,
-                        f"{alm_note} | {self._format_seconds(elapsed)}"
-                    )
+                    if step_detail_enabled:
+                        self._set_pbar_postfix(
+                            p_step,
+                            f"{alm_note} | {self._format_seconds(elapsed)}"
+                        )
                     p_step.update(1)
 
                     # 4) 日志/检查点
-                    self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
+                    if step_detail_enabled:
+                        self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
                     if self.cfg.log_every <= 0:
@@ -2988,10 +3267,11 @@ class Trainer:
                         log_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("log", elapsed))
-                    self._set_pbar_postfix(
-                        p_step,
-                        f"{log_note} | {self._format_seconds(elapsed)}"
-                    )
+                    if step_detail_enabled:
+                        self._set_pbar_postfix(
+                            p_step,
+                            f"{log_note} | {self._format_seconds(elapsed)}"
+                        )
                     p_step.update(1)
 
                 p_train.update(1)
@@ -3003,14 +3283,20 @@ class Trainer:
                             "resample": "采样",
                             "train": "前向/反传",
                             "alm": "ALM",
-                            "log": "日志"
+                            "log": "日志",
                         }
+                        stage_totals: Dict[str, float] = {}
+                        for name, t in self._step_stage_times:
+                            stage_totals[name] = stage_totals.get(name, 0.0) + float(t)
+                        n_steps = max(1, int(round(len(self._step_stage_times) / 4.0)))
+                        avg_step = total_spent / n_steps
+                        ordered = ["resample", "train", "alm", "log"]
                         parts_txt = ", ".join(
-                            f"{label_map.get(name, name)}:{t / total_spent * 100:.0f}%"
-                            for name, t in self._step_stage_times
+                            f"{label_map.get(name, name)}:{stage_totals.get(name, 0.0) / total_spent * 100:.0f}%"
+                            for name in ordered
                         )
                         summary_note = (
-                            f"step{step}耗时 {self._format_seconds(total_spent)} ({parts_txt})"
+                            f"step{step}平均耗时 {self._format_seconds(avg_step)} ({parts_txt})"
                         )
                         if step == 1:
                             summary_note += " | 首轮额外包括图追踪/初次缓存"
@@ -3763,3 +4049,5 @@ class _SavedModelModule(tf.Module):
 
         stage_feat = feats_ta.stack()
         return stage_P, stage_feat
+
+

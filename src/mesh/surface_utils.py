@@ -148,7 +148,7 @@ C3D10_FACES = {
 SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D5", "C3D6", "C3D10", "SOLID185"}
 
 # ANSYS contact/target surface elements
-SURFACE_ELEMENT_TYPES = {"TARGE170", "CONTA173", "CONTA174"}
+SURFACE_ELEMENT_TYPES = {"TARGE170", "CONTA173", "CONTA174", "SURF154", "ET_154"}
 
 
 def _ordered_unique(nodes: Iterable[int]) -> List[int]:
@@ -328,6 +328,17 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
             et = (blk.elem_type or "").upper()
             for eid, conn in zip(blk.elem_ids, blk.connectivity):
                 elem_index[int(eid)] = (et, conn, pname)
+
+    # Fallback: include assembly-level elements that are not part-assigned
+    # (e.g., SURF154 surface elements exported as standalone components).
+    if hasattr(asm, "element_types"):
+        for eid, conn in getattr(asm, "elements", {}).items():
+            if int(eid) in elem_index:
+                continue
+            et = getattr(asm, "element_types", {}).get(int(eid), "")
+            if not et:
+                continue
+            elem_index[int(eid)] = (et, list(conn), "_ASM_")
 
     tri_nodes: List[Tuple[int, int, int]] = []
     tri_eids: List[int] = []

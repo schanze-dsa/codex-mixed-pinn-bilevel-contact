@@ -110,7 +110,6 @@ def _default_saved_model_dir(out_dir: str) -> str:
 
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
-from inp_io.inp_parser import load_inp
 from inp_io.cdb_parser import load_cdb
 from mesh.contact_pairs import guess_surface_key
 
@@ -150,7 +149,7 @@ def _auto_resolve_surface_keys(asm, key_or_hint: str) -> str:
         raise KeyError(msg)
 
 
-# ---------- 读取 INP + 组装 TrainerConfig（并返回 asm 以供审计打印） ----------
+# ---------- 读取 CDB + 组装 TrainerConfig（并返回 asm 以供审计打印） ----------
 def _prepare_config_with_autoguess():
     # 0) 读取 config.yaml（若存在）
     cfg_yaml = _load_yaml_config()
@@ -166,10 +165,9 @@ def _prepare_config_with_autoguess():
     if not os.path.exists(inp_path):
         raise FileNotFoundError(f"未找到网格文件：{inp_path}。请在 config.yaml 中填写正确路径。")
     ext = os.path.splitext(inp_path)[1].lower()
-    if ext == ".cdb":
-        asm = load_cdb(inp_path)
-    else:
-        asm = load_inp(inp_path)
+    if ext != ".cdb":
+        raise ValueError("当前仅支持 .cdb 网格文件，请在 config.yaml 中提供 cdb_path/inp_path=*.cdb")
+    asm = load_cdb(inp_path)
 
     # 2) 镜面表面名
     mirror_surface_name = cfg_yaml.get("mirror_surface_name", "").strip()
@@ -268,6 +266,19 @@ def _prepare_config_with_autoguess():
 
     train_steps = int(optimizer_cfg.get("epochs", TrainerConfig.max_steps))
     n_contact_points_per_pair = int(cfg_yaml.get("n_contact_points_per_pair", TrainerConfig.n_contact_points_per_pair))
+    contact_two_pass = bool(cfg_yaml.get("contact_two_pass", TrainerConfig.contact_two_pass))
+    contact_mode = str(cfg_yaml.get("contact_mode", TrainerConfig.contact_mode))
+    contact_mortar_gauss = int(cfg_yaml.get("contact_mortar_gauss", TrainerConfig.contact_mortar_gauss))
+    contact_mortar_max_points = int(cfg_yaml.get("contact_mortar_max_points", TrainerConfig.contact_mortar_max_points))
+    contact_mode_norm = contact_mode.strip().lower()
+    if contact_mode_norm not in {"sample", "mortar"}:
+        raise ValueError(f"contact_mode 仅支持 'sample' 或 'mortar'，当前为 {contact_mode!r}")
+    if contact_mode_norm == "mortar":
+        if contact_mortar_gauss not in (1, 3, 7):
+            raise ValueError(f"contact_mortar_gauss 仅支持 1/3/7，当前为 {contact_mortar_gauss}")
+        if contact_two_pass:
+            print("[main] contact_mode=mortar 时忽略 contact_two_pass（仅使用单向 mortar 接触）。")
+            contact_two_pass = False
     preload_face_points_each = int(
         cfg_yaml.get("tightening_n_points_each", cfg_yaml.get("preload_n_points_each", TrainerConfig.preload_n_points_each))
     )
@@ -289,6 +300,10 @@ def _prepare_config_with_autoguess():
         part2mat=part2mat,
         contact_pairs=contact_pairs,
         n_contact_points_per_pair=n_contact_points_per_pair,
+        contact_two_pass=contact_two_pass,
+        contact_mode=contact_mode,
+        contact_mortar_gauss=contact_mortar_gauss,
+        contact_mortar_max_points=contact_mortar_max_points,
         preload_specs=nut_specs,
         preload_n_points_each=preload_face_points_each,
         preload_min=preload_min,
@@ -424,13 +439,14 @@ def _prepare_config_with_autoguess():
         "w_int": ("w_int", "E_int"),
         "w_cn": ("w_cn", "E_cn"),
         "w_ct": ("w_ct", "E_ct"),
-        "w_tie": ("w_tie", "E_tie"),
+        "w_bi": ("w_bi", "E_bi"),
         "w_bc": ("w_bc", "E_bc"),
-        "w_pre": ("w_pre", "W_pre"),
         "w_tight": ("w_tight", "E_tight"),
         "w_sigma": ("w_sigma", "E_sigma"),
         "w_eq": ("w_eq", "E_eq"),
         "w_reg": ("w_reg", "E_reg"),
+        "w_ed": ("w_ed", "E_ed"),
+        "w_unc": ("w_unc", "E_unc"),
         "w_path": ("path_penalty_weight", "path_penalty_total"),
         "w_fric_path": ("fric_path_penalty_weight", "fric_path_penalty_total"),
     }
@@ -458,6 +474,34 @@ def _prepare_config_with_autoguess():
     if "graph_layers" in net_cfg_yaml:
         cfg.model_cfg.field.graph_layers = int(net_cfg_yaml["graph_layers"])
         print(f"[main] Graph layers: {cfg.model_cfg.field.graph_layers}")
+    if "stress_out_dim" in net_cfg_yaml:
+        cfg.model_cfg.field.stress_out_dim = int(net_cfg_yaml["stress_out_dim"])
+        print(f"[main] Stress head out dim: {cfg.model_cfg.field.stress_out_dim}")
+    if "use_finite_spectral" in net_cfg_yaml:
+        cfg.model_cfg.field.use_finite_spectral = bool(net_cfg_yaml["use_finite_spectral"])
+        print(f"[main] Finite spectral encoding: {cfg.model_cfg.field.use_finite_spectral}")
+    if "finite_spectral_modes" in net_cfg_yaml:
+        cfg.model_cfg.field.finite_spectral_modes = int(net_cfg_yaml["finite_spectral_modes"])
+        print(f"[main] Finite spectral modes: {cfg.model_cfg.field.finite_spectral_modes}")
+    if "finite_spectral_with_distance" in net_cfg_yaml:
+        cfg.model_cfg.field.finite_spectral_with_distance = bool(net_cfg_yaml["finite_spectral_with_distance"])
+    if "use_engineering_semantics" in net_cfg_yaml:
+        cfg.model_cfg.field.use_engineering_semantics = bool(net_cfg_yaml["use_engineering_semantics"])
+        print(f"[main] Engineering semantics: {cfg.model_cfg.field.use_engineering_semantics}")
+    if "semantic_feat_dim" in net_cfg_yaml:
+        cfg.model_cfg.field.semantic_feat_dim = int(net_cfg_yaml["semantic_feat_dim"])
+        print(f"[main] Semantic feature dim: {cfg.model_cfg.field.semantic_feat_dim}")
+    if (
+        bool(getattr(cfg.model_cfg.field, "use_engineering_semantics", False))
+        and int(getattr(cfg.model_cfg.field, "semantic_feat_dim", 0) or 0) <= 0
+    ):
+        cfg.model_cfg.field.semantic_feat_dim = 4
+        print("[main] Semantic feature dim defaulted to 4 (contact/bc/mirror/material).")
+    if "uncertainty_out_dim" in net_cfg_yaml:
+        cfg.model_cfg.field.uncertainty_out_dim = int(net_cfg_yaml["uncertainty_out_dim"])
+        print(f"[main] Uncertainty head out dim: {cfg.model_cfg.field.uncertainty_out_dim}")
+    if "use_graph" in net_cfg_yaml:
+        cfg.model_cfg.field.use_graph = bool(net_cfg_yaml["use_graph"])
 
     # ===== 接触力学参数（normal/friction）=====
     normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
@@ -483,6 +527,12 @@ def _prepare_config_with_autoguess():
             cfg.contact_cfg.friction.mu_t = float(fric_cfg_yaml["mu_t"])
         if "mu_f" in fric_cfg_yaml:
             cfg.contact_cfg.friction.mu_f = float(fric_cfg_yaml["mu_f"])
+        if "use_bipotential_residual" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.use_bipotential_residual = bool(fric_cfg_yaml["use_bipotential_residual"])
+        if "bipotential_weight" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.bipotential_weight = float(fric_cfg_yaml["bipotential_weight"])
+        if "bipotential_eps" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.bipotential_eps = float(fric_cfg_yaml["bipotential_eps"])
         if "use_smooth_friction" in fric_cfg_yaml:
             val = bool(fric_cfg_yaml["use_smooth_friction"])
             cfg.contact_cfg.use_smooth_friction = val
@@ -531,6 +581,38 @@ def _prepare_config_with_autoguess():
     cfg.loss_focus_terms = tuple(focus_terms)
     cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
 
+    ed_cfg = loss_cfg_yaml.get("energy_dissipation", {}) or {}
+    if isinstance(ed_cfg, dict) and ed_cfg:
+        if "enabled" in ed_cfg:
+            cfg.total_cfg.ed_enabled = bool(ed_cfg["enabled"])
+        if "external_scale" in ed_cfg:
+            cfg.total_cfg.ed_external_scale = float(ed_cfg["external_scale"])
+        if "margin" in ed_cfg:
+            cfg.total_cfg.ed_margin = float(ed_cfg["margin"])
+        if "use_relu" in ed_cfg:
+            cfg.total_cfg.ed_use_relu = bool(ed_cfg["use_relu"])
+        if "squared" in ed_cfg:
+            cfg.total_cfg.ed_square = bool(ed_cfg["squared"])
+    if float(getattr(cfg.total_cfg, "w_ed", 0.0) or 0.0) > 0.0 and "enabled" not in ed_cfg:
+        cfg.total_cfg.ed_enabled = True
+
+    unc_cfg = cfg_yaml.get("uncertainty_config", {}) or {}
+    if isinstance(unc_cfg, dict) and unc_cfg:
+        if "loss_weight" in unc_cfg:
+            cfg.uncertainty_loss_weight = float(unc_cfg["loss_weight"])
+        if "sample_points" in unc_cfg:
+            cfg.uncertainty_sample_points = int(unc_cfg["sample_points"])
+        if "proxy_scale" in unc_cfg:
+            cfg.uncertainty_proxy_scale = float(unc_cfg["proxy_scale"])
+        if "logvar_min" in unc_cfg:
+            cfg.uncertainty_logvar_min = float(unc_cfg["logvar_min"])
+        if "logvar_max" in unc_cfg:
+            cfg.uncertainty_logvar_max = float(unc_cfg["logvar_max"])
+
+    # allow loss_config.base_weights.w_unc as shorthand
+    if "w_unc" in base_weights_yaml and float(cfg.uncertainty_loss_weight) <= 0.0:
+        cfg.uncertainty_loss_weight = float(base_weights_yaml["w_unc"])
+
     # 启用应力头时默认也纳入自适应关注项，避免固定权重过大导致梯度爆炸
     has_stress_head = getattr(cfg.model_cfg.field, "stress_out_dim", 0) > 0
     if has_stress_head and "E_sigma" not in cfg.loss_focus_terms:
@@ -544,8 +626,6 @@ def _prepare_config_with_autoguess():
 
     cfg.resample_contact_every = int(
         cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
-    )
-    )
     )
     cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
 
@@ -575,6 +655,10 @@ def _prepare_config_with_autoguess():
     else:
         cfg.elas_cfg.n_points_per_step = int(raw_n_points)
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
+    if "stress_loss_weight" in elas_cfg_yaml:
+        cfg.elas_cfg.stress_loss_weight = float(elas_cfg_yaml.get("stress_loss_weight", cfg.elas_cfg.stress_loss_weight))
+    if "use_forward_mode" in elas_cfg_yaml:
+        cfg.elas_cfg.use_forward_mode = bool(elas_cfg_yaml.get("use_forward_mode"))
 
     # 3) 接触/拧紧采样：根据阶段数做显存友好的调整
     stage_multiplier = 1
@@ -620,15 +704,24 @@ def _prepare_config_with_autoguess():
             pass
 
     contact_target = cfg.n_contact_points_per_pair
-    if stage_multiplier > 1:
+    if contact_mode_norm == "mortar" and contact_mortar_max_points > 0:
+        contact_target = cfg.contact_mortar_max_points
+
+    if stage_multiplier > 1 and not (contact_mode_norm == "mortar" and contact_mortar_max_points <= 0):
         per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
         per_stage_contact = max(256, int(math.ceil(per_stage_contact * load_factor)))
         approx_total_contact = per_stage_contact * stage_multiplier
         if per_stage_contact != contact_target:
-            print(
-                "[main] 分阶段拧紧启用：将每对接触采样从 "
-                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
-            )
+            if contact_mode_norm == "mortar" and contact_mortar_max_points > 0:
+                print(
+                    "[main] 分阶段拧紧启用：将 mortar 接触上限从 "
+                    f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
+                )
+            else:
+                print(
+                    "[main] 分阶段拧紧启用：将每对接触采样从 "
+                    f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
+                )
         # 分阶段计算仍会在同一梯度带内重复评估接触能，因此进一步限制总量
         contact_cap = 2048
         if per_stage_contact > contact_cap:
@@ -638,7 +731,10 @@ def _prepare_config_with_autoguess():
                 "[main] 接触点上限触发：将每阶段采样压缩到 "
                 f"{per_stage_contact} (≈{approx_total_contact} 总点数)。"
             )
-        cfg.n_contact_points_per_pair = per_stage_contact
+        if contact_mode_norm == "mortar" and contact_mortar_max_points > 0:
+            cfg.contact_mortar_max_points = per_stage_contact
+        else:
+            cfg.n_contact_points_per_pair = per_stage_contact
 
         preload_target = cfg.preload_n_points_each
         per_stage_preload = max(128, math.ceil(preload_target / stage_multiplier))
@@ -679,7 +775,7 @@ def _prepare_config_with_autoguess():
 
     # 5) 根据拧紧角度范围自动调整归一化（映射到约 [-1, 1]）
     preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
-    if preload_hi <= preload_lo:
+    if preload_hi < preload_lo:
         raise ValueError("拧紧角度范围 tighten_angle_range 的上限必须大于下限。")
     preload_mid = 0.5 * (preload_lo + preload_hi)
     preload_half_span = 0.5 * (preload_hi - preload_lo)
@@ -716,8 +812,11 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
         print(f"[main] 未提供 --export，将 SavedModel 写入: {export_dir}")
     trainer.export_saved_model(export_dir)
 
-    print("\n[OK] 训练完成！请到 'outputs/' 查看 5 张 “MIRROR UP” 变形云图（文件名包含螺母拧紧角度数值）。")
-    print("   如需修改 INP 路径、表面名或超参，请编辑 config.yaml。")
+    out_dir_disp = cfg.out_dir or "outputs"
+    print(
+        f"\n[OK] 训练完成！请到 '{out_dir_disp}' 查看镜面变形云图（数量取决于可视化配置）。"
+    )
+    print("   如需修改 CDB 路径、表面名或超参，请编辑 config.yaml。")
 def main(argv=None):
     _setup_run_logs()
     parser = argparse.ArgumentParser(

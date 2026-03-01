@@ -104,7 +104,7 @@ def _volume_points_for_part(pm: PartMesh) -> Tuple[np.ndarray, np.ndarray]:
         et = (blk.elem_type or "").upper()
         if et == "C3D4":
             x, w = _centroid_weight_c3d4_block(pm, blk)
-        elif et == "C3D8":
+        elif et in {"C3D8", "SOLID185"}:
             x, w = _centroid_weight_c3d8_block(pm, blk)
         else:
             # unsupported element type -> skip

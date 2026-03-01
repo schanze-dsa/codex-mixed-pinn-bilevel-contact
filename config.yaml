@@ -9,7 +9,6 @@
 # 1. 材料库
 # ------------------------------------------------------------
 
-# 材料标签的枚举（顺序无所谓，但名字要和下面 material_properties 一致）
 material_enum:
   - jingmian
   - structural_steel
@@ -88,30 +87,33 @@ material_properties:
     sigma_u_tension: 3.1e2        # MPa
 
 # ------------------------------------------------------------
-# 2. Part → 材料映射（需与 INP 中 Part 名一致）
+# 2. Part → 材料映射（需与 INP/CDB 中 Part 名一致）
 # ------------------------------------------------------------
+# 注意：当前 CDB 文件没有 CMBLOCK 定义部件，
+# 解析器会自动创建 ALL_SOLID 部件包含所有实体元素
 part2mat:
+  # ?? CDB ??? CM/ELEM ??????????
   MIRROR: jingmian
-
-  LUOSHUAN: structural_steel
-  LUOSHUAN1: structural_steel
-  LUOSHUAN2: structural_steel
-  LUOMU:    structural_steel
-  LUOMU1:    structural_steel
-  LUOMU2:    structural_steel
-
-  AUTO1:  zhijia      # support parts
-
+  luomu: structural_steel
+  luomu1: structural_steel
+  luomu2: structural_steel
+  luoshuan: structural_steel
+  luoshuan1: structural_steel
+  luoshuan2: structural_steel
+  auto1: zhijia
+  __CONTACT__: jingmian
+  # ?????? CDB ??????????? ALL_SOLID
+  # ALL_SOLID: jingmian
 # ------------------------------------------------------------
 # 3. 预紧螺栓与装配面
 # ------------------------------------------------------------
 nuts:
   - name: nut
-    part: LUOMU
+    part: luomu
   - name: nut1
-    part: LUOMU1
+    part: luomu1
   - name: nut2
-    part: LUOMU2
+    part: luomu2
 
 
 # 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
@@ -130,7 +132,7 @@ preload_staging:
 preload_use_stages: true
 preload_randomize_order: false
 preload_sequence:
-  - values: [20.0, 20.0, 20.0]
+  - values: [5.5, 5.5, 5.5]
     order: [1, 2, 3]
 preload_sequence_repeat: 1
 preload_sequence_shuffle: false
@@ -139,12 +141,11 @@ preload_sequence_jitter: 0.0
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
-contact_pairs:
-  - master_key: GROUP_TARG_CONT_8_MASTER_COMP
-    slave_key: GROUP_TARG_CONT_8_SLAVE_COMP
-    name: contact_8
-
-
+contact_pairs: []
+contact_mode: mortar         # sample | mortar
+contact_mortar_gauss: 3      # 三角形高斯点数（1/3/7）
+contact_mortar_max_points: 5000 # 0=不截断；>0 时对每对接触上限采样数（近似）
+contact_two_pass: false      # 仅 sample 模式有效
 # ------------------------------------------------------------
 # 4.5 边界条件（固定约束）
 # ------------------------------------------------------------
@@ -153,10 +154,6 @@ bc_mode: alm            # alm | penalty | hard - 使用ALM避免高权重
 bc_alpha: 5.0e3         # 罚函数/ALM 基础刚度 (降低以配合低w_bc)
 bc_mu: 2.0e3            # ALM 增广系数 (提高以更强约束)
 
-# Tie约束配置（绑定约束）
-tie_mode: alm           # alm | penalty - 与BC保持一致使用ALM
-tie_alpha: 5.0e1        # Tie罚函数基础刚度 (再降低2倍，从1e2降到5e1)
-tie_mu: 2.0e2           # Tie ALM增广系数 (从5e2降到2e2)
 
 # ------------------------------------------------------------
 # 5. 网络与优化器配置（后续 DFEM 改造时会用）
@@ -167,13 +164,11 @@ network_config:
   output_dim: 1            # 保留字段（实际由FieldConfig.out_dim控制）
 
   # DFEM mode: use node embeddings instead of spatial coordinates
-  dfem_mode: false         # 关闭 DFEM 节点嵌入（回到 Fourier + GCN）；DFEM 能量积分仍由 ElasticityEnergy 提供
-  n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
-  node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
   graph_precompute: true   # 预计算全局 kNN 邻接并缓存
   graph_k: 8               # kNN 邻居数（提速用；固体力学通常够用）
   graph_width: 128         # GCN 隐藏维度（提速）
   graph_layers: 3          # GCN 层数（提速）
+  stress_out_dim: 6        # 应力监督输出维度（6 分量）
 
   layers:
     - 64
@@ -186,7 +181,7 @@ network_config:
 # 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
 mirror_surface_name: 'MIRROR UP'
 
-mixed_precision: null                     # null/false -> float32 (recommended if you see grad=nan); or "mixed_float16"
+mixed_precision: null          # 关闭混合精度以避免 NaN
 
 optimizer_config:
   type: Adam
@@ -194,13 +189,17 @@ optimizer_config:
   grad_clip_norm: 1.0        # 从10降到1，加强裁剪防止梯度爆炸
   batch_size: 32
   epochs: 1500             # Adam 阶段的迭代步数
+  log_every: 50            # 每50步打印一次日志（减少 CPU-GPU 同步开销）
   lbfgs:
     enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
     max_iter: 200            # L-BFGS 最大迭代次数
     tolerance: 1.0e-6        # 收敛判据（目标函数相对变化）
     history_size: 50         # 拟牛顿历史记忆对数
     line_search: 50          # 线搜索最大迭代
-    reuse_last_batch: true   # true 表示复用 Adam 最后一次随机样本
+  reuse_last_batch: true   # true 表示复用 Adam 最后一次随机样本
+
+# kNN 图缓存（npz）
+graph_cache_name: graph_cache_knn.npz
 
 # ------------------------------------------------------------
 # 7. 弹性 DFEM 配置（ElasticityConfig）
@@ -209,9 +208,11 @@ elasticity_config:
   coord_scale: 1.0          # 坐标缩放系数
   chunk_size: 0             # 节点前向微批大小；≤0 表示整图前向，不再分块
   use_pfor: false           # 保留字段，可忽略
-  check_nan: true           # 是否进行数值 NaN 检查
-  n_points_per_step: 2048   # 每步用于 DFEM 积分的子单元/积分点上限；None/0 表示全量
+  use_forward_mode: true    # 用前向 JVP 计算应变（替代3次反向梯度）
+  check_nan: false          # 关闭 NaN 检查以提速（调试时可开启）
+  n_points_per_step: 8192   # 每步用于 DFEM 积分的子单元/积分点上限（增大以提升GPU利用率）
   plasticity_model: j2      # elastic | j2 (von Mises)
+  stress_loss_weight: 1.0   # 应力监督权重（0 将禁用）
 
 # ------------------------------------------------------------
 # 7. 损失函数与自适应加权（TotalConfig + weighted PINN）
@@ -223,22 +224,19 @@ loss_config:
 
     # DFEM节点嵌入随机初始化导致Eint爆炸，需要降低100倍
     # Eint初始~1e6, 乘1e-7后约0.1，待稳定后可逐步提高
-    w_int: 0.0
+    w_int: 1.0
 
     # Ecn ~ 3e4, 乘 1e-4 后约 3.0 (接触很重要，稍微大点没关系)
     w_cn: 1.0
 
     # 【恢复摩擦】Ect ~ 5e7 (k_t降低后), 乘 1e-8 后约 0.5
     # 摩擦是核心物理，必须保留！通过降低k_t来控制数值
-    w_ct: 0.0
+    w_ct: 1.0   # 摩擦项参与损失；ALM 乘子在图外更新（不进梯度）
 
-    # 【禁用Tie约束】Etie完全冻结在1.001e+07，阻碍训练
     # 暂时禁用，等修复后再启用
-    w_tie: 0.0        # 从1e-10改为0，完全禁用
     w_bc: 1.0      # 边界条件通常残差较小，给大一点
 
     # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
-    w_pre: 0.0     # preload work disabled
     w_tight: 1.0   # nut tightening penalty
 
     # 应力监督：用线弹性理论应力指导网络
@@ -262,7 +260,6 @@ loss_config:
       - w_cn
       - w_bc
       # - w_ct
-      # 注意：预紧外功 W_pre 不参与自适应加权（避免等价“缩放载荷”）。
       # 预紧项的权重会与 w_int 保持固定比例（由代码绑定），从而保持 P 的物理意义不变。
 
 # ------------------------------------------------------------
@@ -271,11 +268,11 @@ loss_config:
 # 关键修复：降低摩擦惩罚系数k_t以匹配弹性能量scale
 # 当前问题：Ect=2.6e8远大于Eint=2.5e5，导致梯度NaN
 friction_config:
-  enabled: false
-  k_t: 0.0            # 关闭切向惩罚刚度
-  mu_t: 1.0e3         # 保留数值稳定系数（实际不会起作用）
-  mu_f: 0.0           # 关闭库仑摩擦
-  use_smooth_friction: false  # 关闭摩擦平滑路径
+  enabled: true
+  k_t: 100            # 降低切向惩罚刚度，缓解 NaN
+  mu_t: 200           # 降低切向 ALM 系数
+  mu_f: 0.15
+  use_smooth_friction: true   # 启用平滑摩擦路径
   use_delta_st_friction: false
   smooth_to_strict: false
   smooth_fraction: 0.3
@@ -304,32 +301,31 @@ output_config:
 # ------------------------------------------------------------
 # 9. INP 文件路径
 # ------------------------------------------------------------
-inp_path: mir.cdb
+inp_path: mir111.cdb
 
 # ------------------------------------------------------------
 # 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
 # ------------------------------------------------------------
 debug_big_model: false             # 是否放大网络容量（默认关闭，避免无条件改模型尺寸）
-tighten_angle_min: 0.0            # tightening angle min (deg)
-tighten_angle_max: 30.0           # tightening angle max (deg)
+tighten_angle_min: 5.5            # tightening angle min (deg)
+tighten_angle_max: 5.5            # tightening angle max (deg)
 tightening_config:
   alpha: 1.0e3
   angle_unit: deg
   clockwise: true
 
-n_contact_points_per_pair: 800      # 每对接触面的采样数（单阶段）
-tightening_n_points_each: 400     # samples per nut surface
-resample_contact_every: 50  # contact resample period (steps)
+n_contact_points_per_pair: 2000     # sample 模式：每对接触面的采样数；mortar 模式下默认忽略
+tightening_n_points_each: 800     # samples per nut surface（增大）
+resample_contact_every: 0    # 关闭训练中重采样，避免CPU瓶颈
+contact_rar_enabled: false   # 关闭接触RAR重采样
 
 alm_update_every: 0                # 交由阶段内 ALM 更新
 
 incremental_mode: true
-stage_inner_steps: 1
+stage_inner_steps: 5        # 每阶段内迭代5步（减少 Python 循环开销）
 stage_alm_every: 1
-stage_resample_contact: true
+stage_resample_contact: false
 reset_contact_state_per_case: true
 stage_schedule_steps: [400, 400, 400, 300]
 
 
-n_tie_points: 2000
-tie_alpha: 1e3
