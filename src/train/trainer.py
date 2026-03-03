@@ -328,6 +328,14 @@ class TrainerConfig:
     log_every: int = 1
     alm_update_every: int = 10
     resample_contact_every: int = 10
+    early_exit_enabled: bool = True
+    early_exit_warmup_steps: int = 200
+    early_exit_nonfinite_patience: int = 8
+    early_exit_divergence_patience: int = 30
+    early_exit_grad_norm_threshold: float = 1.0e6
+    early_exit_pi_ema_rel_increase: float = 0.5
+    early_exit_check_every: int = 1
+    contact_route_update_every: int = 1
     lbfgs_enabled: bool = False
     lbfgs_max_iter: int = 200
     lbfgs_tolerance: float = 1e-6
@@ -420,6 +428,11 @@ class Trainer:
         self._pi_baseline: Optional[float] = None
         self._pi_ema: Optional[float] = None
         self._prev_pi: Optional[float] = None
+        self._best_pi_ema: Optional[float] = None
+        self._nonfinite_streak: int = 0
+        self._diverge_streak: int = 0
+        self._contact_route_ema: Optional[float] = None
+        self._contact_route_ref: Optional[float] = None
         self._preload_sequence: List[np.ndarray] = []
         self._preload_sequence_orders: List[Optional[np.ndarray]] = []
         self._preload_sequence_index: int = 0
@@ -724,6 +737,162 @@ class Trainer:
 
     def _step_detail_enabled(self) -> bool:
         return bool(self._tqdm_enabled and getattr(self.cfg, "step_bar_enabled", False))
+
+    def _route_update_every(self) -> int:
+        return max(1, int(getattr(self.cfg, "contact_route_update_every", 1) or 1))
+
+    def _should_update_contact_route(self, step: int) -> bool:
+        if step <= 1:
+            return True
+        return (step % self._route_update_every()) == 0
+
+    def _early_exit_check_every(self) -> int:
+        return max(1, int(getattr(self.cfg, "early_exit_check_every", 1) or 1))
+
+    def _should_check_early_exit(self, step: int) -> bool:
+        if not bool(getattr(self.cfg, "early_exit_enabled", False)):
+            return False
+        if step <= 1:
+            return True
+        return (step % self._early_exit_check_every()) == 0
+
+    def _should_collect_step_scalars(self, step: int) -> bool:
+        # Any detailed step bar needs full scalar diagnostics every step.
+        if self._step_detail_enabled():
+            return True
+        log_every = int(getattr(self.cfg, "log_every", 0) or 0)
+        if log_every > 0 and (step == 1 or (step % log_every) == 0):
+            return True
+        if self._should_check_early_exit(step):
+            return True
+        return False
+
+    def _contact_route_score(self) -> float:
+        if self._contact_route_ema is None:
+            return 0.0
+        if self._contact_route_ref is None or self._contact_route_ref <= 0.0:
+            return float(self._contact_route_ema)
+        return float(self._contact_route_ema) / float(self._contact_route_ref)
+
+    def _update_contact_route_metric(self, parts: Mapping[str, Any]) -> float:
+        raw = None
+        for key in ("R_contact_comp", "E_cn"):
+            if key not in parts:
+                continue
+            val = parts.get(key)
+            try:
+                if isinstance(val, tf.Tensor):
+                    if val.shape.rank == 0:
+                        raw = float(tf.cast(val, tf.float32).numpy())
+                        break
+                else:
+                    raw = float(val)
+                    break
+            except Exception:
+                continue
+
+        if raw is None or not np.isfinite(raw):
+            return self._contact_route_score()
+
+        raw = abs(float(raw))
+        if self._contact_route_ema is None:
+            self._contact_route_ema = raw
+        else:
+            ema_decay = 0.9
+            self._contact_route_ema = (
+                ema_decay * self._contact_route_ema + (1.0 - ema_decay) * raw
+            )
+
+        if self._contact_route_ref is None:
+            self._contact_route_ref = max(self._contact_route_ema, 1.0e-6)
+        else:
+            ref_decay = 0.99
+            self._contact_route_ref = (
+                ref_decay * self._contact_route_ref
+                + (1.0 - ref_decay) * max(self._contact_route_ema, 1.0e-6)
+            )
+
+        return self._contact_route_score()
+
+    def _push_contact_route_hint(self) -> None:
+        if self.model is None or not hasattr(self.model, "field"):
+            return
+        field = getattr(self.model, "field", None)
+        if field is None:
+            return
+        route_src = str(
+            getattr(getattr(field, "cfg", None), "adaptive_depth_route_source", "")
+            or ""
+        ).strip().lower()
+        if route_src != "contact_residual":
+            return
+        if hasattr(field, "set_contact_residual_hint"):
+            field.set_contact_residual_hint(self._contact_route_score())
+
+    def _check_early_exit(self, step: int, pi_val: float, grad_val: float) -> Optional[str]:
+        if not bool(getattr(self.cfg, "early_exit_enabled", False)):
+            return None
+
+        nonfinite_patience = max(
+            1, int(getattr(self.cfg, "early_exit_nonfinite_patience", 1) or 1)
+        )
+        div_patience = max(
+            1, int(getattr(self.cfg, "early_exit_divergence_patience", 1) or 1)
+        )
+        warmup_steps = max(0, int(getattr(self.cfg, "early_exit_warmup_steps", 0) or 0))
+        grad_thr = float(
+            getattr(self.cfg, "early_exit_grad_norm_threshold", 0.0) or 0.0
+        )
+        ema_rel_inc = max(
+            0.0, float(getattr(self.cfg, "early_exit_pi_ema_rel_increase", 0.0) or 0.0)
+        )
+
+        finite_pi = bool(np.isfinite(pi_val))
+        finite_grad = bool(np.isfinite(grad_val))
+        if not (finite_pi and finite_grad):
+            self._nonfinite_streak += 1
+        else:
+            self._nonfinite_streak = 0
+
+        if self._nonfinite_streak >= nonfinite_patience:
+            return (
+                f"non-finite detected for {self._nonfinite_streak} consecutive steps "
+                f"(patience={nonfinite_patience})"
+            )
+
+        pi_ema = float(self._pi_ema) if self._pi_ema is not None else None
+        if pi_ema is not None and np.isfinite(pi_ema):
+            if self._best_pi_ema is None or pi_ema < self._best_pi_ema:
+                self._best_pi_ema = pi_ema
+
+        if step <= warmup_steps:
+            self._diverge_streak = 0
+            return None
+
+        grad_high = grad_thr > 0.0 and finite_grad and float(grad_val) >= grad_thr
+        ema_worse = False
+        if (
+            pi_ema is not None
+            and np.isfinite(pi_ema)
+            and self._best_pi_ema is not None
+            and np.isfinite(self._best_pi_ema)
+        ):
+            baseline = max(abs(float(self._best_pi_ema)), 1.0e-12)
+            ema_worse = (pi_ema - float(self._best_pi_ema)) / baseline >= ema_rel_inc
+
+        if grad_high and ema_worse:
+            self._diverge_streak += 1
+        else:
+            self._diverge_streak = 0
+
+        if self._diverge_streak >= div_patience:
+            return (
+                f"divergence detected: grad_norm={grad_val:.3e} >= {grad_thr:.3e} and "
+                f"Pi_ema has worsened for {self._diverge_streak} consecutive steps "
+                f"(patience={div_patience})"
+            )
+
+        return None
 
     def _format_energy_summary_if_needed(self, parts: Mapping[str, tf.Tensor]) -> str:
         if not self._step_detail_enabled():
@@ -1655,6 +1824,10 @@ class Trainer:
                 materials=cfg.materials,
                 cfg=cfg.elas_cfg,
             )
+            if hasattr(self.elasticity, "set_sample_metrics_cache_enabled"):
+                self.elasticity.set_sample_metrics_cache_enabled(
+                    bool(getattr(self.cfg, "volume_rar_enabled", True))
+                )
             print("[trainer] Elasticity: residual (volume points)")
             pb.update(1)
 
@@ -2265,11 +2438,7 @@ class Trainer:
     def _maybe_apply_volume_rar(self, step_index: int) -> Tuple[Optional[np.ndarray], str]:
         """返回一组 DFEM 子单元索引，按应变能密度进行重采样。"""
 
-        if (
-            not self.cfg.volume_rar_enabled
-            or self._volume_rar_cache is None
-            or self.elasticity is None
-        ):
+        if self.elasticity is None:
             return None, ""
 
         total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
@@ -2278,9 +2447,21 @@ class Trainer:
             return None, ""
 
         m = min(int(target_n), total_cells)
+        if m >= total_cells:
+            return None, ""
+
+        rng = np.random.default_rng(self.cfg.seed + step_index * 23)
+
+        def _uniform_sample(note_prefix: str = "volUNI") -> Tuple[np.ndarray, str]:
+            idx = np.asarray(rng.choice(total_cells, size=m, replace=False), dtype=np.int64)
+            return idx, f"{note_prefix} {m}/{total_cells}"
+
+        if not self.cfg.volume_rar_enabled or self._volume_rar_cache is None:
+            return _uniform_sample()
+
         importance = self._volume_rar_cache.get("importance")
         if importance is None or importance.shape[0] != total_cells:
-            return None, ""
+            return _uniform_sample()
 
         rar_frac = float(np.clip(self.cfg.volume_rar_fraction, 0.0, 1.0))
         min_uniform = int(np.round(m * np.clip(self.cfg.volume_rar_uniform_ratio, 0.0, 1.0)))
@@ -2289,15 +2470,14 @@ class Trainer:
             n_rar = max(0, m - min_uniform)
         n_uniform = max(0, m - n_rar)
         if n_rar <= 0:
-            return None, ""
+            return _uniform_sample()
 
         temp = max(self.cfg.volume_rar_temperature, 1e-6)
         weights = np.power(importance + float(self.cfg.volume_rar_floor), 1.0 / temp)
         weights = np.where(np.isfinite(weights), weights, 0.0)
         if float(weights.sum()) <= 0.0:
-            return None, ""
+            return _uniform_sample()
 
-        rng = np.random.default_rng(self.cfg.seed + step_index * 23)
         probs = weights / (weights.sum() + 1e-12)
         try:
             rar_indices = np.array(
@@ -3074,10 +3254,13 @@ class Trainer:
             disable=not (self._tqdm_enabled and self.cfg.train_bar_enabled),
         )
         step_detail_enabled = self._step_detail_enabled()
+        last_step = 0
+        stop_reason = None
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color
         with tqdm(**train_pb_kwargs) as p_train:
             for step in range(1, self.cfg.max_steps + 1):
+                stop_this_step = False
                 # 子进度条：本 step 的 4 个动作
                 step_pb_kwargs = dict(
                     total=4,
@@ -3137,29 +3320,42 @@ class Trainer:
                     if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
                         vol_indices, vol_note = self._maybe_apply_volume_rar(step)
                         self.elasticity.set_sample_indices(vol_indices)
+                    self._push_contact_route_hint()
                     Pi, parts, stats, grad_norm = self._train_step(total, preload_case, step=step)
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
                     self._last_preload_case = copy.deepcopy(preload_case)
                     self._update_contact_rar_cache()
                     self._update_volume_rar_cache()
-                    pi_val = float(Pi.numpy())
-                    if self._pi_baseline is None:
-                        self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
-                    if self._pi_ema is None:
-                        self._pi_ema = pi_val
+                    if self._should_update_contact_route(step):
+                        route_score = self._update_contact_route_metric(parts)
                     else:
-                        ema_alpha = 0.1
-                        self._pi_ema = (1 - ema_alpha) * self._pi_ema + ema_alpha * pi_val
-                    rel_pi = pi_val / (self._pi_baseline or pi_val or 1.0)
+                        route_score = self._contact_route_score()
+
+                    should_collect_scalars = self._should_collect_step_scalars(step)
+                    pi_val = float("nan")
+                    grad_val = float("nan")
+                    rel_pi = None
                     rel_delta = None
-                    if self._prev_pi is not None and self._prev_pi != 0.0:
-                        rel_delta = (self._prev_pi - pi_val) / abs(self._prev_pi)
-                    self._prev_pi = pi_val
+                    if should_collect_scalars:
+                        pi_val = float(Pi.numpy())
+                        if self._pi_baseline is None:
+                            self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
+                        if self._pi_ema is None:
+                            self._pi_ema = pi_val
+                        else:
+                            ema_alpha = 0.1
+                            self._pi_ema = (1 - ema_alpha) * self._pi_ema + ema_alpha * pi_val
+                        rel_pi = pi_val / (self._pi_baseline or pi_val or 1.0)
+                        if self._prev_pi is not None and self._prev_pi != 0.0:
+                            rel_delta = (self._prev_pi - pi_val) / abs(self._prev_pi)
+                        self._prev_pi = pi_val
+                        grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
+                    elif self._prev_pi is not None:
+                        pi_val = float(self._prev_pi)
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
-                    grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
                     if step_detail_enabled:
                         rel_pct = rel_pi * 100.0 if rel_pi is not None else None
                         rel_txt = (
@@ -3181,7 +3377,7 @@ class Trainer:
                         train_note = (
                             f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
                             f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
-                            f"grad={grad_val:.2e} {ema_txt}"
+                            f"grad={grad_val:.2e} {ema_txt} route={route_score:.2f}"
                         )
                         if step == 1:
                             train_note += " | 首轮包含图追踪/缓存构建"
@@ -3191,12 +3387,29 @@ class Trainer:
                         )
                     p_step.update(1)
 
+                    stop_reason = None
+                    if self._should_check_early_exit(step):
+                        stop_reason = self._check_early_exit(step, pi_val, grad_val)
+                    if stop_reason:
+                        stop_this_step = True
+                        print(
+                            f"[trainer] Early exit at step {step}: {stop_reason}",
+                            flush=True,
+                        )
+                        if step_detail_enabled:
+                            self._set_pbar_postfix(
+                                p_step,
+                                f"触发 early-exit | {self._format_seconds(elapsed)}"
+                            )
+
                     # 3) ALM 更新
                     if step_detail_enabled:
                         self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
                     t0 = time.perf_counter()
                     alm_note = "跳过"
-                    if self.contact is None:
+                    if stop_this_step:
+                        alm_note = "跳过 (early-exit)"
+                    elif self.contact is None:
                         alm_note = "跳过 (无接触体)"
                     elif self.cfg.incremental_mode:
                         alm_note = "跳过 (incremental)"
@@ -3225,7 +3438,9 @@ class Trainer:
                         self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
-                    if self.cfg.log_every <= 0:
+                    if stop_this_step:
+                        log_note = "跳过 (early-exit)"
+                    elif self.cfg.log_every <= 0:
                         log_note = "跳过 (已禁用)"
                     else:
                         should_log = step == 1 or step % self.cfg.log_every == 0
@@ -3260,7 +3475,8 @@ class Trainer:
                                     log_note += " | checkpoint 保存失败(已跳过)"
 
                     if (
-                        self.cfg.log_every > 0
+                        not stop_this_step
+                        and self.cfg.log_every > 0
                         and not (step == 1 or step % self.cfg.log_every == 0)
                     ):
                         remaining = self.cfg.log_every - (step % self.cfg.log_every)
@@ -3275,6 +3491,7 @@ class Trainer:
                     p_step.update(1)
 
                 p_train.update(1)
+                last_step = step
 
                 if step % max(1, self.cfg.log_every) == 0:
                     total_spent = sum(t for _, t in self._step_stage_times)
@@ -3303,9 +3520,13 @@ class Trainer:
                         self._set_pbar_postfix(p_train, summary_note)
                     self._step_stage_times.clear()
 
+                if stop_this_step:
+                    break
+
         # 训练结束：再存一次
         if self.ckpt_manager is not None:
-            final_ckpt = self._save_checkpoint_best_effort(self.cfg.max_steps)
+            final_step = last_step if last_step > 0 else self.cfg.max_steps
+            final_ckpt = self._save_checkpoint_best_effort(final_step)
             if final_ckpt:
                 print(f"[trainer] 训练结束已保存 checkpoint -> {final_ckpt}")
             else:
@@ -3915,6 +4136,7 @@ class _SavedModelModule(tf.Module):
         self._n_bolts = int(max(1, n_bolts))
 
     @tf.function(
+        autograph=False,
         input_signature=[
             tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="x"),
             tf.TensorSpec(shape=[None], dtype=tf.float32, name="p"),

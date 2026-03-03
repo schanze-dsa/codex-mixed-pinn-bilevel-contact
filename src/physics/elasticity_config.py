@@ -25,3 +25,6 @@ class ElasticityConfig:
     stress_loss_weight: float = 1.0
     # Use forward-mode JVP to compute strain (faster than 3x reverse-mode grads)
     use_forward_mode: bool = True
+    # Cache per-sample metrics (psi/idx) for volume-RAR diagnostics.
+    # Disable this to avoid extra device->host synchronization.
+    cache_sample_metrics: bool = True

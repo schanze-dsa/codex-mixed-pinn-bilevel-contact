@@ -14,15 +14,15 @@ Public factory:
     model = create_displacement_model(cfg)      # returns DisplacementModel
     u = model.u_fn(X, params)                   # X: (N,3) mm (normalized outside if needed)
                                                # params: dict; must contain either:
-                                               #   "P_hat": preload feature vector; staged 情况下
-                                               #           包含 [P_hat, mask, last, rank]，长度
-                                               #           为 4*n_bolts
+                                               #   "P_hat": preload feature vector; staged 鎯呭喌涓?
+                                               #           鍖呭惈 [P_hat, mask, last, rank]锛岄暱搴?
+                                               #           涓?4*n_bolts
                                                # or "P": (3,) with "preload_shift/scale" in cfg
 
 Notes:
-- This file只关注“网络前向”，不做物理装配；训练循环将把本模型与能量/接触算子组合。
-- 激活默认 SiLU；可选 GELU/RELU/Tanh。
-- 混合精度可选（'float16' 或 'bfloat16'）；权重保持 float32，数值稳定。
+- This file鍙叧娉ㄢ€滅綉缁滃墠鍚戔€濓紝涓嶅仛鐗╃悊瑁呴厤锛涜缁冨惊鐜皢鎶婃湰妯″瀷涓庤兘閲?鎺ヨЕ绠楀瓙缁勫悎銆?
+- 婵€娲婚粯璁?SiLU锛涘彲閫?GELU/RELU/Tanh銆?
+- 娣峰悎绮惧害鍙€夛紙'float16' 鎴?'bfloat16'锛夛紱鏉冮噸淇濇寔 float32锛屾暟鍊肩ǔ瀹氥€?
 
 Author: you
 """
@@ -56,32 +56,32 @@ class EncoderConfig:
 
 @dataclass
 class FieldConfig:
-    in_dim_coord: int = 3     # xyz (normalized outside if需要)
+    in_dim_coord: int = 3     # xyz (normalized outside if闇€瑕?
     fourier: FourierConfig = FourierConfig()
     cond_dim: int = 64
-    # 以下 legacy MLP 参数仅保留兼容性；当前实现始终走 GCN 主干
+    # 浠ヤ笅 legacy MLP 鍙傛暟浠呬繚鐣欏吋瀹规€э紱褰撳墠瀹炵幇濮嬬粓璧?GCN 涓诲共
     width: int = 256
     depth: int = 7
     act: str = "silu"
     residual_skips: Tuple[int, int] = (3, 6)
     out_dim: int = 3          # displacement ux,uy,uz
-    stress_out_dim: int = 6   # 应力分量输出维度（默认 6: σxx,σyy,σzz,σxy,σyz,σxz）；<=0 关闭应力头
-    use_graph: bool = True    # 是否启用 GCN 主干；若为 False 将报错
-    graph_k: int = 12         # kNN 图中的邻居数量
-    graph_knn_chunk: int = 1024  # 构建 kNN/图卷积时每批处理的节点数量
-    graph_precompute: bool = False  # 是否在构建阶段预计算全局邻接并缓存
-    graph_layers: int = 4     # 图卷积层数
-    graph_width: int = 192    # 每层的隐藏特征维度
+    stress_out_dim: int = 6   # 搴斿姏鍒嗛噺杈撳嚭缁村害锛堥粯璁?6: 蟽xx,蟽yy,蟽zz,蟽xy,蟽yz,蟽xz锛夛紱<=0 鍏抽棴搴斿姏澶?
+    use_graph: bool = True    # 鏄惁鍚敤 GCN 涓诲共锛涜嫢涓?False 灏嗘姤閿?
+    graph_k: int = 12         # kNN 鍥句腑鐨勯偦灞呮暟閲?
+    graph_knn_chunk: int = 1024  # 鏋勫缓 kNN/鍥惧嵎绉椂姣忔壒澶勭悊鐨勮妭鐐规暟閲?
+    graph_precompute: bool = False  # 鏄惁鍦ㄦ瀯寤洪樁娈甸璁＄畻鍏ㄥ眬閭绘帴骞剁紦瀛?
+    graph_layers: int = 4     # 鍥惧嵎绉眰鏁?
+    graph_width: int = 192    # 姣忓眰鐨勯殣钘忕壒寰佺淮搴?
     graph_dropout: float = 0.0
-    # 基于条件向量的 FiLM 调制
+    # 鍩轰簬鏉′欢鍚戦噺鐨?FiLM 璋冨埗
     use_film: bool = True
-    # 仅为兼容旧版残差开关（已移除残差实现）；保留字段避免加载旧配置时报错
+    # 浠呬负鍏煎鏃х増娈嬪樊寮€鍏筹紙宸茬Щ闄ゆ畫宸疄鐜帮級锛涗繚鐣欏瓧娈甸伩鍏嶅姞杞芥棫閰嶇疆鏃舵姤閿?
     graph_residual: bool = False
-    # 简单硬约束掩码：以圆孔为例，半径内强制位移为 0，可选开启
+    # 绠€鍗曠‖绾︽潫鎺╃爜锛氫互鍦嗗瓟涓轰緥锛屽崐寰勫唴寮哄埗浣嶇Щ涓?0锛屽彲閫夊紑鍚?
     hard_bc_radius: Optional[float] = None
     hard_bc_center: Tuple[float, float] = (0.0, 0.0)
     hard_bc_dims: Tuple[bool, bool, bool] = (True, True, True)
-    # 输出缩放：网络预测无量纲位移后再乘以该尺度，便于微小量级的数值稳定
+    # 杈撳嚭缂╂斁锛氱綉缁滈娴嬫棤閲忕翰浣嶇Щ鍚庡啀涔樹互璇ュ昂搴︼紝渚夸簬寰皬閲忕骇鐨勬暟鍊肩ǔ瀹?
     output_scale: float = 1.0e-2
     output_scale_trainable: bool = False
     
@@ -98,6 +98,14 @@ class FieldConfig:
     semantic_feat_dim: int = 0
     # Aleatoric uncertainty head (log-variance for displacement components)
     uncertainty_out_dim: int = 0
+    # Sample-level adaptive depth routing:
+    # easy samples use shallow head, hard samples use deep head.
+    adaptive_depth_enabled: bool = False
+    adaptive_depth_mode: str = "hard"  # hard | soft
+    adaptive_depth_shallow_layers: int = 2
+    adaptive_depth_threshold: float = 0.5
+    adaptive_depth_temperature: float = 1.0
+    adaptive_depth_route_source: str = "z_norm"  # z_norm | contact_residual
 
 @dataclass
 class ModelConfig:
@@ -140,10 +148,10 @@ def _maybe_mixed_precision(policy: Optional[str]):
 class GaussianFourierFeatures(tf.keras.layers.Layer):
     """
     Map 3D coordinates x -> concat_k [sin(B_k x), cos(B_k x)] with B_k ~ N(0, sigma_k^2).
-    - 支持多尺度 sigma_k（例如 [1,10,50]），每个尺度采样 num 个频率后拼接。
-    - 可选让 B_k 变为 trainable，以便网络自适应频段。默认保持冻结。
-    Mixed precision 兼容策略：
-    - 统一在 float32 中进行 matmul/sin/cos/concat，再 cast 回输入 dtype（通常是 float16）。
+    - 鏀寔澶氬昂搴?sigma_k锛堜緥濡?[1,10,50]锛夛紝姣忎釜灏哄害閲囨牱 num 涓鐜囧悗鎷兼帴銆?
+    - 鍙€夎 B_k 鍙樹负 trainable锛屼互渚跨綉缁滆嚜閫傚簲棰戞銆傞粯璁や繚鎸佸喕缁撱€?
+    Mixed precision 鍏煎绛栫暐锛?
+    - 缁熶竴鍦?float32 涓繘琛?matmul/sin/cos/concat锛屽啀 cast 鍥炶緭鍏?dtype锛堥€氬父鏄?float16锛夈€?
     """
 
     def __init__(
@@ -177,7 +185,7 @@ class GaussianFourierFeatures(tf.keras.layers.Layer):
     def call(self, x: tf.Tensor) -> tf.Tensor:
         if self.num <= 0 or not self.B_list:
             return x
-        # ---- 修复 dtype 不匹配：在 float32 里计算，最后再 cast 回来 ----
+        # ---- 淇 dtype 涓嶅尮閰嶏細鍦?float32 閲岃绠楋紝鏈€鍚庡啀 cast 鍥炴潵 ----
         x32 = tf.cast(x, tf.float32)      # (N, in_dim)
         feat_bands = []
         for B in self.B_list:
@@ -186,7 +194,7 @@ class GaussianFourierFeatures(tf.keras.layers.Layer):
             feat_bands.append(tf.sin(xb32))
             feat_bands.append(tf.cos(xb32))
         feat32 = tf.concat(feat_bands + [x32], axis=-1)
-        return tf.cast(feat32, x.dtype)   # 回到与输入一致的 dtype（mixed_float16 下为 float16）
+        return tf.cast(feat32, x.dtype)   # 鍥炲埌涓庤緭鍏ヤ竴鑷寸殑 dtype锛坢ixed_float16 涓嬩负 float16锛?
 
     @property
     def out_dim(self) -> int:
@@ -294,7 +302,7 @@ class MLP(tf.keras.layers.Layer):
 
 
 class GraphConvLayer(tf.keras.layers.Layer):
-    """简单的消息传递层：聚合 kNN 邻居并结合相对坐标统计。"""
+    """Simple graph message-passing layer over kNN neighborhoods."""
 
     def __init__(
         self,
@@ -309,7 +317,7 @@ class GraphConvLayer(tf.keras.layers.Layer):
         self.k = max(int(k), 1)
         self.act = _get_activation(act)
         self.dropout = float(max(dropout, 0.0))
-        # chunk_size 参数仅为向后兼容保留；新实现为一次性并行求解
+        # chunk_size 鍙傛暟浠呬负鍚戝悗鍏煎淇濈暀锛涙柊瀹炵幇涓轰竴娆℃€у苟琛屾眰瑙?
         self._unused_chunk = chunk_size
         self.lin = tf.keras.layers.Dense(
             hidden_dim,
@@ -404,13 +412,13 @@ class GraphConvLayer(tf.keras.layers.Layer):
 
 def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
     """
-    返回每个点的 k 个邻居索引 (N, k)。
+    杩斿洖姣忎釜鐐圭殑 k 涓偦灞呯储寮?(N, k)銆?
 
-    早期实现即便做了按行分块，依旧需要为每个行块一次性构造大小为
-    (chunk × N) 的距离矩阵，N 动辄上万时会产生数百 MB 的瞬时分配，从而
-    触发 GPU OOM。这里改为 *双层分块*：对于每个行块，再按列块遍历全集，
-    仅保留当前行块的 top-k 中间结果，使得任一时刻只需保存
-    (chunk × chunk) 的距离矩阵，内存需求降到线性级别。
+    鏃╂湡瀹炵幇鍗充究鍋氫簡鎸夎鍒嗗潡锛屼緷鏃ч渶瑕佷负姣忎釜琛屽潡涓€娆℃€ф瀯閫犲ぇ灏忎负
+    (chunk 脳 N) 鐨勮窛绂荤煩闃碉紝N 鍔ㄨ緞涓婁竾鏃朵細浜х敓鏁扮櫨 MB 鐨勭灛鏃跺垎閰嶏紝浠庤€?
+    瑙﹀彂 GPU OOM銆傝繖閲屾敼涓?*鍙屽眰鍒嗗潡*锛氬浜庢瘡涓鍧楋紝鍐嶆寜鍒楀潡閬嶅巻鍏ㄩ泦锛?
+    浠呬繚鐣欏綋鍓嶈鍧楃殑 top-k 涓棿缁撴灉锛屼娇寰椾换涓€鏃跺埢鍙渶淇濆瓨
+    (chunk 脳 chunk) 鐨勮窛绂荤煩闃碉紝鍐呭瓨闇€姹傞檷鍒扮嚎鎬х骇鍒€?
     """
 
     x = tf.cast(x, tf.float32)
@@ -558,13 +566,13 @@ class ParamEncoder(tf.keras.layers.Layer):
         return self.mlp(P_hat)  # (B, out_dim)
 
     def _normalize_dim(self, P_hat: tf.Tensor) -> tf.Tensor:
-        """Pad/trim P_hat to the configured input dim so encoder weight shapes一致。"""
+        """Pad/trim ``P_hat`` to match the configured encoder input width."""
 
         target = self.in_dim
         if target <= 0:
             return P_hat
 
-        # 静态形状已匹配则直接返回
+        # 闈欐€佸舰鐘跺凡鍖归厤鍒欑洿鎺ヨ繑鍥?
         if P_hat.shape.rank is not None and P_hat.shape[-1] == target:
             P_hat.set_shape((None, target))
             return P_hat
@@ -597,6 +605,31 @@ class DisplacementNet(tf.keras.Model):
         self.use_film = bool(getattr(cfg, "use_film", False))
         self.use_finite_spectral = bool(getattr(cfg, "use_finite_spectral", False))
         self.use_engineering_semantics = bool(getattr(cfg, "use_engineering_semantics", False))
+        self.adaptive_depth_enabled = bool(getattr(cfg, "adaptive_depth_enabled", False))
+        self.adaptive_depth_mode = str(getattr(cfg, "adaptive_depth_mode", "hard") or "hard").strip().lower()
+        if self.adaptive_depth_mode not in {"hard", "soft"}:
+            raise ValueError(f"Unsupported adaptive_depth_mode='{self.adaptive_depth_mode}', expect 'hard' or 'soft'.")
+        self.adaptive_depth_shallow_layers = max(
+            1, int(getattr(cfg, "adaptive_depth_shallow_layers", 1) or 1)
+        )
+        self.adaptive_depth_threshold = float(getattr(cfg, "adaptive_depth_threshold", 0.5))
+        self.adaptive_depth_temperature = max(
+            1.0e-6, float(getattr(cfg, "adaptive_depth_temperature", 1.0))
+        )
+        self.adaptive_depth_route_source = str(
+            getattr(cfg, "adaptive_depth_route_source", "z_norm") or "z_norm"
+        ).strip().lower()
+        if self.adaptive_depth_route_source not in {"z_norm", "contact_residual"}:
+            raise ValueError(
+                "Unsupported adaptive_depth_route_source="
+                f"'{self.adaptive_depth_route_source}', expect 'z_norm' or 'contact_residual'."
+            )
+        self._contact_residual_hint = tf.Variable(
+            0.0,
+            trainable=False,
+            dtype=tf.float32,
+            name="contact_residual_hint",
+        )
 
         # Fourier PE (used if not in DFEM mode)
         self.pe = GaussianFourierFeatures(
@@ -652,6 +685,19 @@ class DisplacementNet(tf.keras.Model):
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
         )
+        self.mlp_out_shallow = None
+        self.mlp_out_deep = None
+        if self.adaptive_depth_enabled:
+            self.mlp_out_shallow = tf.keras.layers.Dense(
+                cfg.out_dim,
+                kernel_initializer="glorot_uniform",
+                name="mlp_head_shallow",
+            )
+            self.mlp_out_deep = tf.keras.layers.Dense(
+                cfg.out_dim,
+                kernel_initializer="glorot_uniform",
+                name="mlp_head_deep",
+            )
 
         self.graph_proj = tf.keras.layers.Dense(
             cfg.graph_width,
@@ -667,7 +713,7 @@ class DisplacementNet(tf.keras.Model):
             )
             for _ in range(cfg.graph_layers)
         ]
-        # FiLM 调制：为每层准备 γ/β，初始为恒等（γ=1, β=0）
+        # FiLM 璋冨埗锛氫负姣忓眰鍑嗗 纬/尾锛屽垵濮嬩负鎭掔瓑锛埼?1, 尾=0锛?
         self.film_gamma: list[tf.keras.layers.Layer] = []
         self.film_beta: list[tf.keras.layers.Layer] = []
         if self.use_film:
@@ -693,8 +739,25 @@ class DisplacementNet(tf.keras.Model):
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
         )
+        self.graph_out_shallow = None
+        self.graph_out_deep = None
+        if self.adaptive_depth_enabled:
+            self.graph_out_shallow = tf.keras.layers.Dense(
+                cfg.out_dim,
+                kernel_initializer="glorot_uniform",
+                name="graph_head_shallow",
+            )
+            self.graph_out_deep = tf.keras.layers.Dense(
+                cfg.out_dim,
+                kernel_initializer="glorot_uniform",
+                name="graph_head_deep",
+            )
         self.stress_out = None
         self.stress_out_mlp = None
+        self.stress_out_shallow = None
+        self.stress_out_deep = None
+        self.stress_out_mlp_shallow = None
+        self.stress_out_mlp_deep = None
         if cfg.stress_out_dim > 0:
             self.stress_out = tf.keras.layers.Dense(
                 cfg.stress_out_dim,
@@ -706,8 +769,33 @@ class DisplacementNet(tf.keras.Model):
                 kernel_initializer="glorot_uniform",
                 name="stress_head_mlp",
             )
+            if self.adaptive_depth_enabled:
+                self.stress_out_shallow = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_graph_shallow",
+                )
+                self.stress_out_deep = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_graph_deep",
+                )
+                self.stress_out_mlp_shallow = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_mlp_shallow",
+                )
+                self.stress_out_mlp_deep = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_mlp_deep",
+                )
         self.uncertainty_out = None
         self.uncertainty_out_mlp = None
+        self.uncertainty_out_shallow = None
+        self.uncertainty_out_deep = None
+        self.uncertainty_out_mlp_shallow = None
+        self.uncertainty_out_mlp_deep = None
         if int(getattr(cfg, "uncertainty_out_dim", 0) or 0) > 0:
             uod = int(cfg.uncertainty_out_dim)
             self.uncertainty_out = tf.keras.layers.Dense(
@@ -720,12 +808,33 @@ class DisplacementNet(tf.keras.Model):
                 kernel_initializer="glorot_uniform",
                 name="uncertainty_head_mlp",
             )
-        # 全局邻接缓存（可选）
+            if self.adaptive_depth_enabled:
+                self.uncertainty_out_shallow = tf.keras.layers.Dense(
+                    uod,
+                    kernel_initializer="glorot_uniform",
+                    name="uncertainty_head_graph_shallow",
+                )
+                self.uncertainty_out_deep = tf.keras.layers.Dense(
+                    uod,
+                    kernel_initializer="glorot_uniform",
+                    name="uncertainty_head_graph_deep",
+                )
+                self.uncertainty_out_mlp_shallow = tf.keras.layers.Dense(
+                    uod,
+                    kernel_initializer="glorot_uniform",
+                    name="uncertainty_head_mlp_shallow",
+                )
+                self.uncertainty_out_mlp_deep = tf.keras.layers.Dense(
+                    uod,
+                    kernel_initializer="glorot_uniform",
+                    name="uncertainty_head_mlp_deep",
+                )
+        # 鍏ㄥ眬閭绘帴缂撳瓨锛堝彲閫夛級
         self._global_knn_idx: Optional[tf.Tensor] = None
         self._global_adj: Optional[tf.sparse.SparseTensor] = None
         self._global_knn_n: Optional[int] = None
 
-        # 输出缩放（可选可训练），便于微小位移量级的数值稳定
+        # 杈撳嚭缂╂斁锛堝彲閫夊彲璁粌锛夛紝渚夸簬寰皬浣嶇Щ閲忕骇鐨勬暟鍊肩ǔ瀹?
         scale_init = tf.constant(getattr(cfg, "output_scale", 1.0), dtype=tf.float32)
         if getattr(cfg, "output_scale_trainable", False):
             self.output_scale = tf.Variable(scale_init, trainable=True, name="output_scale")
@@ -780,7 +889,7 @@ class DisplacementNet(tf.keras.Model):
         return_uncertainty: bool = False,
     ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor] | Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
-        x : (N,3) coordinates (already normalized if you采用归一化)
+        x : (N,3) coordinates (already normalized if you閲囩敤褰掍竴鍖?
         z : (B,cond_dim) or (cond_dim,)
         Returns:
             u: (N,3)
@@ -799,25 +908,25 @@ class DisplacementNet(tf.keras.Model):
         N = tf.shape(x)[0]
         B = tf.shape(z)[0]
 
-        # --- 修复点 1：处理 Fallback 逻辑 ---
-        # 原代码: if tf.not_equal(B, 1) and tf.not_equal(B, N): ...
-        # 新代码: 使用 tf.cond
+        # --- 淇鐐?1锛氬鐞?Fallback 閫昏緫 ---
+        # 鍘熶唬鐮? if tf.not_equal(B, 1) and tf.not_equal(B, N): ...
+        # 鏂颁唬鐮? 浣跨敤 tf.cond
         condition_fallback = tf.logical_and(tf.not_equal(B, 1), tf.not_equal(B, N))
         z = tf.cond(condition_fallback, lambda: z[:1], lambda: z)
         
-        # 更新 B (因为 z 可能变了)
+        # 鏇存柊 B (鍥犱负 z 鍙兘鍙樹簡)
         B = tf.shape(z)[0]
 
-        # --- 修复点 2：处理广播逻辑 (你现在的报错点) ---
-        # 原代码: if tf.equal(B, 1): ... else: ...
-        # 新代码: 使用 tf.cond
+        # --- 淇鐐?2锛氬鐞嗗箍鎾€昏緫 (浣犵幇鍦ㄧ殑鎶ラ敊鐐? ---
+        # 鍘熶唬鐮? if tf.equal(B, 1): ... else: ...
+        # 鏂颁唬鐮? 浣跨敤 tf.cond
         zb = tf.cond(
             tf.equal(B, 1), 
             lambda: tf.repeat(z, repeats=N, axis=0), 
             lambda: z
         )
 
-        # --- 后续逻辑保持不变 ---
+        # --- 鍚庣画閫昏緫淇濇寔涓嶅彉 ---
         feat_dtype = x.dtype
         if zb.dtype != feat_dtype:
             zb = tf.cast(zb, feat_dtype)
@@ -860,19 +969,23 @@ class DisplacementNet(tf.keras.Model):
         h = tf.concat([x_feat, zb], axis=-1)
 
         def _apply_output(u_out: tf.Tensor, coords: tf.Tensor, hfeat: tf.Tensor):
-            # 输出缩放：网络预测无量纲位移，再映射到物理量级
+            # Output scaling: network predicts normalized displacement first.
             scale = tf.cast(self.output_scale, u_out.dtype)
             u_out = u_out * scale
 
-            # 可选硬约束：以圆孔为例，在半径内直接将位移投影为 0，减少软约束漏出
+            # Optional hard BC mask for points inside the constrained hole radius.
             if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
                 cx, cy = self.cfg.hard_bc_center
                 dx = coords[:, 0] - tf.cast(cx, coords.dtype)
                 dy = coords[:, 1] - tf.cast(cy, coords.dtype)
                 r2 = dx * dx + dy * dy
-                mask = tf.cast(r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2, u_out.dtype)
+                mask = tf.cast(
+                    r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2,
+                    u_out.dtype,
+                )
                 dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
                 u_out = u_out * mask[:, None] * dof_mask
+
             sigma_out = None
             if return_stress:
                 if self.stress_out is None:
@@ -884,6 +997,7 @@ class DisplacementNet(tf.keras.Model):
                     sigma_out = self.stress_out_mlp(hfeat)
                 else:
                     sigma_out = self.stress_out(hfeat)
+
             log_var = None
             if return_uncertainty:
                 if self.uncertainty_out is None:
@@ -895,6 +1009,70 @@ class DisplacementNet(tf.keras.Model):
                     log_var = self.uncertainty_out_mlp(hfeat)
                 else:
                     log_var = self.uncertainty_out(hfeat)
+
+            if return_stress and return_uncertainty:
+                return u_out, sigma_out, log_var
+            if return_stress:
+                return u_out, sigma_out
+            if return_uncertainty:
+                return u_out, log_var
+            return u_out
+
+        def _apply_output_adaptive(
+            u_shallow: tf.Tensor,
+            u_deep: tf.Tensor,
+            coords: tf.Tensor,
+            hfeat_shallow: tf.Tensor,
+            hfeat_deep: tf.Tensor,
+            *,
+            use_mlp_head: bool,
+        ):
+            alpha = self._sample_route_alpha(z, u_deep.dtype)
+            one = tf.cast(1.0, u_deep.dtype)
+            u_out = (one - alpha) * u_shallow + alpha * u_deep
+            scale = tf.cast(self.output_scale, u_out.dtype)
+            u_out = u_out * scale
+
+            if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
+                cx, cy = self.cfg.hard_bc_center
+                dx = coords[:, 0] - tf.cast(cx, coords.dtype)
+                dy = coords[:, 1] - tf.cast(cy, coords.dtype)
+                r2 = dx * dx + dy * dy
+                mask = tf.cast(
+                    r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2,
+                    u_out.dtype,
+                )
+                dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
+                u_out = u_out * mask[:, None] * dof_mask
+
+            sigma_out = None
+            if return_stress:
+                if self.stress_out is None:
+                    raise ValueError("stress head disabled (stress_out_dim<=0)")
+                if use_mlp_head:
+                    shallow_head = self.stress_out_mlp_shallow or self.stress_out_mlp
+                    deep_head = self.stress_out_mlp_deep or self.stress_out_mlp
+                else:
+                    shallow_head = self.stress_out_shallow or self.stress_out
+                    deep_head = self.stress_out_deep or self.stress_out
+                sigma_shallow = shallow_head(hfeat_shallow)
+                sigma_deep = deep_head(hfeat_deep)
+                sigma_out = (one - alpha) * sigma_shallow + alpha * sigma_deep
+
+            log_var = None
+            if return_uncertainty:
+                if self.uncertainty_out is None:
+                    raise ValueError("uncertainty head disabled (uncertainty_out_dim<=0)")
+                if use_mlp_head:
+                    shallow_head = self.uncertainty_out_mlp_shallow or self.uncertainty_out_mlp
+                    deep_head = self.uncertainty_out_mlp_deep or self.uncertainty_out_mlp
+                else:
+                    shallow_head = self.uncertainty_out_shallow or self.uncertainty_out
+                    deep_head = self.uncertainty_out_deep or self.uncertainty_out
+                log_var_shallow = shallow_head(hfeat_shallow)
+                log_var_deep = deep_head(hfeat_deep)
+                log_var = (one - alpha) * log_var_shallow + alpha * log_var_deep
+
             if return_stress and return_uncertainty:
                 return u_out, sigma_out, log_var
             if return_stress:
@@ -905,10 +1083,37 @@ class DisplacementNet(tf.keras.Model):
 
         def mlp_forward():
             hcur = h
-            for layer in self.mlp_layers:
+            if not self.adaptive_depth_enabled:
+                for layer in self.mlp_layers:
+                    hcur = self.mlp_act(layer(hcur))
+                u_out = self.mlp_out(hcur)
+                return _apply_output(u_out, x, hcur)
+
+            shallow_depth = min(
+                self.adaptive_depth_shallow_layers,
+                max(1, len(self.mlp_layers)),
+            )
+            h_shallow = None
+            for li, layer in enumerate(self.mlp_layers, start=1):
                 hcur = self.mlp_act(layer(hcur))
-            u_out = self.mlp_out(hcur)
-            return _apply_output(u_out, x, hcur)
+                if li == shallow_depth:
+                    h_shallow = hcur
+            if h_shallow is None:
+                h_shallow = hcur
+            h_deep = hcur
+
+            shallow_head = self.mlp_out_shallow or self.mlp_out
+            deep_head = self.mlp_out_deep or self.mlp_out
+            u_shallow = shallow_head(h_shallow)
+            u_deep = deep_head(h_deep)
+            return _apply_output_adaptive(
+                u_shallow,
+                u_deep,
+                x,
+                h_shallow,
+                h_deep,
+                use_mlp_head=True,
+            )
 
         def graph_forward():
             coords = x
@@ -936,22 +1141,48 @@ class DisplacementNet(tf.keras.Model):
                     return knn_cached, _knn_to_adj(knn_cached, n_nodes)
 
                 knn_idx, adj = tf.cond(use_cached, _use_cache, _build_dynamic)
-                 
+
             hcur = self.graph_proj(h)
             film_gamma = self.film_gamma if self.use_film else None
             film_beta = self.film_beta if self.use_film else None
-            for li, layer in enumerate(self.graph_layers):
+            shallow_depth = min(
+                self.adaptive_depth_shallow_layers,
+                max(1, len(self.graph_layers)),
+            )
+            h_shallow = None
+            for li, layer in enumerate(self.graph_layers, start=1):
                 hcur = layer(hcur, coords, knn_idx, adj=adj, training=training)
                 if film_gamma is not None and film_beta is not None:
-                    gamma = film_gamma[li](zb)
-                    beta = film_beta[li](zb)
+                    gamma = film_gamma[li - 1](zb)
+                    beta = film_beta[li - 1](zb)
                     gamma = tf.cast(gamma, hcur.dtype)
                     beta = tf.cast(beta, hcur.dtype)
                     hcur = gamma * hcur + beta
-            hcur = self.graph_norm(hcur)
-            u_out = self.graph_out(hcur)
-            return _apply_output(u_out, coords, hcur)
+                if li == shallow_depth:
+                    h_shallow = hcur
 
+            if h_shallow is None:
+                h_shallow = hcur
+
+            if not self.adaptive_depth_enabled:
+                hcur = self.graph_norm(hcur)
+                u_out = self.graph_out(hcur)
+                return _apply_output(u_out, coords, hcur)
+
+            h_shallow_norm = self.graph_norm(h_shallow)
+            h_deep_norm = self.graph_norm(hcur)
+            shallow_head = self.graph_out_shallow or self.graph_out
+            deep_head = self.graph_out_deep or self.graph_out
+            u_shallow = shallow_head(h_shallow_norm)
+            u_deep = deep_head(h_deep_norm)
+            return _apply_output_adaptive(
+                u_shallow,
+                u_deep,
+                coords,
+                h_shallow_norm,
+                h_deep_norm,
+                use_mlp_head=False,
+            )
         # --- Decide graph vs MLP ---
         if not self.use_graph:
             return mlp_forward()
@@ -966,7 +1197,7 @@ class DisplacementNet(tf.keras.Model):
         return tf.cond(use_graph, graph_forward, mlp_forward)
 
     def set_global_graph(self, coords: tf.Tensor):
-        """预计算并缓存全局 kNN 邻接，用于整图前向以避免分块断图。"""
+        """Precompute and cache global kNN adjacency for full-mesh forward passes."""
 
         coords = tf.convert_to_tensor(coords, dtype=tf.float32)
         k = self.cfg.graph_k
@@ -975,6 +1206,34 @@ class DisplacementNet(tf.keras.Model):
         
         # Precompute sparse adj
         self._global_adj = _knn_to_adj(self._global_knn_idx, self._global_knn_n)
+
+    def set_contact_residual_hint(self, value: float | tf.Tensor):
+        """Update sample-level routing hint from contact residual statistics."""
+
+        v = tf.cast(tf.convert_to_tensor(value), tf.float32)
+        if v.shape.rank != 0:
+            v = tf.reshape(v, ())
+        v = tf.where(tf.math.is_finite(v), v, tf.zeros_like(v))
+        v = tf.maximum(v, tf.constant(0.0, dtype=tf.float32))
+        self._contact_residual_hint.assign(v)
+
+    def _sample_route_alpha(self, z: tf.Tensor, dtype: tf.dtypes.DType) -> tf.Tensor:
+        """
+        Return deep-path weight alpha in [0,1] for sample-level routing.
+        alpha=0 -> shallow head, alpha=1 -> deep head.
+        """
+        if self.adaptive_depth_route_source == "contact_residual":
+            score = tf.cast(self._contact_residual_hint, tf.float32)
+        else:
+            z_sample = tf.reduce_mean(tf.cast(z, tf.float32), axis=0, keepdims=True)
+            score = tf.sqrt(tf.reduce_mean(tf.square(z_sample)))
+        threshold = tf.cast(self.adaptive_depth_threshold, tf.float32)
+        temperature = tf.cast(self.adaptive_depth_temperature, tf.float32)
+        if self.adaptive_depth_mode == "soft":
+            alpha = tf.math.sigmoid((score - threshold) / tf.maximum(temperature, 1.0e-6))
+        else:
+            alpha = tf.cast(score >= threshold, tf.float32)
+        return tf.cast(tf.reshape(alpha, (1, 1)), dtype)
 
 
 # -----------------------------
@@ -1023,15 +1282,19 @@ class DisplacementModel:
         if P_hat.shape.rank == 1:
             P_hat = tf.expand_dims(P_hat, axis=0)
 
-        # P_hat may include staged metadata (mask/last/rank) -> length 4*n_bolts; avoid
-        # over-constraining the last dimension. We only ensure rank-2 here and let
-        # ParamEncoder._normalize_dim pad/trim to cfg.encoder.in_dim when set.
-        P_hat = tf.ensure_shape(P_hat, (None, None))
+        # P_hat may include staged metadata (mask/last/rank), so keep trailing
+        # dimension flexible but enforce rank-2.
+        tf.debugging.assert_rank(P_hat, 2, message="P_hat must be rank-2 after normalization.")
+        P_hat.set_shape((None, None))
 
         X = tf.convert_to_tensor(X, dtype=tf.float32)
         if X.shape.rank == 1:
             X = tf.expand_dims(X, axis=0)
-        X = tf.ensure_shape(X, (None, 3))
+        # Do not use tf.ensure_shape here: under tf.function+ForwardAccumulator it
+        # can trigger trace_type errors in some TF versions.
+        tf.debugging.assert_rank(X, 2, message="X must be rank-2 with shape (N,3).")
+        tf.debugging.assert_equal(tf.shape(X)[-1], 3, message="X last dimension must be 3.")
+        X.set_shape((None, 3))
 
         return X, P_hat
 
@@ -1046,15 +1309,15 @@ class DisplacementModel:
     def _u_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> tf.Tensor:
         z = self.encoder(P_hat)          # (B, cond_dim)
         u = self.field(X, z)             # (N,3)
-        # Physics operators和能量算子都假定输入为 float32；若启用混合精度，
-        # 网络内部会在 float16/bfloat16 下计算，此处统一 cast 回 float32，
-        # 以避免如 tie/boundary 约束中出现 "expected float but got half" 的报错。
+        # Physics operators鍜岃兘閲忕畻瀛愰兘鍋囧畾杈撳叆涓?float32锛涜嫢鍚敤娣峰悎绮惧害锛?
+        # 缃戠粶鍐呴儴浼氬湪 float16/bfloat16 涓嬭绠楋紝姝ゅ缁熶竴 cast 鍥?float32锛?
+        # 浠ラ伩鍏嶅 tie/boundary 绾︽潫涓嚭鐜?"expected float but got half" 鐨勬姤閿欍€?
         return tf.cast(u, tf.float32)
 
     def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
         """
         Unified forward:
-            X: (N,3) float tensor (coordinates; normalized outside if采用归一化)
+            X: (N,3) float tensor (coordinates; normalized outside if閲囩敤褰掍竴鍖?
             params: dict with either
                 - 'P_hat': (3,) or (N,3) normalized preload
                 - or 'P': (3,) real preload in N + cfg.preload_shift/scale provided
@@ -1079,8 +1342,8 @@ class DisplacementModel:
 
     def us_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """
-        带应力头的前向：返回位移 u 和预测的应力分量 sigma。
-        sigma 的维度由 cfg.field.stress_out_dim 决定（默认 6）。
+        甯﹀簲鍔涘ご鐨勫墠鍚戯細杩斿洖浣嶇Щ u 鍜岄娴嬬殑搴斿姏鍒嗛噺 sigma銆?
+        sigma 鐨勭淮搴︾敱 cfg.field.stress_out_dim 鍐冲畾锛堥粯璁?6锛夈€?
         """
         X, P_hat = self._normalize_inputs(X, params)
         return self._us_fn_compiled(X, P_hat)

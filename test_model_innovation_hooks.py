@@ -159,6 +159,64 @@ class InnovationHookTests(unittest.TestCase):
 
         self.assertGreaterEqual(calls["count"], 1)
 
+    def test_sample_level_adaptive_depth_routes_easy_and_hard_samples(self):
+        cfg = ModelConfig()
+        cfg.field.dfem_mode = False
+        cfg.field.use_graph = False
+        cfg.field.depth = 3
+        cfg.field.width = 8
+        cfg.field.fourier.num = 0
+        cfg.field.output_scale = 1.0
+        cfg.field.adaptive_depth_enabled = True
+        cfg.field.adaptive_depth_mode = "hard"
+        cfg.field.adaptive_depth_shallow_layers = 1
+        cfg.field.adaptive_depth_threshold = 0.5
+        cfg.field.adaptive_depth_temperature = 0.1
+        cfg.field.adaptive_depth_route_source = "contact_residual"
+
+        model = create_displacement_model(cfg)
+        X = tf.convert_to_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+
+        # Build variables first.
+        _ = model.u_fn(X, {"P_hat": tf.zeros((1, 3), dtype=tf.float32)})
+
+        def _set_dense_bias_only(layer: tf.keras.layers.Dense, bias_value: float):
+            w, b = layer.get_weights()
+            w[...] = 0.0
+            b[...] = bias_value
+            layer.set_weights([w, b])
+
+        for hidden in model.field.mlp_layers:
+            _set_dense_bias_only(hidden, 0.0)
+
+        _set_dense_bias_only(model.field.mlp_out_shallow, 1.0)
+        _set_dense_bias_only(model.field.mlp_out_deep, 2.0)
+
+        model.field.set_contact_residual_hint(0.0)
+        easy = model.u_fn(X, {"P_hat": tf.ones((1, 3), dtype=tf.float32) * 10.0})
+        model.field.set_contact_residual_hint(2.0)
+        hard = model.u_fn(X, {"P_hat": tf.zeros((1, 3), dtype=tf.float32)})
+
+        np.testing.assert_allclose(
+            easy.numpy(),
+            np.ones((4, 3), dtype=np.float32),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            hard.numpy(),
+            np.full((4, 3), 2.0, dtype=np.float32),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -360,6 +360,29 @@ def _prepare_config_with_autoguess():
         cfg.grad_clip_norm = float(optimizer_cfg["grad_clip_norm"])
     if "log_every" in optimizer_cfg:
         cfg.log_every = int(optimizer_cfg["log_every"])
+    if "contact_route_update_every" in cfg_yaml:
+        cfg.contact_route_update_every = int(cfg_yaml["contact_route_update_every"])
+    early_exit_cfg = optimizer_cfg.get("early_exit", None)
+    if not isinstance(early_exit_cfg, dict):
+        early_exit_cfg = cfg_yaml.get("early_exit", {}) or {}
+    else:
+        early_exit_cfg = early_exit_cfg or {}
+    if "enabled" in early_exit_cfg:
+        cfg.early_exit_enabled = bool(early_exit_cfg["enabled"])
+    if "warmup_steps" in early_exit_cfg:
+        cfg.early_exit_warmup_steps = int(early_exit_cfg["warmup_steps"])
+    if "nonfinite_patience" in early_exit_cfg:
+        cfg.early_exit_nonfinite_patience = int(early_exit_cfg["nonfinite_patience"])
+    if "divergence_patience" in early_exit_cfg:
+        cfg.early_exit_divergence_patience = int(early_exit_cfg["divergence_patience"])
+    if "grad_norm_threshold" in early_exit_cfg:
+        cfg.early_exit_grad_norm_threshold = float(early_exit_cfg["grad_norm_threshold"])
+    if "pi_ema_rel_increase" in early_exit_cfg:
+        cfg.early_exit_pi_ema_rel_increase = float(early_exit_cfg["pi_ema_rel_increase"])
+    if "check_every" in early_exit_cfg:
+        cfg.early_exit_check_every = int(early_exit_cfg["check_every"])
+    elif "early_exit_check_every" in cfg_yaml:
+        cfg.early_exit_check_every = int(cfg_yaml["early_exit_check_every"])
 
     lbfgs_cfg = optimizer_cfg.get("lbfgs", {}) or {}
     cfg.lbfgs_enabled = bool(optimizer_cfg.get("lbfgs_enabled", cfg.lbfgs_enabled))
@@ -502,6 +525,18 @@ def _prepare_config_with_autoguess():
         print(f"[main] Uncertainty head out dim: {cfg.model_cfg.field.uncertainty_out_dim}")
     if "use_graph" in net_cfg_yaml:
         cfg.model_cfg.field.use_graph = bool(net_cfg_yaml["use_graph"])
+    if "adaptive_depth_enabled" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_enabled = bool(net_cfg_yaml["adaptive_depth_enabled"])
+    if "adaptive_depth_mode" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_mode = str(net_cfg_yaml["adaptive_depth_mode"])
+    if "adaptive_depth_shallow_layers" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_shallow_layers = int(net_cfg_yaml["adaptive_depth_shallow_layers"])
+    if "adaptive_depth_threshold" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_threshold = float(net_cfg_yaml["adaptive_depth_threshold"])
+    if "adaptive_depth_temperature" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_temperature = float(net_cfg_yaml["adaptive_depth_temperature"])
+    if "adaptive_depth_route_source" in net_cfg_yaml:
+        cfg.model_cfg.field.adaptive_depth_route_source = str(net_cfg_yaml["adaptive_depth_route_source"])
 
     # ===== 接触力学参数（normal/friction）=====
     normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
@@ -628,6 +663,33 @@ def _prepare_config_with_autoguess():
         cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
     )
     cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
+    if "contact_rar_enabled" in cfg_yaml:
+        cfg.contact_rar_enabled = bool(cfg_yaml.get("contact_rar_enabled"))
+    if "contact_rar_fraction" in cfg_yaml:
+        cfg.contact_rar_fraction = float(cfg_yaml.get("contact_rar_fraction"))
+    if "contact_rar_temperature" in cfg_yaml:
+        cfg.contact_rar_temperature = float(cfg_yaml.get("contact_rar_temperature"))
+    if "contact_rar_floor" in cfg_yaml:
+        cfg.contact_rar_floor = float(cfg_yaml.get("contact_rar_floor"))
+    if "contact_rar_uniform_ratio" in cfg_yaml:
+        cfg.contact_rar_uniform_ratio = float(cfg_yaml.get("contact_rar_uniform_ratio"))
+    if "contact_rar_fric_mix" in cfg_yaml:
+        cfg.contact_rar_fric_mix = float(cfg_yaml.get("contact_rar_fric_mix"))
+    if "contact_rar_balance_pairs" in cfg_yaml:
+        cfg.contact_rar_balance_pairs = bool(cfg_yaml.get("contact_rar_balance_pairs"))
+
+    if "volume_rar_enabled" in cfg_yaml:
+        cfg.volume_rar_enabled = bool(cfg_yaml.get("volume_rar_enabled"))
+    if "volume_rar_fraction" in cfg_yaml:
+        cfg.volume_rar_fraction = float(cfg_yaml.get("volume_rar_fraction"))
+    if "volume_rar_temperature" in cfg_yaml:
+        cfg.volume_rar_temperature = float(cfg_yaml.get("volume_rar_temperature"))
+    if "volume_rar_uniform_ratio" in cfg_yaml:
+        cfg.volume_rar_uniform_ratio = float(cfg_yaml.get("volume_rar_uniform_ratio"))
+    if "volume_rar_floor" in cfg_yaml:
+        cfg.volume_rar_floor = float(cfg_yaml.get("volume_rar_floor"))
+    if "volume_rar_ema_decay" in cfg_yaml:
+        cfg.volume_rar_ema_decay = float(cfg_yaml.get("volume_rar_ema_decay"))
 
     if cfg.incremental_mode:
         cfg.contact_cfg.update_every_steps = 1
@@ -659,6 +721,10 @@ def _prepare_config_with_autoguess():
         cfg.elas_cfg.stress_loss_weight = float(elas_cfg_yaml.get("stress_loss_weight", cfg.elas_cfg.stress_loss_weight))
     if "use_forward_mode" in elas_cfg_yaml:
         cfg.elas_cfg.use_forward_mode = bool(elas_cfg_yaml.get("use_forward_mode"))
+    if "cache_sample_metrics" in elas_cfg_yaml:
+        cfg.elas_cfg.cache_sample_metrics = bool(elas_cfg_yaml.get("cache_sample_metrics"))
+    else:
+        cfg.elas_cfg.cache_sample_metrics = bool(cfg.volume_rar_enabled)
 
     # 3) 接触/拧紧采样：根据阶段数做显存友好的调整
     stage_multiplier = 1

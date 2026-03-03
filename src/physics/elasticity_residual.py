@@ -75,6 +75,9 @@ class ElasticityResidual:
         self.lam_tf = tf.convert_to_tensor(self.lam, dtype=tf.float32)
         self.mu_tf = tf.convert_to_tensor(self.mu, dtype=tf.float32)
 
+        self._cache_sample_metrics = bool(
+            getattr(self.cfg, "cache_sample_metrics", True)
+        )
         self._last_sample_metrics: Optional[Dict[str, Any]] = None
 
     # ----- public helpers -----
@@ -86,8 +89,24 @@ class ElasticityResidual:
         idx = np.asarray(indices, dtype=np.int64).reshape(-1)
         self._sample_indices = idx
 
+    def set_sample_metrics_cache_enabled(self, enabled: bool):
+        self._cache_sample_metrics = bool(enabled)
+        if not self._cache_sample_metrics:
+            self._last_sample_metrics = None
+
     def last_sample_metrics(self) -> Optional[Dict[str, Any]]:
         return self._last_sample_metrics
+
+    def _cache_metrics(self, psi: tf.Tensor, idx: Optional[tf.Tensor]) -> None:
+        if not self._cache_sample_metrics:
+            self._last_sample_metrics = None
+            return
+        psi_t = tf.cast(psi, tf.float32)
+        if idx is None:
+            idx_t = tf.range(tf.shape(psi_t)[0], dtype=tf.int64)
+        else:
+            idx_t = tf.cast(idx, tf.int64)
+        self._last_sample_metrics = {"psi": psi_t, "idx": idx_t}
 
     # ----- core computation -----
 
@@ -232,13 +251,8 @@ class ElasticityResidual:
             "vol_sum": tf.reduce_sum(w),
         }
 
-        # Cache for RAR
-        if tf.executing_eagerly():
-            if idx is None:
-                idx_np = np.arange(self.n_cells, dtype=np.int64)
-            else:
-                idx_np = idx.numpy()
-            self._last_sample_metrics = {"psi": psi.numpy(), "idx": idx_np}
+        # Cache for RAR (tensor form; materialize on host only when needed).
+        self._cache_metrics(psi, idx)
 
         if not return_cache:
             return E_int, stats
@@ -356,13 +370,8 @@ class ElasticityResidual:
             "vol_sum": tf.reduce_sum(w),
         }
 
-        # Cache for RAR
-        if tf.executing_eagerly():
-            if idx is None:
-                idx_np = np.arange(self.n_cells, dtype=np.int64)
-            else:
-                idx_np = idx.numpy()
-            self._last_sample_metrics = {"psi": psi.numpy(), "idx": idx_np}
+        # Cache for RAR (tensor form; materialize on host only when needed).
+        self._cache_metrics(psi, idx)
 
         elastic_cache = {
             "eps_vec": eps_vec,
