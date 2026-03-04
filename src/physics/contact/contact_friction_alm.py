@@ -638,7 +638,6 @@ class FrictionContactALM:
         self._last_r_norm = r_norm
         return L_ct, stats
 
-    @tf.function(jit_compile=False)
     def update_multipliers(
         self,
         u_fn,

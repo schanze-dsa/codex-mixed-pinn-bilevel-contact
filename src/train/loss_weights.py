@@ -319,9 +319,10 @@ def update_loss_weights(
                 state.last_factor_ct = state.last_factors.get("E_ct", 1.0)
                 return
 
-            target = float(np.median(positive))
+            # Use geometric mean as balancing target so one dominant term
+            # does not pin itself near the original weight floor.
+            target = float(np.exp(np.mean(np.log(positive + eps))))
             factors = target / (vals + eps)
-            factors = np.clip(factors, state.min_factor, state.max_factor)
 
             new_current = dict(state.base)
             state.last_factors = {}
@@ -329,6 +330,15 @@ def update_loss_weights(
             max_w = state.max_weight
             for term, factor in zip(term_order, factors):
                 base_w = float(state.base.get(term, 0.0))
+                min_factor = float(state.min_factor)
+                max_factor = float(state.max_factor)
+                if min_w is not None and base_w > 0.0:
+                    min_factor = min(min_factor, float(min_w) / base_w)
+                if max_w is not None and base_w > 0.0:
+                    max_factor = max(max_factor, float(max_w) / base_w)
+                if max_factor < min_factor:
+                    max_factor = min_factor
+                factor = float(np.clip(float(factor), min_factor, max_factor))
                 new_w = base_w * float(factor)
                 if new_w < 0.0:
                     new_w = 0.0
@@ -350,7 +360,6 @@ def update_loss_weights(
 
             avg = float(len(soft)) if len(soft) > 0 else 1.0
             factors = avg * soft
-            factors = np.clip(factors, state.min_factor, state.max_factor)
 
             new_current = dict(state.base)
             state.last_factors = {}
@@ -360,6 +369,15 @@ def update_loss_weights(
                 if term not in new_current:
                     continue
                 base_w = float(new_current[term])
+                min_factor = float(state.min_factor)
+                max_factor = float(state.max_factor)
+                if min_w is not None and base_w > 0.0:
+                    min_factor = min(min_factor, float(min_w) / base_w)
+                if max_w is not None and base_w > 0.0:
+                    max_factor = max(max_factor, float(max_w) / base_w)
+                if max_factor < min_factor:
+                    max_factor = min_factor
+                factor = float(np.clip(float(factor), min_factor, max_factor))
                 new_w = base_w * float(factor)
                 if new_w < 0.0:
                     new_w = 0.0

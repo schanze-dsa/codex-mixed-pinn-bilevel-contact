@@ -8,6 +8,7 @@ import os
 import sys
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import tensorflow as tf
@@ -217,6 +218,41 @@ class InnovationHookTests(unittest.TestCase):
             rtol=0.0,
             atol=1.0e-6,
         )
+
+    def test_pointwise_forward_bypasses_graph_path(self):
+        cfg = ModelConfig()
+        cfg.field.dfem_mode = False
+        cfg.field.use_graph = True
+        cfg.field.graph_layers = 1
+        cfg.field.graph_width = 16
+        cfg.field.graph_k = 2
+        cfg.field.fourier.num = 0
+        cfg.field.stress_out_dim = 6
+
+        model = create_displacement_model(cfg)
+        X = tf.convert_to_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        params = {"P": tf.constant([0.0, 0.0, 0.0], dtype=tf.float32)}
+
+        # Build and cache graph first.
+        _ = model.u_fn(X, params)
+        model.field.set_global_graph(X)
+
+        layer = model.field.graph_layers[0]
+        with patch.object(layer, "call", side_effect=RuntimeError("graph path called")):
+            u = model.u_fn_pointwise(X, params)
+            u2, sigma = model.us_fn_pointwise(X, params)
+
+        self.assertEqual(tuple(u.shape), (4, 3))
+        self.assertEqual(tuple(u2.shape), (4, 3))
+        self.assertEqual(tuple(sigma.shape), (4, 6))
 
 if __name__ == "__main__":
     unittest.main()

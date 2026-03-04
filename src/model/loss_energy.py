@@ -108,6 +108,20 @@ class TotalEnergy:
             return "residual"
         return "energy"
 
+    @staticmethod
+    def _resolve_bound_variant(fn, method_name: str):
+        """Use an alternate bound method when available (e.g. pointwise forward)."""
+
+        if fn is None:
+            return None
+        owner = getattr(fn, "__self__", None)
+        if owner is None:
+            return fn
+        alt = getattr(owner, method_name, None)
+        if callable(alt):
+            return alt
+        return fn
+
     def attach(self, elasticity: Optional[ElasticityResidual] = None,
                contact: Optional[ContactOperator] = None,
                tightening: Optional[NutTighteningPenalty] = None,
@@ -174,16 +188,18 @@ class TotalEnergy:
 
         u_nodes = None
         elastic_cache = None
+        u_fn_elastic = self._resolve_bound_variant(u_fn, "u_fn_pointwise")
+        stress_fn_elastic = self._resolve_bound_variant(stress_fn, "us_fn_pointwise")
         if self.elasticity is not None:
             u_nodes = self.elasticity._eval_u_on_nodes(u_fn, params)
             E_int_res = self.elasticity.energy(
-                u_fn,
+                u_fn_elastic,
                 params,
                 tape=tape,
-                return_cache=bool(stress_fn),
+                return_cache=bool(stress_fn_elastic),
                 u_nodes=u_nodes,
             )
-            if bool(stress_fn):
+            if bool(stress_fn_elastic):
                 E_int, estates, elastic_cache = E_int_res  # type: ignore[misc]
             else:
                 E_int, estates = E_int_res  # type: ignore[misc]
@@ -225,7 +241,7 @@ class TotalEnergy:
 
         w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
         w_eq = float(getattr(self.cfg, "w_eq", 0.0))
-        use_stress = stress_fn is not None and elastic_cache is not None
+        use_stress = stress_fn_elastic is not None and elastic_cache is not None
         use_sigma = use_stress and w_sigma > 1e-15 and getattr(self.elasticity.cfg, "stress_loss_weight", 0.0) > 0.0
         use_eq = use_stress and w_eq > 1e-15
 
@@ -274,7 +290,7 @@ class TotalEnergy:
             node_ids = tf.reshape(dof_idx // 3, (-1,))
             unique_nodes, rev = tf.unique(node_ids)
             X_nodes = tf.cast(tf.gather(self.elasticity.X_nodes_tf, unique_nodes), dtype)
-            _, sigma_pred_nodes = stress_fn(X_nodes, params)
+            _, sigma_pred_nodes = stress_fn_elastic(X_nodes, params)
             sigma_pred_nodes = tf.cast(sigma_pred_nodes, dtype)
 
             sigma_nodes_full = tf.gather(sigma_pred_nodes, rev)
@@ -326,7 +342,9 @@ class TotalEnergy:
         w_eq = float(getattr(self.cfg, "w_eq", 0.0))
         w_reg = float(getattr(self.cfg, "w_reg", 0.0))
         stress_weight = float(getattr(getattr(self.elasticity, "cfg", None), "stress_loss_weight", 0.0))
-        need_sigma = stress_fn is not None and w_sigma > 1e-15 and stress_weight > 0.0
+        u_fn_elastic = self._resolve_bound_variant(u_fn, "u_fn_pointwise")
+        stress_fn_elastic = self._resolve_bound_variant(stress_fn, "us_fn_pointwise")
+        need_sigma = stress_fn_elastic is not None and w_sigma > 1e-15 and stress_weight > 0.0
         need_eq = w_eq > 1e-15
         need_reg = w_reg > 1e-15
 
@@ -335,9 +353,9 @@ class TotalEnergy:
         if self.elasticity is not None:
             u_nodes = self.elasticity._eval_u_on_nodes(u_fn, params)
             estates, elastic_cache = self.elasticity.residual_cache(
-                u_fn,
+                u_fn_elastic,
                 params,
-                stress_fn=stress_fn,
+                stress_fn=stress_fn_elastic,
                 need_sigma=need_sigma,
                 need_eq=need_eq,
             )
@@ -376,7 +394,7 @@ class TotalEnergy:
             parts["E_tight"] = tf.cast(E_tight, dtype)
             stats.update(tstats)
 
-        use_stress = stress_fn is not None and elastic_cache is not None
+        use_stress = stress_fn_elastic is not None and elastic_cache is not None
         use_sigma = use_stress and w_sigma > 1e-15 and stress_weight > 0.0
         use_eq = elastic_cache is not None and w_eq > 1e-15
         use_reg = elastic_cache is not None and w_reg > 1e-15

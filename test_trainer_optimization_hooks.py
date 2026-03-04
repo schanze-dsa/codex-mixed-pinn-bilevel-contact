@@ -19,6 +19,8 @@ if SRC not in sys.path:
 
 from train.trainer import Trainer, _SavedModelModule
 from model.pinn_model import ModelConfig, FieldConfig, EncoderConfig, create_displacement_model
+from physics.contact.contact_normal_alm import NormalContactALM
+from physics.contact.contact_friction_alm import FrictionContactALM
 
 
 class _OptWithAggregateArg:
@@ -226,6 +228,13 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         trainer.model = SimpleNamespace(field=_Field())
         trainer._push_contact_route_hint()
         self.assertIsNotNone(captured["v"])
+
+    def test_contact_multiplier_updates_are_plain_python_methods(self):
+        normal = NormalContactALM()
+        friction = FrictionContactALM()
+
+        self.assertFalse(hasattr(normal.update_multipliers, "python_function"))
+        self.assertFalse(hasattr(friction.update_multipliers, "python_function"))
 
 
 if __name__ == "__main__":

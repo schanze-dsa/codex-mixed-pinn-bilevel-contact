@@ -349,7 +349,6 @@ class NormalContactALM:
         }
         return En, stats
 
-    @tf.function(jit_compile=False)
     def update_multipliers(
         self,
         u_fn,

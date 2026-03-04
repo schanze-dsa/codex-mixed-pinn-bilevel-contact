@@ -93,6 +93,36 @@ def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int
     if batch_size is None or batch_size <= 0:
         batch_size = points.shape[0]
 
+    def _has_matching_global_graph() -> bool:
+        owner = getattr(u_fn, "__self__", None)
+        field = getattr(owner, "field", None) if owner is not None else None
+        if field is None:
+            return False
+        knn_idx = getattr(field, "_global_knn_idx", None)
+        if knn_idx is None:
+            return False
+        cached_n = getattr(field, "_global_knn_n", None)
+        if cached_n is None:
+            shape = getattr(knn_idx, "shape", None)
+            if shape is None or len(shape) < 1 or shape[0] is None:
+                return False
+            cached_n = shape[0]
+        try:
+            return int(cached_n) == int(points.shape[0])
+        except Exception:
+            return False
+
+    # For graph models, chunked calls force a fallback to pointwise MLP because
+    # each chunk length differs from the cached full-mesh graph size. Prefer one
+    # full call when the node count matches, then fall back to chunking on error.
+    if points.shape[0] > batch_size and _has_matching_global_graph():
+        try:
+            x_all = tf.convert_to_tensor(points, dtype=tf.float32)
+            u_all = u_fn(x_all, params)
+            return np.asarray(u_all.numpy(), dtype=np.float64)
+        except Exception as exc:
+            print(f"[viz] full-graph eval failed, fallback to chunked eval: {exc}")
+
     outputs = []
     n = points.shape[0]
     for start in range(0, n, batch_size):

@@ -887,6 +887,7 @@ class DisplacementNet(tf.keras.Model):
         training: bool | None = False,
         return_stress: bool = False,
         return_uncertainty: bool = False,
+        force_pointwise: bool = False,
     ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor] | Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         x : (N,3) coordinates (already normalized if you閲囩敤褰掍竴鍖?
@@ -1184,6 +1185,8 @@ class DisplacementNet(tf.keras.Model):
                 use_mlp_head=False,
             )
         # --- Decide graph vs MLP ---
+        if force_pointwise:
+            return mlp_forward()
         if not self.use_graph:
             return mlp_forward()
         if self._global_knn_idx is None:
@@ -1314,6 +1317,19 @@ class DisplacementModel:
         # 浠ラ伩鍏嶅 tie/boundary 绾︽潫涓嚭鐜?"expected float but got half" 鐨勬姤閿欍€?
         return tf.cast(u, tf.float32)
 
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _u_fn_pointwise_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> tf.Tensor:
+        z = self.encoder(P_hat)
+        u = self.field(X, z, force_pointwise=True)
+        return tf.cast(u, tf.float32)
+
     def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
         """
         Unified forward:
@@ -1324,6 +1340,12 @@ class DisplacementModel:
         """
         X, P_hat = self._normalize_inputs(X, params)
         return self._u_fn_compiled(X, P_hat)
+
+    def u_fn_pointwise(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
+        """Forward that always uses the pointwise MLP path."""
+
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._u_fn_pointwise_compiled(X, P_hat)
 
     @tf.function(
         jit_compile=False,
@@ -1340,6 +1362,21 @@ class DisplacementModel:
         u, sigma = self.field(X, z, return_stress=True)
         return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
 
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _us_fn_pointwise_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        if self.field.stress_out is None:
+            raise ValueError("stress head disabled (stress_out_dim<=0)")
+        z = self.encoder(P_hat)
+        u, sigma = self.field(X, z, return_stress=True, force_pointwise=True)
+        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
     def us_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """
         甯﹀簲鍔涘ご鐨勫墠鍚戯細杩斿洖浣嶇Щ u 鍜岄娴嬬殑搴斿姏鍒嗛噺 sigma銆?
@@ -1347,6 +1384,12 @@ class DisplacementModel:
         """
         X, P_hat = self._normalize_inputs(X, params)
         return self._us_fn_compiled(X, P_hat)
+
+    def us_fn_pointwise(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Stress forward that always uses the pointwise MLP path."""
+
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._us_fn_pointwise_compiled(X, P_hat)
 
     @tf.function(
         jit_compile=False,
