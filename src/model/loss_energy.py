@@ -412,6 +412,46 @@ class TotalEnergy:
             if use_sigma and sigma_pred is not None and sigma_phys_head is not None:
                 sigma_pred = tf.cast(sigma_pred, dtype)
                 sigma_phys_head = tf.cast(sigma_phys_head, dtype)
+                # Align residual-path physics stress ordering to stress-head convention:
+                # phys: [xx,yy,zz,yz,xz,xy] -> head: [xx,yy,zz,xy,yz,xz].
+                n_sigma_comp = sigma_phys_head.shape[-1]
+                if n_sigma_comp is None:
+                    sigma_cols = tf.shape(sigma_phys_head)[1]
+
+                    def _reorder_sigma():
+                        core = tf.stack(
+                            [
+                                sigma_phys_head[:, 0],
+                                sigma_phys_head[:, 1],
+                                sigma_phys_head[:, 2],
+                                sigma_phys_head[:, 5],
+                                sigma_phys_head[:, 3],
+                                sigma_phys_head[:, 4],
+                            ],
+                            axis=1,
+                        )
+                        return tf.concat([core, sigma_phys_head[:, 6:]], axis=1)
+
+                    sigma_phys_head = tf.cond(
+                        sigma_cols >= 6, _reorder_sigma, lambda: sigma_phys_head
+                    )
+                elif n_sigma_comp >= 6:
+                    sigma_phys_core = tf.stack(
+                        [
+                            sigma_phys_head[:, 0],
+                            sigma_phys_head[:, 1],
+                            sigma_phys_head[:, 2],
+                            sigma_phys_head[:, 5],
+                            sigma_phys_head[:, 3],
+                            sigma_phys_head[:, 4],
+                        ],
+                        axis=1,
+                    )
+                    sigma_phys_head = (
+                        sigma_phys_core
+                        if n_sigma_comp == 6
+                        else tf.concat([sigma_phys_core, sigma_phys_head[:, 6:]], axis=1)
+                    )
                 diff = sigma_pred - sigma_phys_head
                 diff_n = diff / sigma_ref
                 res = tf.reduce_sum(diff_n * diff_n, axis=1)

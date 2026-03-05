@@ -131,7 +131,9 @@ preload_staging:
 
 preload_use_stages: true
 preload_randomize_order: false
-preload_sequence: []
+preload_sequence:
+  - values: [6, 6, 6]
+    order: [3, 2, 1]
 preload_sequence_repeat: 1
 preload_sequence_shuffle: false
 preload_sequence_jitter: 0.0
@@ -171,6 +173,8 @@ network_config:
   adaptive_depth_threshold: 1.0
   adaptive_depth_temperature: 1.0
   stress_out_dim: 6        # 搴斿姏鐩戠潱杈撳嚭缁村害锛? 鍒嗛噺锛?
+  output_scale: 1.0e-3     # 压低位移输出幅值（原默认 1e-2）
+  output_scale_trainable: false
   layers:
     - 64
     - 64
@@ -289,7 +293,18 @@ normal_config:
 output_config:
   save_path: './results'
   visualize: true
+  viz_use_last_training_case: true
+  viz_samples_after_train: 1
+  viz_eval_scope: surface
+  viz_force_pointwise: true
+  viz_plot_stages: true
+  viz_skip_release_stage_plot: true
+  viz_compare_cases: false
   viz_use_shape_function_interp: true   # 鍚敤褰㈠嚱鏁版彃鍊硷紝璁╅暅闈簯鍥炬洿鍏夋粦
+  viz_smooth_vector_iters: 6
+  viz_smooth_vector_lambda: 0.45
+  viz_smooth_scalar_iters: 0
+  viz_smooth_scalar_lambda: 0.6
   viz_surface_source: "part_top"
   viz_refine_subdivisions: 2            # 缁嗗垎浠ュ钩婊?
   viz_diagnose_blanks: true             # 鍚敤绌虹櫧璇婃柇
@@ -328,4 +343,3 @@ volume_rar_enabled: false
 contact_route_update_every: 25
 early_exit:
   check_every: 25
-

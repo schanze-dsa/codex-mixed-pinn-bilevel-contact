@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -55,6 +56,81 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         )
 
         self.assertFalse(module.run._autograph)
+
+    def test_savedmodel_stage_features_match_trainer_staged_encoding(self):
+        # Build a tiny model/module for SavedModel-side param preparation.
+        cfg_model = ModelConfig(
+            encoder=EncoderConfig(in_dim=16, out_dim=8, width=8, depth=1),
+            field=FieldConfig(cond_dim=8, width=16, depth=2, out_dim=3),
+            preload_shift=4.0,
+            preload_scale=2.0,
+            mixed_precision=None,
+        )
+        model = create_displacement_model(cfg_model)
+        module = _SavedModelModule(
+            model=model,
+            use_stages=True,
+            append_release_stage=True,
+            shift=4.0,
+            scale=2.0,
+            n_bolts=3,
+        )
+
+        p = tf.constant([2.0, 5.0, 4.0], dtype=tf.float32)
+        order = tf.constant([1, 2, 3], dtype=tf.int32)  # 1-based should normalize to 0-based.
+        params_sm = module._prepare_params(p, order)
+
+        # Build the same expected final-stage feature vector via trainer path.
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            preload_use_stages=True,
+            total_cfg=SimpleNamespace(preload_stage_mode="force_then_lock"),
+            model_cfg=SimpleNamespace(preload_shift=4.0, preload_scale=2.0),
+        )
+        case = {
+            "P": np.asarray([2.0, 5.0, 4.0], dtype=np.float32),
+            "order": np.asarray([0, 1, 2], dtype=np.int32),
+        }
+        case.update(trainer._build_stage_case(case["P"], case["order"]))
+        params_full = trainer._make_preload_params(case)
+        params_ref = trainer._extract_final_stage_params(params_full, keep_context=True)
+
+        self.assertEqual(int(params_sm["P_hat"].shape[0]), 16)
+        self.assertEqual(int(params_ref["P_hat"].shape[0]), 16)
+        np.testing.assert_allclose(
+            params_sm["P_hat"].numpy(),
+            params_ref["P_hat"].numpy(),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+
+    def test_resolve_viz_cases_prefers_fixed_cases_by_default(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(viz_use_last_training_case=False)
+        trainer._last_preload_case = {"P": np.asarray([9.0, 9.0, 9.0], dtype=np.float32)}
+        trainer._fixed_viz_preload_cases = lambda: [  # type: ignore[method-assign]
+            {"P": np.asarray([2.0, 2.0, 6.0], dtype=np.float32)}
+        ]
+        trainer._sample_preload_case = lambda: {"P": np.asarray([1.0, 1.0, 1.0], dtype=np.float32)}  # type: ignore[method-assign]
+
+        cases = trainer._resolve_viz_cases(n_samples=5)
+
+        self.assertEqual(len(cases), 1)
+        np.testing.assert_allclose(cases[0]["P"], np.asarray([2.0, 2.0, 6.0], dtype=np.float32))
+
+    def test_resolve_viz_cases_can_use_last_training_case_when_enabled(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(viz_use_last_training_case=True)
+        trainer._last_preload_case = {"P": np.asarray([3.0, 4.0, 5.0], dtype=np.float32)}
+        trainer._fixed_viz_preload_cases = lambda: [  # type: ignore[method-assign]
+            {"P": np.asarray([2.0, 2.0, 6.0], dtype=np.float32)}
+        ]
+        trainer._sample_preload_case = lambda: {"P": np.asarray([1.0, 1.0, 1.0], dtype=np.float32)}  # type: ignore[method-assign]
+
+        cases = trainer._resolve_viz_cases(n_samples=5)
+
+        self.assertEqual(len(cases), 1)
+        np.testing.assert_allclose(cases[0]["P"], np.asarray([3.0, 4.0, 5.0], dtype=np.float32))
 
     def test_contact_route_update_interval_gate(self):
         trainer = object.__new__(Trainer)
@@ -235,6 +311,94 @@ class TrainerOptimizationHookTests(unittest.TestCase):
 
         self.assertFalse(hasattr(normal.update_multipliers, "python_function"))
         self.assertFalse(hasattr(friction.update_multipliers, "python_function"))
+
+    def test_resolve_viz_reference_path_auto_uses_out_dir_3txt(self):
+        trainer = object.__new__(Trainer)
+        with tempfile.TemporaryDirectory() as td:
+            ref_path = os.path.join(td, "3.txt")
+            with open(ref_path, "w", encoding="utf-8") as fp:
+                fp.write("Node Number\tTotal Deformation (mm)\n")
+                fp.write("1\t1.0e-3\n")
+
+            trainer.cfg = SimpleNamespace(
+                out_dir=td,
+                viz_reference_truth_path="auto",
+            )
+            resolved = trainer._resolve_viz_reference_path()
+            self.assertEqual(os.path.abspath(ref_path), os.path.abspath(str(resolved)))
+
+    def test_write_viz_reference_alignment_filters_non_node_rows(self):
+        trainer = object.__new__(Trainer)
+        with tempfile.TemporaryDirectory() as td:
+            ref_path = os.path.join(td, "3.txt")
+            pred_path = os.path.join(td, "deflection_01_123.txt")
+
+            with open(ref_path, "w", encoding="utf-8") as fp:
+                fp.write("Node Number\tTotal Deformation (mm)\n")
+                fp.write("1\t1.0e-3\n")
+                fp.write("11\t9.9e-1\n")  # non-node id for this tiny assembly
+                fp.write("3\t3.0e-3\n")
+
+            with open(pred_path, "w", encoding="utf-8") as fp:
+                fp.write("# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane\n")
+                fp.write("1 0 0 0 0 0 0 2.0e-3 0 0\n")
+                fp.write("3 0 0 0 0 0 0 6.0e-3 0 0\n")
+
+            trainer.cfg = SimpleNamespace(
+                out_dir=td,
+                viz_write_reference_aligned=True,
+                viz_reference_truth_path=ref_path,
+            )
+            trainer.asm = SimpleNamespace(
+                nodes={
+                    1: (0.0, 0.0, 0.0),
+                    2: (1.0, 0.0, 0.0),
+                    3: (2.0, 0.0, 0.0),
+                },
+                parts={},
+            )
+            trainer._viz_reference_cache_path = None
+            trainer._viz_reference_cache = None
+            trainer._asm_node_ids = None
+
+            aligned_path = trainer._write_viz_reference_alignment(pred_path)
+            self.assertIsNotNone(aligned_path)
+            self.assertTrue(os.path.exists(str(aligned_path)))
+
+            rows = []
+            with open(str(aligned_path), "r", encoding="utf-8") as fp:
+                for raw in fp:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    rows.append(line.split())
+
+            self.assertEqual(len(rows), 2)
+            self.assertEqual([int(r[0]) for r in rows], [1, 3])
+            # diff = pred - truth
+            self.assertAlmostEqual(float(rows[0][3]), 1.0e-3, places=10)
+            self.assertAlmostEqual(float(rows[1][3]), 3.0e-3, places=10)
+
+    def test_resolve_stage_plot_indices_can_skip_release_stage(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(viz_skip_release_stage_plot=True)
+        preload_case = {
+            "stage_last": np.asarray(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0],  # release stage (force_then_lock)
+                ],
+                dtype=np.float32,
+            )
+        }
+        indices = trainer._resolve_stage_plot_indices(preload_case, 4)
+        self.assertEqual(indices, [0, 1, 2])
+
+        trainer.cfg = SimpleNamespace(viz_skip_release_stage_plot=False)
+        indices_all = trainer._resolve_stage_plot_indices(preload_case, 4)
+        self.assertEqual(indices_all, [0, 1, 2, 3])
 
 
 if __name__ == "__main__":

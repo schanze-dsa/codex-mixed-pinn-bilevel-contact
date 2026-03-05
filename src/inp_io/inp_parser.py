@@ -67,6 +67,10 @@ class BoundaryEntry:
     raw: str
 
 @dataclass
+class LoadEntry:
+    raw: str
+
+@dataclass
 class InstanceDef:
     instance: str
     part: str
@@ -95,6 +99,7 @@ class AssemblyModel:
     contact_pairs: List[ContactPair] = field(default_factory=list)
     ties: List[TieConstraint] = field(default_factory=list)
     boundaries: List[BoundaryEntry] = field(default_factory=list)
+    loads: List[LoadEntry] = field(default_factory=list)
     nsets: Dict[str, SetDef] = field(default_factory=dict)
     elsets: Dict[str, SetDef] = field(default_factory=dict)
     instances: List[InstanceDef] = field(default_factory=list)
@@ -115,6 +120,7 @@ class AssemblyModel:
             "num_contact_pairs": len(self.contact_pairs),
             "num_ties": len(self.ties),
             "num_boundaries": len(self.boundaries),
+            "num_loads": len(self.loads),
             "num_nsets": len(self.nsets),
             "num_elsets": len(self.elsets),
             "num_instances": len(self.instances),
@@ -268,6 +274,7 @@ RE_ASSEMBLY = re.compile(r"^\s*\*Assembly\b", re.IGNORECASE)
 RE_END_ASSEMBLY = re.compile(r"^\s*\*End\s*Assembly\b", re.IGNORECASE)
 RE_INSTANCE = re.compile(r"^\s*\*Instance\s*,\s*name\s*=\s*([^,]+)\s*,\s*part\s*=\s*([^,\s]+)", re.IGNORECASE)
 RE_BOUNDARY = re.compile(r"^\s*\*Boundary\b", re.IGNORECASE)
+RE_CLOAD = re.compile(r"^\s*\*Cload\b", re.IGNORECASE)
 
 # —— sets：支持 nset=/elset=/name= ——
 RE_NSET_HEAD  = re.compile(r"^\s*\*Nset\b(.*)$",  re.IGNORECASE)
@@ -505,6 +512,15 @@ def load_inp(path: str) -> AssemblyModel:
                     raw = lines[j].strip()
                     if not _is_comment_or_empty(raw):
                         model.boundaries.append(BoundaryEntry(raw))
+                    j += 1
+                i = j; continue
+
+            if RE_CLOAD.match(line):
+                j = i
+                while j < n and not RE_KW.match(lines[j]):
+                    raw = lines[j].strip()
+                    if not _is_comment_or_empty(raw):
+                        model.loads.append(LoadEntry(raw))
                     j += 1
                 i = j; continue
 

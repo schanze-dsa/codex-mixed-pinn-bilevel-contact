@@ -396,12 +396,21 @@ class TrainerConfig:
     viz_refine_subdivisions: int = 3        # 更细的细分以获得更平滑的云图
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_use_shape_function_interp: bool = False  # 细分可选采用线性形函数插值，避免重新跑网络
+    viz_smooth_vector_iters: int = 0        # 三角网格上的向量拉普拉斯平滑迭代次数
+    viz_smooth_vector_lambda: float = 0.35  # 向量平滑强度 (0~1)
+    viz_smooth_scalar_iters: int = 0        # 标量|u|平滑迭代次数
+    viz_smooth_scalar_lambda: float = 0.6   # 标量平滑强度 (0~1)
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
+    viz_force_pointwise: bool = False       # True 时可视化强制使用 pointwise 前向，避免 graph/pointwise 路径偏差
     viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
     viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
+    viz_use_last_training_case: bool = False  # True 时仅可视化最后一个训练工况；False 时使用固定对比工况
+    viz_write_reference_aligned: bool = True  # 生成与真值节点对齐的对比文本
+    viz_reference_truth_path: Optional[str] = "auto"  # "auto" -> out_dir/3.txt
     viz_plot_stages: bool = False           # preload_use_stages 时额外输出每个加载阶段的云图
+    viz_skip_release_stage_plot: bool = False  # force_then_lock 下跳过最终 release 阶段图片
     viz_compare_cases: bool = True          # 固定6组云图后追加“差值云图/对比报告”
     viz_compare_cmap: str = "coolwarm"      # 差值云图配色（建议发散色图）
     viz_compare_common_scale: bool = True   # 追加同一色标(0~max)的可比云图
@@ -453,6 +462,9 @@ class Trainer:
         self._contact_hardening_targets: Optional[Dict[str, float]] = None
         self._friction_smooth_state: Optional[str] = None
         self._tqdm_enabled: bool = self._resolve_tqdm_enabled()
+        self._viz_reference_cache_path: Optional[str] = None
+        self._viz_reference_cache: Optional[Dict[str, Any]] = None
+        self._asm_node_ids: Optional[set[int]] = None
 
         if cfg.preload_specs:
             self._set_preload_dim(len(cfg.preload_specs))
@@ -3581,11 +3593,14 @@ class Trainer:
         )
 
         diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+        u_eval_fn = self.model.u_fn
+        if bool(getattr(self.cfg, "viz_force_pointwise", False)) and hasattr(self.model, "u_fn_pointwise"):
+            u_eval_fn = self.model.u_fn_pointwise
 
         result = plot_mirror_deflection_by_name(
             self.asm,
             bare,
-            self.model.u_fn,
+            u_eval_fn,
             params,
             P_values=tuple(float(x) for x in P.reshape(-1)),
             out_path=out_path,
@@ -3607,6 +3622,10 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             use_shape_function_interp=self.cfg.viz_use_shape_function_interp,
+            smooth_vector_iters=self.cfg.viz_smooth_vector_iters,
+            smooth_vector_lambda=self.cfg.viz_smooth_vector_lambda,
+            smooth_scalar_iters=self.cfg.viz_smooth_scalar_iters,
+            smooth_scalar_lambda=self.cfg.viz_smooth_scalar_lambda,
             retriangulate_2d=self.cfg.viz_retriangulate_2d,
             eval_batch_size=self.cfg.viz_eval_batch_size,
             eval_scope=self.cfg.viz_eval_scope,
@@ -3654,16 +3673,36 @@ class Trainer:
 
         return cases
 
+    def _resolve_viz_cases(self, n_samples: int) -> List[Dict[str, np.ndarray]]:
+        """Resolve visualization cases with deterministic defaults.
+
+        By default we use fixed, reproducible cases so exported results can be
+        compared against reference datasets across runs. The legacy behavior of
+        using the last sampled training case is available via
+        ``viz_use_last_training_case=True``.
+        """
+
+        use_last = bool(getattr(self.cfg, "viz_use_last_training_case", False))
+        if use_last and self._last_preload_case is not None:
+            print("[viz] Using last training tightening case for visualization.")
+            return [copy.deepcopy(self._last_preload_case)]
+
+        fixed_cases = self._fixed_viz_preload_cases()
+        if fixed_cases:
+            print("[viz] Using fixed tightening cases for reproducible visualization.")
+            return fixed_cases
+
+        if self._last_preload_case is not None:
+            print("[viz] Fixed cases unavailable, fallback to last training case.")
+            return [copy.deepcopy(self._last_preload_case)]
+
+        return [self._sample_preload_case() for _ in range(n_samples)]
+
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
             return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        cases = None
-        if self._last_preload_case is not None:
-            cases = [copy.deepcopy(self._last_preload_case)]
-            print("[viz] Using last training tightening case for visualization.")
-        else:
-            cases = self._fixed_viz_preload_cases()
+        cases = self._resolve_viz_cases(n_samples)
         n_total = len(cases) if cases else n_samples
         print(
             f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
@@ -3736,6 +3775,12 @@ class Trainer:
                         print(f"[viz] saved -> {save_path}")
                     if data_path:
                         print(f"[viz] displacement data -> {data_path}")
+                aligned_path = None
+                if data_path:
+                    try:
+                        aligned_path = self._write_viz_reference_alignment(str(data_path))
+                    except Exception as exc:
+                        print(f"[viz] reference alignment skipped: {exc}")
                 viz_records.append(
                     {
                         "index": i + 1,
@@ -3749,6 +3794,7 @@ class Trainer:
                             if self.cfg.viz_write_surface_mesh and save_path
                             else None
                         ),
+                        "aligned_path": aligned_path,
                     }
                 )
             except TypeError as e:
@@ -3766,12 +3812,14 @@ class Trainer:
                 try:
                     stages_np = np.asarray(preload_case.get("stages"), dtype=np.float32)
                     if stages_np.ndim == 2 and stages_np.shape[0] > 1:
-                        for s in range(int(stages_np.shape[0])):
+                        stage_indices = self._resolve_stage_plot_indices(preload_case, int(stages_np.shape[0]))
+                        n_plot = int(len(stage_indices))
+                        for rank, s in enumerate(stage_indices, start=1):
                             P_stage = stages_np[s]
                             title_s = f"{self.cfg.viz_title_prefix}  P=[{int(P_stage[0])},{int(P_stage[1])},{int(P_stage[2])}]N"
                             if order_display:
                                 title_s += f"  (order={order_display})"
-                            title_s += f"  (stage={s+1}/{int(stages_np.shape[0])})"
+                            title_s += f"  (stage={rank}/{n_plot})"
                             save_path_s = os.path.join(
                                 self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}_s{s+1}.png"
                             )
@@ -3786,6 +3834,211 @@ class Trainer:
                 self._write_viz_comparison(viz_records)
             except Exception as exc:
                 print(f"[viz] comparison skipped: {exc}")
+
+    def _resolve_stage_plot_indices(self, preload_case: Dict[str, Any], stage_count: int) -> List[int]:
+        if stage_count <= 0:
+            return []
+        indices = list(range(int(stage_count)))
+        if not bool(getattr(self.cfg, "viz_skip_release_stage_plot", False)):
+            return indices
+        stage_last = preload_case.get("stage_last")
+        if stage_last is None:
+            return indices
+        try:
+            stage_last_np = np.asarray(stage_last, dtype=np.float32)
+        except Exception:
+            return indices
+        if stage_last_np.ndim != 2 or stage_last_np.shape[0] != stage_count:
+            return indices
+        keep = [
+            i
+            for i in range(stage_count)
+            if bool(np.any(np.abs(stage_last_np[i]) > 1.0e-8))
+        ]
+        return keep if keep else indices
+
+    def _resolve_viz_reference_path(self) -> Optional[str]:
+        raw = str(getattr(self.cfg, "viz_reference_truth_path", "auto") or "").strip()
+        if not raw:
+            return None
+
+        low = raw.lower()
+        if low in {"none", "off", "false", "0", "disable", "disabled"}:
+            return None
+
+        candidates: List[str] = []
+        out_dir = str(getattr(self.cfg, "out_dir", "") or "").strip()
+        if low == "auto":
+            if out_dir:
+                candidates.append(os.path.join(out_dir, "3.txt"))
+            candidates.append(os.path.join(os.getcwd(), "results", "3.txt"))
+        else:
+            candidates.append(raw)
+            if out_dir and not os.path.isabs(raw):
+                candidates.append(os.path.join(out_dir, raw))
+            if not os.path.isabs(raw):
+                candidates.append(os.path.join(os.getcwd(), raw))
+
+        for cand in candidates:
+            path = os.path.abspath(os.path.expanduser(str(cand)))
+            if os.path.exists(path):
+                return path
+        return None
+
+    @staticmethod
+    def _read_reference_truth_samples(path: str) -> Optional[Dict[str, Any]]:
+        if not path or not os.path.exists(path):
+            return None
+
+        node_ids: List[int] = []
+        umag: List[float] = []
+        parsed_rows = 0
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cols = re.split(r"[,\s\t]+", line)
+                if len(cols) < 2:
+                    continue
+                try:
+                    nid = int(float(cols[0]))
+                    u = float(cols[1])
+                except Exception:
+                    continue
+                parsed_rows += 1
+                node_ids.append(nid)
+                umag.append(u)
+
+        if not node_ids:
+            return None
+
+        return {
+            "node_id": np.asarray(node_ids, dtype=np.int64),
+            "umag": np.asarray(umag, dtype=np.float64),
+            "parsed_rows": int(parsed_rows),
+            "path": path,
+        }
+
+    def _get_asm_node_id_set(self) -> set[int]:
+        if self._asm_node_ids is not None:
+            return self._asm_node_ids
+
+        ids: set[int] = set()
+        asm = getattr(self, "asm", None)
+        nodes = getattr(asm, "nodes", None) if asm is not None else None
+        if isinstance(nodes, dict):
+            for nid in nodes.keys():
+                try:
+                    ids.add(int(nid))
+                except Exception:
+                    continue
+
+        if not ids and asm is not None:
+            for part in getattr(asm, "parts", {}).values():
+                for nid in getattr(part, "node_ids", []) or []:
+                    try:
+                        ids.add(int(nid))
+                    except Exception:
+                        continue
+
+        self._asm_node_ids = ids
+        return ids
+
+    def _load_viz_reference_truth(self) -> Optional[Dict[str, Any]]:
+        path = self._resolve_viz_reference_path()
+        if path is None:
+            return None
+        if self._viz_reference_cache is not None and self._viz_reference_cache_path == path:
+            return self._viz_reference_cache
+
+        loaded = self._read_reference_truth_samples(path)
+        if loaded is None:
+            self._viz_reference_cache_path = None
+            self._viz_reference_cache = None
+            return None
+
+        self._viz_reference_cache_path = path
+        self._viz_reference_cache = loaded
+        return loaded
+
+    def _write_viz_reference_alignment(self, pred_data_path: str) -> Optional[str]:
+        if not bool(getattr(self.cfg, "viz_write_reference_aligned", False)):
+            return None
+
+        pred = self._read_viz_samples(str(pred_data_path))
+        if pred is None:
+            return None
+        ref = self._load_viz_reference_truth()
+        if ref is None:
+            return None
+
+        valid_node_ids = self._get_asm_node_id_set()
+        if not valid_node_ids:
+            print("[viz] reference alignment skipped: assembly node ids unavailable.")
+            return None
+
+        ref_ids = np.asarray(ref["node_id"], dtype=np.int64).reshape(-1)
+        ref_u = np.asarray(ref["umag"], dtype=np.float64).reshape(-1)
+        node_mask = np.asarray([int(nid) in valid_node_ids for nid in ref_ids], dtype=bool)
+
+        ref_node_ids = ref_ids[node_mask]
+        ref_node_u = ref_u[node_mask]
+        nonnode_count = int(ref_ids.size - ref_node_ids.size)
+        if ref_node_ids.size == 0:
+            print("[viz] reference alignment skipped: no valid node rows in reference.")
+            return None
+
+        ref_map: Dict[int, float] = {}
+        for nid, val in zip(ref_node_ids.tolist(), ref_node_u.tolist()):
+            ref_map[int(nid)] = float(val)
+
+        pred_ids = np.asarray(pred["node_id"], dtype=np.int64).reshape(-1)
+        pred_u = np.asarray(pred["umag"], dtype=np.float64).reshape(-1)
+        common_mask = np.asarray([int(nid) in ref_map for nid in pred_ids], dtype=bool)
+        common_ids = pred_ids[common_mask]
+        if common_ids.size == 0:
+            print("[viz] reference alignment skipped: no overlapping node ids.")
+            return None
+
+        ref_common = np.asarray([ref_map[int(nid)] for nid in common_ids.tolist()], dtype=np.float64)
+        pred_common = pred_u[common_mask]
+        diff = pred_common - ref_common
+
+        denom = np.where(np.abs(ref_common) > 1.0e-30, ref_common, np.nan)
+        ratio = np.divide(pred_common, denom)
+        ratio_abs = np.abs(np.divide(pred_common, np.where(np.abs(ref_common) > 1.0e-30, ref_common, np.nan)))
+        ratio_med = float(np.nanmedian(ratio_abs)) if ratio_abs.size else float("nan")
+
+        out_path = os.path.splitext(str(pred_data_path))[0] + "_aligned.txt"
+        with open(out_path, "w", encoding="utf-8") as fp:
+            fp.write("# Aligned mirror displacement: prediction vs reference\n")
+            fp.write(f"# reference_path={ref.get('path', '')}\n")
+            fp.write(f"# reference_rows_total={int(ref_ids.size)}\n")
+            fp.write(f"# reference_rows_node_only={int(ref_node_ids.size)}\n")
+            fp.write(f"# reference_rows_nonnode={nonnode_count}\n")
+            fp.write(f"# predicted_rows={int(pred_ids.size)}\n")
+            fp.write(f"# common_rows={int(common_ids.size)}\n")
+            fp.write("# columns: node_id u_ref u_pred diff(pred-ref) ratio(pred/ref)\n")
+            for nid, u_ref, u_pred, du, rt in zip(
+                common_ids.tolist(),
+                ref_common.tolist(),
+                pred_common.tolist(),
+                diff.tolist(),
+                ratio.tolist(),
+            ):
+                fp.write(
+                    f"{int(nid):10d} {float(u_ref): .8e} {float(u_pred): .8e} "
+                    f"{float(du): .8e} {float(rt): .8e}\n"
+                )
+
+        print(
+            "[viz] aligned displacement -> "
+            f"{out_path} (common={int(common_ids.size)}, nonnode_ref={nonnode_count}, "
+            f"median|pred/ref|={ratio_med:.3e})"
+        )
+        return out_path
 
     @staticmethod
     def _read_viz_samples(path: str) -> Optional[Dict[str, Any]]:
@@ -4163,10 +4416,16 @@ class _SavedModelModule(tf.Module):
         order = self._normalize_order(order)
         
         # 构建阶段张量 (包含 P_hat 特征)
-        stage_P, stage_feat = self._build_stage_tensors(P, order)
+        stage_P, stage_feat, rank_vec, stage_count_total = self._build_stage_tensors(P, order)
         
-        # 返回最后一个阶段的数据
-        return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
+        # 返回最后一个阶段的数据，并补充与训练可视化一致的上下文字段。
+        return {
+            "P": stage_P[-1],
+            "P_hat": stage_feat[-1],
+            "stage_order": order,
+            "stage_rank": rank_vec,
+            "stage_count": tf.cast(stage_count_total, tf.int32),
+        }
 
     def _normalize_order(self, order):
         order = tf.reshape(order, (self._n_bolts,))
@@ -4260,16 +4519,26 @@ class _SavedModelModule(tf.Module):
         else:
             rank_vec = tf.zeros_like(rank_vec)
 
-        # 拼接最终特征 P_hat
+        # 拼接最终特征 P_hat。
+        # 必须与 Trainer._make_preload_params 的 staged 特征定义一致：
+        # [norm, mask, last, rank, t_stage, delta_t]
         feats_ta = tf.TensorArray(tf.float32, size=stage_count_total)
+        tighten_time = rank_vec
         for i in range(stage_count_total):
             # 归一化 P
             norm = (stage_P[i] - self._shift) / self._scale
-            # 拼接: [NormP, Mask, Last, Rank]
-            feat = tf.concat([norm, stage_masks[i], stage_last[i], rank_vec], axis=0)
+            if stage_count_total > 1:
+                t_stage = tf.cast(i, tf.float32) / tf.cast(stage_count_total - 1, tf.float32)
+            else:
+                t_stage = tf.cast(0.0, tf.float32)
+            delta_t = tf.maximum(tf.cast(0.0, tf.float32), t_stage - tighten_time)
+            feat = tf.concat(
+                [norm, stage_masks[i], stage_last[i], rank_vec, tf.reshape(t_stage, (1,)), delta_t],
+                axis=0,
+            )
             feats_ta = feats_ta.write(i, feat)
 
         stage_feat = feats_ta.stack()
-        return stage_P, stage_feat
+        return stage_P, stage_feat, rank_vec, stage_count_total
 
 

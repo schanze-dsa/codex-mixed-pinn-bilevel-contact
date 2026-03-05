@@ -334,6 +334,45 @@ def _smooth_scalar_on_tri_mesh(values: np.ndarray,
         vals = updated
 
     return vals
+
+
+def _smooth_vector_on_tri_mesh(values: np.ndarray,
+                               triangles: np.ndarray,
+                               iterations: int = 1,
+                               lam: float = 0.35,
+                               preserve_mean: bool = True) -> np.ndarray:
+    """Laplacian smoothing for vector fields on a triangulated mesh."""
+
+    vec = np.asarray(values, dtype=np.float64).copy()
+    if vec.ndim != 2:
+        raise ValueError("values must be a 2D array shaped (N, C)")
+    lam = float(np.clip(lam, 0.0, 1.0))
+    if iterations <= 0 or lam <= 0.0 or vec.shape[0] == 0:
+        return vec
+
+    n_vertices = int(vec.shape[0])
+    neighbors = _build_vertex_adjacency(triangles.astype(int), n_vertices)
+    finite_mask = np.all(np.isfinite(vec), axis=1)
+    if not np.any(finite_mask):
+        return vec
+
+    target_mean = np.mean(vec[finite_mask], axis=0)
+    for _ in range(int(iterations)):
+        updated = vec.copy()
+        for idx, nbrs in enumerate(neighbors):
+            if not finite_mask[idx] or len(nbrs) == 0:
+                continue
+            valid_neighbors = [j for j in nbrs if finite_mask[j]]
+            if not valid_neighbors:
+                continue
+            mean_val = np.mean(vec[valid_neighbors], axis=0)
+            updated[idx] = (1.0 - lam) * vec[idx] + lam * mean_val
+        vec = updated
+        if preserve_mean and np.any(finite_mask):
+            cur_mean = np.mean(vec[finite_mask], axis=0)
+            vec[finite_mask] += (target_mean - cur_mean)
+
+    return vec
 from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
@@ -798,13 +837,15 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            surface_source: str = "part_top",
                            style: str = "smooth",
                            cmap: Optional[str] = None,
-                           draw_wireframe: bool = False,
-                           refine_subdivisions: int = 2,
-                           refine_max_points: Optional[int] = None,
-                           use_shape_function_interp: bool = False,
-                           smooth_scalar_iters: int = 0,
-                           smooth_scalar_lambda: float = 0.6,
-                           eval_batch_size: int = 65_536,
+                            draw_wireframe: bool = False,
+                            refine_subdivisions: int = 2,
+                            refine_max_points: Optional[int] = None,
+                            use_shape_function_interp: bool = False,
+                            smooth_vector_iters: int = 0,
+                            smooth_vector_lambda: float = 0.35,
+                            smooth_scalar_iters: int = 0,
+                            smooth_scalar_lambda: float = 0.6,
+                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
                            auto_fill_blanks: bool = False,
@@ -975,6 +1016,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
                 f"to respect max_points={max_pts}.",
             )
 
+    bary_w = None
+    bary_parent = None
     if applied_subdiv > 0:
         X_plot, UV_plot, tri_plot, bary_w, bary_parent = _refine_surface_samples(
             X3D, UV, tri_idx, applied_subdiv, return_barycentric=True
@@ -1018,6 +1061,28 @@ def plot_mirror_deflection(asm: AssemblyModel,
                 diag_out["rigid_removal"] = {"translation_norm": trans_norm, "rotation_rad": angle}
         except Exception as exc:  # pragma: no cover - defensive fallback
             print(f"[viz] remove_rigid failed, falling back to raw displacements: {exc}")
+
+    # Optional vector-field smoothing to suppress high-frequency prediction speckles.
+    vector_steps = max(0, int(smooth_vector_iters or 0))
+    if vector_steps > 0:
+        vec_lam = float(smooth_vector_lambda)
+        u_base = _smooth_vector_on_tri_mesh(
+            u_base,
+            tri_idx,
+            iterations=vector_steps,
+            lam=vec_lam,
+            preserve_mean=True,
+        )
+        if applied_subdiv > 0 and use_shape_function_interp and bary_w is not None and bary_parent is not None:
+            u_plot = _interpolate_displacement_on_refined(u_base, tri_idx, bary_parent, bary_w)
+        else:
+            u_plot = _smooth_vector_on_tri_mesh(
+                u_plot,
+                tri_plot,
+                iterations=vector_steps,
+                lam=vec_lam,
+                preserve_mean=True,
+            )
 
     # Displacement magnitude on original and refined nodes
     d_base = np.linalg.norm(u_base, axis=1)

@@ -349,10 +349,46 @@ def _prepare_config_with_autoguess():
     cfg.viz_use_shape_function_interp = bool(
         output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
     )
+    if "viz_use_last_training_case" in output_cfg:
+        cfg.viz_use_last_training_case = bool(output_cfg["viz_use_last_training_case"])
+    if "viz_samples_after_train" in output_cfg:
+        cfg.viz_samples_after_train = int(output_cfg["viz_samples_after_train"])
+    if "viz_plot_stages" in output_cfg:
+        cfg.viz_plot_stages = bool(output_cfg["viz_plot_stages"])
+    if "viz_skip_release_stage_plot" in output_cfg:
+        cfg.viz_skip_release_stage_plot = bool(output_cfg["viz_skip_release_stage_plot"])
+    if "viz_compare_cases" in output_cfg:
+        cfg.viz_compare_cases = bool(output_cfg["viz_compare_cases"])
+    if "viz_write_reference_aligned" in output_cfg:
+        cfg.viz_write_reference_aligned = bool(output_cfg["viz_write_reference_aligned"])
+    for key in (
+        "viz_reference_truth_path",
+        "viz_truth_path",
+        "truth_data_path",
+        "truth_path",
+    ):
+        if key in output_cfg:
+            val = output_cfg.get(key)
+            cfg.viz_reference_truth_path = None if val is None else str(val)
+            break
     if "viz_surface_source" in output_cfg:
         cfg.viz_surface_source = str(output_cfg["viz_surface_source"])
     if "viz_refine_subdivisions" in output_cfg:
         cfg.viz_refine_subdivisions = int(output_cfg["viz_refine_subdivisions"])
+    if "viz_smooth_vector_iters" in output_cfg:
+        cfg.viz_smooth_vector_iters = int(output_cfg["viz_smooth_vector_iters"])
+    if "viz_smooth_vector_lambda" in output_cfg:
+        cfg.viz_smooth_vector_lambda = float(output_cfg["viz_smooth_vector_lambda"])
+    if "viz_smooth_scalar_iters" in output_cfg:
+        cfg.viz_smooth_scalar_iters = int(output_cfg["viz_smooth_scalar_iters"])
+    if "viz_smooth_scalar_lambda" in output_cfg:
+        cfg.viz_smooth_scalar_lambda = float(output_cfg["viz_smooth_scalar_lambda"])
+    if "viz_eval_scope" in output_cfg:
+        cfg.viz_eval_scope = str(output_cfg["viz_eval_scope"])
+    if "viz_eval_batch_size" in output_cfg:
+        cfg.viz_eval_batch_size = int(output_cfg["viz_eval_batch_size"])
+    if "viz_force_pointwise" in output_cfg:
+        cfg.viz_force_pointwise = bool(output_cfg["viz_force_pointwise"])
     cfg.adam_steps = cfg.max_steps
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
@@ -500,6 +536,12 @@ def _prepare_config_with_autoguess():
     if "stress_out_dim" in net_cfg_yaml:
         cfg.model_cfg.field.stress_out_dim = int(net_cfg_yaml["stress_out_dim"])
         print(f"[main] Stress head out dim: {cfg.model_cfg.field.stress_out_dim}")
+    if "output_scale" in net_cfg_yaml:
+        cfg.model_cfg.field.output_scale = float(net_cfg_yaml["output_scale"])
+        print(f"[main] Displacement output scale: {cfg.model_cfg.field.output_scale:g}")
+    if "output_scale_trainable" in net_cfg_yaml:
+        cfg.model_cfg.field.output_scale_trainable = bool(net_cfg_yaml["output_scale_trainable"])
+        print(f"[main] Output scale trainable: {cfg.model_cfg.field.output_scale_trainable}")
     if "use_finite_spectral" in net_cfg_yaml:
         cfg.model_cfg.field.use_finite_spectral = bool(net_cfg_yaml["use_finite_spectral"])
         print(f"[main] Finite spectral encoding: {cfg.model_cfg.field.use_finite_spectral}")

@@ -1,0 +1,66 @@
+﻿159:        cfg_yaml.get("inp_path", "")
+160:        or cfg_yaml.get("cdb_path", "")
+161:        or cfg_yaml.get("mesh_path", "")
+173:    mirror_surface_name = cfg_yaml.get("mirror_surface_name", "").strip()
+184:    for b in cfg_yaml.get("nuts", []) or []:
+204:    contact_pairs_cfg = cfg_yaml.get("contact_pairs", []) or []
+225:    mat_props = cfg_yaml.get("material_properties", {}) or {}
+259:    part2mat = cfg_yaml.get("part2mat", {}) or {}
+264:    optimizer_cfg = cfg_yaml.get("optimizer_config", {}) or {}
+265:    elas_cfg_yaml = cfg_yaml.get("elasticity_config", {}) or {}
+268:    n_contact_points_per_pair = int(cfg_yaml.get("n_contact_points_per_pair", TrainerConfig.n_contact_points_per_pair))
+269:    contact_two_pass = bool(cfg_yaml.get("contact_two_pass", TrainerConfig.contact_two_pass))
+270:    contact_mode = str(cfg_yaml.get("contact_mode", TrainerConfig.contact_mode))
+271:    contact_mortar_gauss = int(cfg_yaml.get("contact_mortar_gauss", TrainerConfig.contact_mortar_gauss))
+272:    contact_mortar_max_points = int(cfg_yaml.get("contact_mortar_max_points", TrainerConfig.contact_mortar_max_points))
+283:        cfg_yaml.get("tightening_n_points_each", cfg_yaml.get("preload_n_points_each", TrainerConfig.preload_n_points_each))
+285:    preload_min = cfg_yaml.get("tighten_angle_min", cfg_yaml.get("preload_min", None))
+286:    preload_max = cfg_yaml.get("tighten_angle_max", cfg_yaml.get("preload_max", None))
+287:    preload_range = cfg_yaml.get("tighten_angle_range", cfg_yaml.get("preload_range_n", None))
+325:    output_cfg = cfg_yaml.get("output_config", {}) or {}
+329:    tight_cfg = cfg_yaml.get("tightening_config", {}) or {}
+341:        mp_cfg = cfg_yaml.get("mixed_precision", None)
+367:        early_exit_cfg = cfg_yaml.get("early_exit", {}) or {}
+400:    staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+401:    stage_mode_top = cfg_yaml.get("preload_stage_mode", None)
+408:    use_stages_val = cfg_yaml.get("preload_use_stages", None)
+414:    random_order_val = cfg_yaml.get("preload_randomize_order", None)
+427:    seq_overrides = cfg_yaml.get("preload_sequence", None)
+439:        cfg.incremental_mode = bool(cfg_yaml.get("incremental_mode"))
+441:        cfg.stage_inner_steps = int(cfg_yaml.get("stage_inner_steps", cfg.stage_inner_steps))
+443:        cfg.stage_alm_every = int(cfg_yaml.get("stage_alm_every", cfg.stage_alm_every))
+445:        cfg.stage_resample_contact = bool(cfg_yaml.get("stage_resample_contact"))
+447:        cfg.reset_contact_state_per_case = bool(cfg_yaml.get("reset_contact_state_per_case"))
+449:        schedule = cfg_yaml.get("stage_schedule_steps") or []
+454:    loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
+455:    loss_mode = loss_cfg_yaml.get("mode", None)
+457:        loss_mode = loss_cfg_yaml.get("loss_mode", None)
+460:    base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}
+481:    net_cfg_yaml = cfg_yaml.get("network_config", {})
+542:    normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
+555:    fric_cfg_yaml = cfg_yaml.get("friction_config", {}) or {}
+586:    adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
+619:    ed_cfg = loss_cfg_yaml.get("energy_dissipation", {}) or {}
+634:    unc_cfg = cfg_yaml.get("uncertainty_config", {}) or {}
+663:        cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
+665:    cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
+667:        cfg.contact_rar_enabled = bool(cfg_yaml.get("contact_rar_enabled"))
+669:        cfg.contact_rar_fraction = float(cfg_yaml.get("contact_rar_fraction"))
+671:        cfg.contact_rar_temperature = float(cfg_yaml.get("contact_rar_temperature"))
+673:        cfg.contact_rar_floor = float(cfg_yaml.get("contact_rar_floor"))
+675:        cfg.contact_rar_uniform_ratio = float(cfg_yaml.get("contact_rar_uniform_ratio"))
+677:        cfg.contact_rar_fric_mix = float(cfg_yaml.get("contact_rar_fric_mix"))
+679:        cfg.contact_rar_balance_pairs = bool(cfg_yaml.get("contact_rar_balance_pairs"))
+682:        cfg.volume_rar_enabled = bool(cfg_yaml.get("volume_rar_enabled"))
+684:        cfg.volume_rar_fraction = float(cfg_yaml.get("volume_rar_fraction"))
+686:        cfg.volume_rar_temperature = float(cfg_yaml.get("volume_rar_temperature"))
+688:        cfg.volume_rar_uniform_ratio = float(cfg_yaml.get("volume_rar_uniform_ratio"))
+690:        cfg.volume_rar_floor = float(cfg_yaml.get("volume_rar_floor"))
+692:        cfg.volume_rar_ema_decay = float(cfg_yaml.get("volume_rar_ema_decay"))
+700:    debug_big_model = bool(cfg_yaml.get("debug_big_model", False))
+713:    cfg.elas_cfg.chunk_size = int(elas_cfg_yaml.get("chunk_size", 0))
+714:    raw_n_points = elas_cfg_yaml.get("n_points_per_step", 4096)
+719:    cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
+721:        cfg.elas_cfg.stress_loss_weight = float(elas_cfg_yaml.get("stress_loss_weight", cfg.elas_cfg.stress_loss_weight))
+723:        cfg.elas_cfg.use_forward_mode = bool(elas_cfg_yaml.get("use_forward_mode"))
+725:        cfg.elas_cfg.cache_sample_metrics = bool(elas_cfg_yaml.get("cache_sample_metrics"))
