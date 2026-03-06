@@ -82,6 +82,30 @@ except Exception:  # 允许单文件调试时的降级实现
             raise NotImplementedError
 
 
+def delta_slip_from_pair(
+    us_now: tf.Tensor,
+    um_now: tf.Tensor,
+    us_prev: tf.Tensor,
+    um_prev: tf.Tensor,
+    t1: tf.Tensor,
+    t2: tf.Tensor,
+) -> tf.Tensor:
+    """Stateless incremental tangential slip kernel."""
+
+    us_now = tf.cast(us_now, tf.float32)
+    um_now = tf.cast(um_now, tf.float32)
+    us_prev = tf.cast(us_prev, tf.float32)
+    um_prev = tf.cast(um_prev, tf.float32)
+    t1 = tf.cast(t1, tf.float32)
+    t2 = tf.cast(t2, tf.float32)
+
+    du = (us_now - um_now) - (us_prev - um_prev)
+    return tf.stack(
+        [tf.reduce_sum(du * t1, axis=-1), tf.reduce_sum(du * t2, axis=-1)],
+        axis=-1,
+    )
+
+
 # -----------------------------
 # Config
 # -----------------------------

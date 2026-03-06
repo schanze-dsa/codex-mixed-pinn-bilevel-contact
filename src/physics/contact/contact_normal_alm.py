@@ -83,6 +83,12 @@ def fb_residual(a: tf.Tensor, b: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
     return tf.sqrt(a * a + b * b + eps * eps) - a - b
 
 
+def normal_fb_residual(g: tf.Tensor, lambda_n: tf.Tensor, eps_n: tf.Tensor) -> tf.Tensor:
+    """Stateless FB kernel for the normal complementarity equation."""
+
+    return fb_residual(g, lambda_n, eps_n)
+
+
 @dataclass
 class NormalALMConfig:
     """Hyperparameters for the normal-contact ALM operator."""
