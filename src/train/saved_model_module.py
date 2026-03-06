@@ -8,6 +8,18 @@ import tensorflow as tf
 from model.pinn_model import DisplacementModel
 
 
+def ensure_partial_restore_compat(status):
+    """Allow partial checkpoint restores for backward-compatible mixed upgrades."""
+
+    expect_partial = getattr(status, "expect_partial", None)
+    if callable(expect_partial):
+        try:
+            expect_partial()
+        except Exception:
+            pass
+    return status
+
+
 class _SavedModelModule(tf.Module):
     """TensorFlow module exposing the PINN forward pass for SavedModel export."""
 

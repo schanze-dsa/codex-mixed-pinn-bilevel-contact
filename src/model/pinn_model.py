@@ -29,7 +29,7 @@ Author: you
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Any, Optional, Tuple, Dict
 
 import numpy as np
 import tensorflow as tf
@@ -114,6 +114,19 @@ class ModelConfig:
     mixed_precision: Optional[str] = None      # None|'float16'|'bfloat16'
     preload_shift: float = 500.0               # for P normalization if only "P" is given
     preload_scale: float = 1500.0              # P_hat = (P - shift)/scale
+
+
+@dataclass
+class MixedFieldBatch:
+    u: tf.Tensor
+    sigma_vec: tf.Tensor
+    cache_key: Tuple[Any, Any]
+
+
+@dataclass
+class MixedForwardCache:
+    key: Optional[Tuple[Any, Any]] = None
+    batch: Optional[MixedFieldBatch] = None
 
 
 # -----------------------------
@@ -1390,6 +1403,29 @@ class DisplacementModel:
 
         _, sigma = self.us_fn(X, params)
         return tf.cast(sigma, tf.float32)
+
+    def forward_mixed(
+        self,
+        X: tf.Tensor,
+        params: Optional[Dict] = None,
+        cache: Optional[MixedForwardCache] = None,
+    ) -> MixedFieldBatch:
+        """Return mixed outputs with optional single-forward cache reuse."""
+
+        cache_obj = cache if cache is not None else MixedForwardCache()
+        cache_key = (id(X), id(params))
+        if cache_obj.key == cache_key and cache_obj.batch is not None:
+            return cache_obj.batch
+
+        u, sigma = self.us_fn(X, params)
+        batch = MixedFieldBatch(
+            u=tf.cast(u, tf.float32),
+            sigma_vec=tf.cast(sigma, tf.float32),
+            cache_key=cache_key,
+        )
+        cache_obj.key = cache_key
+        cache_obj.batch = batch
+        return batch
 
     def us_fn_pointwise(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """Stress forward that always uses the pointwise MLP path."""
