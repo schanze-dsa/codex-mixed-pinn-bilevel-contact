@@ -18,7 +18,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from train.trainer import Trainer, _SavedModelModule
+from train.trainer import Trainer, TrainerConfig, _SavedModelModule
 from model.pinn_model import ModelConfig, FieldConfig, EncoderConfig, create_displacement_model
 from physics.contact.contact_normal_alm import NormalContactALM
 from physics.contact.contact_friction_alm import FrictionContactALM
@@ -37,6 +37,68 @@ class _OptNoAggregateArg:
 
 
 class TrainerOptimizationHookTests(unittest.TestCase):
+    def test_trainer_includes_init_mixin(self):
+        from train.trainer_init_mixin import TrainerInitMixin
+
+        self.assertTrue(issubclass(Trainer, TrainerInitMixin))
+
+    def test_trainer_reexports_config_from_config_module(self):
+        from train.trainer_config import TrainerConfig as TrainerConfigFromModule
+
+        self.assertIs(TrainerConfig, TrainerConfigFromModule)
+
+    def test_trainer_includes_opt_mixin(self):
+        from train.trainer_opt_mixin import TrainerOptMixin
+
+        self.assertTrue(issubclass(Trainer, TrainerOptMixin))
+
+    def test_trainer_includes_monitor_mixin(self):
+        from train.trainer_monitor_mixin import TrainerMonitorMixin
+
+        self.assertTrue(issubclass(Trainer, TrainerMonitorMixin))
+
+    def test_trainer_includes_preload_mixin(self):
+        from train.trainer_preload_mixin import TrainerPreloadMixin
+
+        self.assertTrue(issubclass(Trainer, TrainerPreloadMixin))
+
+    def test_train_step_always_uses_incremental_path(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(incremental_mode=False)
+        preload_case = {"P": np.asarray([1.0, 2.0, 3.0], dtype=np.float32)}
+
+        called = {"count": 0}
+
+        def _fake_incremental(total, case, *, step=None):
+            called["count"] += 1
+            self.assertEqual(total, "total")
+            self.assertIs(case, preload_case)
+            self.assertEqual(step, 7)
+            return "ok"
+
+        trainer._train_step_incremental = _fake_incremental  # type: ignore[method-assign]
+        out = trainer._train_step(total="total", preload_case=preload_case, step=7)
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(called["count"], 1)
+
+    def test_validate_locked_route_rejects_conflicting_flags(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            preload_use_stages=False,
+            incremental_mode=False,
+            stage_resample_contact=True,
+            resample_contact_every=10,
+            contact_rar_enabled=True,
+            volume_rar_enabled=True,
+            lbfgs_enabled=True,
+            friction_smooth_schedule=True,
+            viz_compare_cases=True,
+        )
+
+        with self.assertRaises(ValueError):
+            trainer._validate_locked_route()  # type: ignore[attr-defined]
+
     def test_savedmodel_module_run_disables_autograph(self):
         cfg = ModelConfig(
             encoder=EncoderConfig(in_dim=3, out_dim=8, width=8, depth=1),
@@ -202,30 +264,17 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(called["count"], 0)
 
-    def test_volume_sampling_falls_back_to_uniform_before_rar_cache_ready(self):
-        trainer = object.__new__(Trainer)
-        trainer.cfg = SimpleNamespace(
-            volume_rar_enabled=True,
-            volume_rar_fraction=0.5,
-            volume_rar_uniform_ratio=0.2,
-            volume_rar_temperature=1.0,
-            volume_rar_floor=1.0e-8,
-            seed=123,
-        )
-        trainer.elasticity = SimpleNamespace(
-            n_cells=1000,
-            cfg=SimpleNamespace(n_points_per_step=64),
-        )
-        trainer._volume_rar_cache = None
-
-        indices, note = trainer._maybe_apply_volume_rar(step_index=1)
-
-        self.assertIsNotNone(indices)
-        self.assertEqual(len(indices), 64)
-        self.assertTrue(np.all(indices >= 0))
-        self.assertTrue(np.all(indices < 1000))
-        self.assertGreater(len(np.unique(indices)), 32)
-        self.assertIn("64", note)
+    def test_legacy_route_helpers_are_removed(self):
+        legacy_methods = [
+            "_maybe_update_friction_smoothing",
+            "_update_contact_rar_cache",
+            "_maybe_apply_contact_rar",
+            "_resample_contact",
+            "_update_volume_rar_cache",
+            "_maybe_apply_volume_rar",
+        ]
+        for name in legacy_methods:
+            self.assertFalse(hasattr(Trainer, name), msg=f"legacy helper should be removed: {name}")
 
     def test_early_exit_triggers_after_nonfinite_streak(self):
         trainer = object.__new__(Trainer)

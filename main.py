@@ -113,6 +113,59 @@ from train.trainer import TrainerConfig
 from inp_io.cdb_parser import load_cdb
 from mesh.contact_pairs import guess_surface_key
 
+_LOCKED_ROUTE_NAME = "force_then_lock+incremental"
+
+
+def _enforce_locked_route(cfg: TrainerConfig) -> None:
+    """Enforce the single supported training route."""
+
+    issues = []
+    stage_mode = str(getattr(cfg.total_cfg, "preload_stage_mode", "") or "")
+    stage_mode = stage_mode.strip().lower().replace("-", "_")
+
+    if not bool(getattr(cfg, "preload_use_stages", False)):
+        issues.append("preload_use_stages must be true")
+    if not bool(getattr(cfg, "incremental_mode", False)):
+        issues.append("incremental_mode must be true")
+    if stage_mode != "force_then_lock":
+        issues.append("preload_stage_mode must be force_then_lock")
+    if bool(getattr(cfg, "stage_resample_contact", False)):
+        issues.append("stage_resample_contact must be false")
+    if int(getattr(cfg, "resample_contact_every", 0) or 0) > 0:
+        issues.append("resample_contact_every must be <= 0")
+    if bool(getattr(cfg, "contact_rar_enabled", False)):
+        issues.append("contact_rar_enabled must be false")
+    if bool(getattr(cfg, "volume_rar_enabled", False)):
+        issues.append("volume_rar_enabled must be false")
+    if bool(getattr(cfg, "lbfgs_enabled", False)):
+        issues.append("optimizer_config.lbfgs.enabled must be false")
+    if bool(getattr(cfg, "friction_smooth_schedule", False)):
+        issues.append("friction_config.smooth_to_strict must be false")
+    if bool(getattr(cfg, "viz_compare_cases", False)):
+        issues.append("output_config.viz_compare_cases must be false")
+
+    if issues:
+        joined = "; ".join(issues)
+        raise ValueError(f"Locked route {_LOCKED_ROUTE_NAME} violation: {joined}")
+
+    # Canonicalize implied values for the locked route.
+    cfg.alm_update_every = 0
+    cfg.contact_cfg.update_every_steps = 1
+
+
+def _canonicalize_locked_route(cfg: TrainerConfig) -> None:
+    """Force canonical values for the only supported training route."""
+
+    cfg.preload_use_stages = True
+    cfg.incremental_mode = True
+    cfg.preload_randomize_order = False
+    cfg.total_cfg.preload_stage_mode = "force_then_lock"
+
+    # Locked-route implied runtime cadence.
+    cfg.alm_update_every = 0
+    cfg.contact_cfg.update_every_steps = 1
+    cfg.elas_cfg.cache_sample_metrics = False
+
 
 # ---------- 工具：读取 config.yaml（容错） ----------
 def _load_yaml_config():
@@ -357,8 +410,6 @@ def _prepare_config_with_autoguess():
         cfg.viz_plot_stages = bool(output_cfg["viz_plot_stages"])
     if "viz_skip_release_stage_plot" in output_cfg:
         cfg.viz_skip_release_stage_plot = bool(output_cfg["viz_skip_release_stage_plot"])
-    if "viz_compare_cases" in output_cfg:
-        cfg.viz_compare_cases = bool(output_cfg["viz_compare_cases"])
     if "viz_write_reference_aligned" in output_cfg:
         cfg.viz_write_reference_aligned = bool(output_cfg["viz_write_reference_aligned"])
     for key in (
@@ -420,18 +471,6 @@ def _prepare_config_with_autoguess():
     elif "early_exit_check_every" in cfg_yaml:
         cfg.early_exit_check_every = int(cfg_yaml["early_exit_check_every"])
 
-    lbfgs_cfg = optimizer_cfg.get("lbfgs", {}) or {}
-    cfg.lbfgs_enabled = bool(optimizer_cfg.get("lbfgs_enabled", cfg.lbfgs_enabled))
-    if lbfgs_cfg:
-        cfg.lbfgs_enabled = bool(lbfgs_cfg.get("enabled", cfg.lbfgs_enabled))
-        cfg.lbfgs_max_iter = int(lbfgs_cfg.get("max_iter", cfg.lbfgs_max_iter))
-        cfg.lbfgs_tolerance = float(lbfgs_cfg.get("tolerance", cfg.lbfgs_tolerance))
-        cfg.lbfgs_history_size = int(lbfgs_cfg.get("history_size", cfg.lbfgs_history_size))
-        cfg.lbfgs_line_search = int(lbfgs_cfg.get("line_search", cfg.lbfgs_line_search))
-        cfg.lbfgs_reuse_last_batch = bool(
-            lbfgs_cfg.get("reuse_last_batch", cfg.lbfgs_reuse_last_batch)
-        )
-
     # ===== 拧紧分阶段 / 顺序设置 =====
     staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
     stage_mode_top = cfg_yaml.get("preload_stage_mode", None)
@@ -477,8 +516,6 @@ def _prepare_config_with_autoguess():
         cfg.stage_inner_steps = int(cfg_yaml.get("stage_inner_steps", cfg.stage_inner_steps))
     if "stage_alm_every" in cfg_yaml:
         cfg.stage_alm_every = int(cfg_yaml.get("stage_alm_every", cfg.stage_alm_every))
-    if "stage_resample_contact" in cfg_yaml:
-        cfg.stage_resample_contact = bool(cfg_yaml.get("stage_resample_contact"))
     if "reset_contact_state_per_case" in cfg_yaml:
         cfg.reset_contact_state_per_case = bool(cfg_yaml.get("reset_contact_state_per_case"))
     if "stage_schedule_steps" in cfg_yaml:
@@ -616,14 +653,6 @@ def _prepare_config_with_autoguess():
             cfg.contact_cfg.friction.use_smooth_friction = val
         if "use_delta_st_friction" in fric_cfg_yaml:
             cfg.contact_cfg.friction.use_delta_st = bool(fric_cfg_yaml["use_delta_st_friction"])
-        if "smooth_to_strict" in fric_cfg_yaml:
-            cfg.friction_smooth_schedule = bool(fric_cfg_yaml["smooth_to_strict"])
-        if "smooth_fraction" in fric_cfg_yaml:
-            cfg.friction_smooth_fraction = float(fric_cfg_yaml["smooth_fraction"])
-        if "smooth_steps" in fric_cfg_yaml:
-            cfg.friction_smooth_steps = int(fric_cfg_yaml["smooth_steps"])
-        if "blend_steps" in fric_cfg_yaml:
-            cfg.friction_blend_steps = int(fric_cfg_yaml["blend_steps"])
 
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
     cfg.loss_adaptive_enabled = bool(
@@ -700,38 +729,7 @@ def _prepare_config_with_autoguess():
         scheme_norm = str(getattr(cfg.total_cfg, "adaptive_scheme", "") or "").strip().lower()
         if scheme_norm in {"", "contact_only", "basic"}:
             cfg.total_cfg.adaptive_scheme = "balance"
-
-    cfg.resample_contact_every = int(
-        cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
-    )
     cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
-    if "contact_rar_enabled" in cfg_yaml:
-        cfg.contact_rar_enabled = bool(cfg_yaml.get("contact_rar_enabled"))
-    if "contact_rar_fraction" in cfg_yaml:
-        cfg.contact_rar_fraction = float(cfg_yaml.get("contact_rar_fraction"))
-    if "contact_rar_temperature" in cfg_yaml:
-        cfg.contact_rar_temperature = float(cfg_yaml.get("contact_rar_temperature"))
-    if "contact_rar_floor" in cfg_yaml:
-        cfg.contact_rar_floor = float(cfg_yaml.get("contact_rar_floor"))
-    if "contact_rar_uniform_ratio" in cfg_yaml:
-        cfg.contact_rar_uniform_ratio = float(cfg_yaml.get("contact_rar_uniform_ratio"))
-    if "contact_rar_fric_mix" in cfg_yaml:
-        cfg.contact_rar_fric_mix = float(cfg_yaml.get("contact_rar_fric_mix"))
-    if "contact_rar_balance_pairs" in cfg_yaml:
-        cfg.contact_rar_balance_pairs = bool(cfg_yaml.get("contact_rar_balance_pairs"))
-
-    if "volume_rar_enabled" in cfg_yaml:
-        cfg.volume_rar_enabled = bool(cfg_yaml.get("volume_rar_enabled"))
-    if "volume_rar_fraction" in cfg_yaml:
-        cfg.volume_rar_fraction = float(cfg_yaml.get("volume_rar_fraction"))
-    if "volume_rar_temperature" in cfg_yaml:
-        cfg.volume_rar_temperature = float(cfg_yaml.get("volume_rar_temperature"))
-    if "volume_rar_uniform_ratio" in cfg_yaml:
-        cfg.volume_rar_uniform_ratio = float(cfg_yaml.get("volume_rar_uniform_ratio"))
-    if "volume_rar_floor" in cfg_yaml:
-        cfg.volume_rar_floor = float(cfg_yaml.get("volume_rar_floor"))
-    if "volume_rar_ema_decay" in cfg_yaml:
-        cfg.volume_rar_ema_decay = float(cfg_yaml.get("volume_rar_ema_decay"))
 
     if cfg.incremental_mode:
         cfg.contact_cfg.update_every_steps = 1
@@ -766,7 +764,10 @@ def _prepare_config_with_autoguess():
     if "cache_sample_metrics" in elas_cfg_yaml:
         cfg.elas_cfg.cache_sample_metrics = bool(elas_cfg_yaml.get("cache_sample_metrics"))
     else:
-        cfg.elas_cfg.cache_sample_metrics = bool(cfg.volume_rar_enabled)
+        cfg.elas_cfg.cache_sample_metrics = False
+
+    # Canonicalize route-dependent switches before any stage-dependent heuristics.
+    _canonicalize_locked_route(cfg)
 
     # 3) 接触/拧紧采样：根据阶段数做显存友好的调整
     stage_multiplier = 1
@@ -889,6 +890,8 @@ def _prepare_config_with_autoguess():
     preload_half_span = 0.5 * (preload_hi - preload_lo)
     cfg.model_cfg.preload_shift = preload_mid
     cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
+    _enforce_locked_route(cfg)
+    print("[main] Locked route:", _LOCKED_ROUTE_NAME)
     # =================================================
     return cfg, asm
 

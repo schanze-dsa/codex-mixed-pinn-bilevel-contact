@@ -1,98 +1,30 @@
-# ============================================================
-# DFEM + PINN 鎬婚厤缃?
-# - 鏈増锛氫笁绉嶆潗鏂?jingmian / structural_steel / zhijia
-# - 寮规€т富妯″瀷锛氱嚎寮规€?+ 棰勭揣 + 鎺ヨЕ/鎽╂摝
-# - 棰濆淇濆瓨浜嗗眻鏈嶅己搴︺€佸瘑搴︺€佺儹瀵肩巼绛夛紝渚夸簬鍚庡鐞?
-# ============================================================
+# Locked training route: force_then_lock + incremental
 
-# ------------------------------------------------------------
-# 1. 鏉愭枡搴?
-# ------------------------------------------------------------
+inp_path: mir111.cdb
+mirror_surface_name: MIRROR UP
 
-material_enum:
-  - jingmian
-  - structural_steel
-  - zhijia
-
-# 鍚勬潗鏂欑殑灞炴€с€傚綋鍓?DFEM 闈欏姏鍒嗘瀽鍙細鐢ㄥ埌 E 鍜?nu锛?
-# 鍏跺畠鍙傛暟涓哄悗缁眻鏈嶅垽瀹氥€佸姩鍔涘銆佺儹鈥撶粨鏋勮€﹀悎绛夊仛鍑嗗銆?
 material_properties:
   jingmian:
-    # ---- 鍩烘湰寮规€у弬鏁帮紙褰撳墠 DFEM 浼氱敤鍒帮級----
-    E: 6.9e4            # MPa锛屾潹姘忔ā閲?
-    nu: 0.33            # 娉婃澗姣?
-
-    # 鍐椾綑寮规€ч噺锛堢敱 E, nu 鎺ㄥ锛屼繚鐣欎究浜庢牎楠?鎵╁睍锛?
-    bulk_modulus: 6.7647e4    # MPa锛屼綋绉ā閲?K
-    shear_modulus: 2.594e4    # MPa锛屽壀鍒囨ā閲?G
-
-    # 瀵嗗害涓庣儹瀛﹀弬鏁帮紙鍚庣画鑻ュ仛鍔ㄥ姏瀛?鐑簲鍔涘彲鐢級
-    density: 2700.0           # kg/m^3
-    alpha_thermal: 2.4e-5     # 1/K锛屽悇鍚戝悓鎬х嚎鑶ㄨ儉绯绘暟
-    k_thermal: 166.9          # W/(m路K)锛屽悇鍚戝悓鎬х儹瀵肩巼
-    cp: 896.0                 # J/(kg路K)锛屾瘮鐑
-
-    # 寮哄害鍙傛暟锛堝眻鏈?鏋侀檺锛夛紝鍙敤浜庡悗澶勭悊瀹夊叏绯绘暟鎴栨崯浼ゆ寚鏍?
-    sigma_y_tension: 2.8e2        # MPa锛屾媺浼稿眻鏈嶅己搴?
-    sigma_y_compression: 2.8e2    # MPa锛屽帇缂╁眻鏈嶅己搴?
-    sigma_u_tension: 3.1e2        # MPa锛屾媺浼告瀬闄愬己搴?
-
-    # 濡傞渶鐤插姵鍒嗘瀽锛屽彲鍦ㄦ澧炲姞 S鈥揘 鏇茬嚎鏁版嵁
-    # sn_curve:
-    #   R: -1
-    #   points:
-    #     - [1.7e3, 2.75e8]
-    #     - [5.0e3, ...]
-    #     ...
-
+    E: 6.9e4
+    nu: 0.33
+    sigma_y_tension: 2.8e2
+    sigma_y_compression: 2.8e2
+    sigma_u_tension: 3.1e2
   structural_steel:
-    # ---- 鍩烘湰寮规€у弬鏁?----
-    E: 2.0e5           # MPa锛屾潹姘忔ā閲?
-    nu: 0.30           # 娉婃澗姣?
-
-    # 鍐椾綑寮规€ч噺
-    bulk_modulus: 1.6667e5    # MPa锛屼綋绉ā閲?K
-    shear_modulus: 7.6923e4   # MPa锛屽壀鍒囨ā閲?G
-
-    # 瀵嗗害涓庣儹瀛﹀弬鏁?
-    density: 7850.0           # kg/m^3
-    alpha_thermal: 1.2e-5     # 1/K
-    k_thermal: 60.5           # W/(m路K)
-    cp: 434.0                 # J/(kg路K)
-
-    # 寮哄害鍙傛暟
-    sigma_y_tension: 2.5e2        # MPa
-    sigma_y_compression: 2.5e2    # MPa
-    sigma_u_tension: 4.6e2        # MPa
-    hardening_modulus: 1.0e3      # MPa (linear isotropic hardening, conservative)
-
+    E: 2.0e5
+    nu: 0.30
+    sigma_y_tension: 2.5e2
+    sigma_y_compression: 2.5e2
+    sigma_u_tension: 4.6e2
+    hardening_modulus: 1.0e3
   zhijia:
-    # ---- 鍩烘湰寮规€у弬鏁?----
-    E: 7.42e4          # MPa锛屾潹姘忔ā閲?
-    nu: 0.36           # 娉婃澗姣?
+    E: 7.42e4
+    nu: 0.36
+    sigma_y_tension: 2.8e2
+    sigma_y_compression: 2.8e2
+    sigma_u_tension: 3.1e2
 
-    # 鍐椾綑寮规€ч噺
-    bulk_modulus: 8.8333e4    # MPa锛屼綋绉ā閲?K
-    shear_modulus: 2.7279e4   # MPa锛屽壀鍒囨ā閲?G
-
-    # 瀵嗗害涓庣儹瀛﹀弬鏁?
-    density: 2850.0           # kg/m^3
-    alpha_thermal: 2.38e-5    # 1/K
-    k_thermal: 44.0           # W/(m路K)
-    cp: 460.0                 # J/(kg路K)
-
-    # 寮哄害鍙傛暟
-    sigma_y_tension: 2.8e2        # MPa
-    sigma_y_compression: 2.8e2    # MPa
-    sigma_u_tension: 3.1e2        # MPa
-
-# ------------------------------------------------------------
-# 2. Part 鈫?鏉愭枡鏄犲皠锛堥渶涓?INP/CDB 涓?Part 鍚嶄竴鑷达級
-# ------------------------------------------------------------
-# 娉ㄦ剰锛氬綋鍓?CDB 鏂囦欢娌℃湁 CMBLOCK 瀹氫箟閮ㄤ欢锛?
-# 瑙ｆ瀽鍣ㄤ細鑷姩鍒涘缓 ALL_SOLID 閮ㄤ欢鍖呭惈鎵€鏈夊疄浣撳厓绱?
 part2mat:
-  # ?? CDB ??? CM/ELEM ??????????
   MIRROR: jingmian
   luomu: structural_steel
   luomu1: structural_steel
@@ -102,11 +34,7 @@ part2mat:
   luoshuan2: structural_steel
   auto1: zhijia
   __CONTACT__: jingmian
-  # ?????? CDB ??????????? ALL_SOLID
-  # ALL_SOLID: jingmian
-# ------------------------------------------------------------
-# 3. 棰勭揣铻烘爴涓庤閰嶉潰
-# ------------------------------------------------------------
+
 nuts:
   - name: nut
     part: luomu
@@ -115,231 +43,131 @@ nuts:
   - name: nut2
     part: luomu2
 
-
-# 棰勭揣鍒嗛樁娈?椤哄簭璁剧疆锛坋nabled=true 鍒欒缁?鎺ㄧ悊閮戒細鎸夌収椤哄簭鍒嗘鍔犺浇锛?
+# Route lock
 preload_staging:
   mode: force_then_lock
-  enabled: true              # 鍚敤鍒嗛樁娈靛姞杞?-> PINN 杈撳叆鍖呭惈椤哄簭淇℃伅
-  randomize_order: false     # 鍥哄畾椤哄簭
-  repeat: 1                  # 鍥哄畾 case
-  shuffle: false             # 鑻ユ彁渚?sequence 鍒楄〃锛屾槸鍚﹀湪 epoch 闂撮殢鏈烘墦涔辨潯鐩?
-  jitter: 0.0                # 椤哄簭鍒楄〃鍦ㄨ缁冩椂鍙犲姞鐨?卤jitter 鍣０锛圢锛?
-  relaxation: 0.25           # 椤哄簭鏉惧紱绯绘暟锛?0 鏃舵棭鎷х殑铻烘爴杞借嵎鏀惧ぇ銆佹櫄鎷х殑鍑忓皬
-  # sequence:               # 濡傞渶鍥哄畾椤哄簭锛屽彲鍙栨秷娉ㄩ噴骞跺～鍐欙細
-  #   - values: [800, 600, 500]
-  #     order:  [1, 3, 2]    # 椤哄簭瀛楁鏀寔 1-based 鎴?0-based
+  enabled: true
+  randomize_order: false
 
 preload_use_stages: true
 preload_randomize_order: false
 preload_sequence:
   - values: [6, 6, 6]
     order: [3, 2, 1]
-preload_sequence_repeat: 1
-preload_sequence_shuffle: false
-preload_sequence_jitter: 0.0
 
-# ------------------------------------------------------------
-# 4. 鎺ヨЕ瀵硅缃紙master/slave surface 鍚嶉渶涓?INP 涓竴鑷达級
-# ------------------------------------------------------------
+incremental_mode: true
+stage_inner_steps: 5
+stage_alm_every: 1
+reset_contact_state_per_case: true
+stage_schedule_steps: [400, 400, 400, 300]
+
+alm_update_every: 0
+
 contact_pairs: []
-contact_mode: mortar         # sample | mortar
-contact_mortar_gauss: 3      # 涓夎褰㈤珮鏂偣鏁帮紙1/3/7锛?contact_mortar_max_points: 5000 # 0=涓嶆埅鏂紱>0 鏃跺姣忓鎺ヨЕ涓婇檺閲囨牱鏁帮紙杩戜技锛?contact_two_pass: false      # 浠?sample 妯″紡鏈夋晥
-# ------------------------------------------------------------
-# 4.5 杈圭晫鏉′欢锛堝浐瀹氱害鏉燂級
-# ------------------------------------------------------------
-# 榛樿浣跨敤 ALM 妯″紡锛屼互杈冧綆缃氱郴鏁伴€艰繎纭害鏉燂紱濡傞渶閫€鍥炵函缃氬嚱鏁帮紝鍙敼涓?penalty銆?
-bc_mode: alm            # alm | penalty | hard - 浣跨敤ALM閬垮厤楂樻潈閲?
-bc_alpha: 5.0e3         # 缃氬嚱鏁?ALM 鍩虹鍒氬害 (闄嶄綆浠ラ厤鍚堜綆w_bc)
-bc_mu: 2.0e3            # ALM 澧炲箍绯绘暟 (鎻愰珮浠ユ洿寮虹害鏉?
+contact_mode: mortar
+contact_mortar_gauss: 3
+contact_mortar_max_points: 5000
+contact_two_pass: false
+n_contact_points_per_pair: 2000
+tightening_n_points_each: 800
 
+normal_config:
+  mode: alm
+  beta: 50.0
+  mu_n: 1.0e3
+  residual_mode: fb
+  fb_eps: 1.0e-8
 
-# ------------------------------------------------------------
-# 5. 缃戠粶涓庝紭鍖栧櫒閰嶇疆锛堝悗缁?DFEM 鏀归€犳椂浼氱敤锛?
-# ------------------------------------------------------------
+friction_config:
+  enabled: true
+  k_t: 100
+  mu_t: 200
+  mu_f: 0.15
+  use_smooth_friction: true
+  use_delta_st_friction: false
+
 network_config:
-  model_type: pinn         # 淇濈暀鍏煎鎬?
-  input_dim: 3             # P杈撳叆缁村害 (P1,P2,P3)
-  output_dim: 1            # 淇濈暀瀛楁锛堝疄闄呯敱FieldConfig.out_dim鎺у埗锛?
-
-  # DFEM mode: use node embeddings instead of spatial coordinates
-  graph_precompute: true   # 棰勮绠楀叏灞€ kNN 閭绘帴骞剁紦瀛?
-  graph_k: 8               # kNN 閭诲眳鏁帮紙鎻愰€熺敤锛涘浐浣撳姏瀛﹂€氬父澶熺敤锛?
-  graph_width: 128         # GCN 闅愯棌缁村害锛堟彁閫燂級
-  graph_layers: 3          # GCN 灞傛暟锛堟彁閫燂級
+  model_type: pinn
+  input_dim: 3
+  output_dim: 1
+  graph_precompute: true
+  graph_k: 8
+  graph_width: 128
+  graph_layers: 3
   adaptive_depth_enabled: true
   adaptive_depth_mode: hard
   adaptive_depth_shallow_layers: 1
   adaptive_depth_route_source: contact_residual
   adaptive_depth_threshold: 1.0
   adaptive_depth_temperature: 1.0
-  stress_out_dim: 6        # 搴斿姏鐩戠潱杈撳嚭缁村害锛? 鍒嗛噺锛?
-  output_scale: 1.0e-3     # 压低位移输出幅值（原默认 1e-2）
+  stress_out_dim: 6
+  output_scale: 1.0e-3
   output_scale_trainable: false
-  layers:
-    - 64
-    - 64
-    - 32
-
-# ------------------------------------------------------------
-# 6. 鍚庡鐞嗕笌鍙鍖?
-# ------------------------------------------------------------
-# 鎸囧畾闀滈潰琛ㄩ潰鍚嶏紝鐢ㄤ簬闀滈潰鍙樺舰鍙鍖栦笌鐩稿叧鍚庡鐞嗭紱闇€涓?INP 琛ㄩ潰鍚嶅畬鍏ㄥ尮閰嶃€?
-mirror_surface_name: 'MIRROR UP'
-
-mixed_precision: null          # 鍏抽棴娣峰悎绮惧害浠ラ伩鍏?NaN
+  layers: [64, 64, 32]
 
 optimizer_config:
   type: Adam
-  learning_rate: 0.00001     # 浠?e-4闄嶅埌1e-5锛岄槻姝FEM鍒濇湡NaN
-  grad_clip_norm: 1.0        # 浠?0闄嶅埌1锛屽姞寮鸿鍓槻姝㈡搴︾垎鐐?
+  learning_rate: 1.0e-5
+  grad_clip_norm: 1.0
   batch_size: 32
-  epochs: 1500             # Adam 闃舵鐨勮凯浠ｆ鏁?
-  log_every: 50            # 姣?0姝ユ墦鍗颁竴娆℃棩蹇楋紙鍑忓皯 CPU-GPU 鍚屾寮€閿€锛?
-  lbfgs:
-    enabled: false           # 鏄惁鍦?Adam 涔嬪悗杩藉姞 L-BFGS 绮捐皟
-    max_iter: 200            # L-BFGS 鏈€澶ц凯浠ｆ鏁?
-    tolerance: 1.0e-6        # 鏀舵暃鍒ゆ嵁锛堢洰鏍囧嚱鏁扮浉瀵瑰彉鍖栵級
-    history_size: 50         # 鎷熺墰椤垮巻鍙茶蹇嗗鏁?
-    line_search: 50          # 绾挎悳绱㈡渶澶ц凯浠?
-  reuse_last_batch: true   # true 琛ㄧず澶嶇敤 Adam 鏈€鍚庝竴娆￠殢鏈烘牱鏈?
-# kNN 鍥剧紦瀛橈紙npz锛?graph_cache_name: graph_cache_knn.npz
+  epochs: 1500
+  log_every: 50
 
-# ------------------------------------------------------------
-# 7. 寮规€?DFEM 閰嶇疆锛圗lasticityConfig锛?
-# ------------------------------------------------------------
 elasticity_config:
-  coord_scale: 1.0          # 鍧愭爣缂╂斁绯绘暟
-  chunk_size: 0             # 鑺傜偣鍓嶅悜寰壒澶у皬锛涒墹0 琛ㄧず鏁村浘鍓嶅悜锛屼笉鍐嶅垎鍧?  use_pfor: false           # 淇濈暀瀛楁锛屽彲蹇界暐
-  use_forward_mode: true    # 鐢ㄥ墠鍚?JVP 璁＄畻搴斿彉锛堟浛浠?娆″弽鍚戞搴︼級
-  check_nan: false          # 鍏抽棴 NaN 妫€鏌ヤ互鎻愰€燂紙璋冭瘯鏃跺彲寮€鍚級
-  n_points_per_step: 8192   # 姣忔鐢ㄤ簬 DFEM 绉垎鐨勫瓙鍗曞厓/绉垎鐐逛笂闄愶紙澧炲ぇ浠ユ彁鍗嘒PU鍒╃敤鐜囷級
-  plasticity_model: j2      # elastic | j2 (von Mises)
-  stress_loss_weight: 1.0   # 搴斿姏鐩戠潱鏉冮噸锛? 灏嗙鐢級
+  coord_scale: 1.0
+  chunk_size: 0
+  use_forward_mode: true
+  check_nan: false
+  n_points_per_step: 8192
+  plasticity_model: j2
+  stress_loss_weight: 1.0
 
-# ------------------------------------------------------------
-# 7. 鎹熷け鍑芥暟涓庤嚜閫傚簲鍔犳潈锛圱otalConfig + weighted PINN锛?
-# ------------------------------------------------------------
 loss_config:
   mode: residual
   base_weights:
-    # 绛栫暐锛氬皢鎵€鏈夐」鐨勫姞鏉冨悗鑳介噺 (weighted energy) 缁熶竴鎺у埗鍦?1.0 ~ 10.0 宸﹀彸
-
-    # DFEM鑺傜偣宓屽叆闅忔満鍒濆鍖栧鑷碋int鐖嗙偢锛岄渶瑕侀檷浣?00鍊?
-    # Eint鍒濆~1e6, 涔?e-7鍚庣害0.1锛屽緟绋冲畾鍚庡彲閫愭鎻愰珮
     w_int: 1.0
-
-    # Ecn ~ 3e4, 涔?1e-4 鍚庣害 3.0 (鎺ヨЕ寰堥噸瑕侊紝绋嶅井澶х偣娌″叧绯?
     w_cn: 1.0
-
-    # 銆愭仮澶嶆懇鎿︺€慐ct ~ 5e7 (k_t闄嶄綆鍚?, 涔?1e-8 鍚庣害 0.5
-    # 鎽╂摝鏄牳蹇冪墿鐞嗭紝蹇呴』淇濈暀锛侀€氳繃闄嶄綆k_t鏉ユ帶鍒舵暟鍊?
-    w_ct: 1.0   # 鎽╂摝椤瑰弬涓庢崯澶憋紱ALM 涔樺瓙鍦ㄥ浘澶栨洿鏂帮紙涓嶈繘姊害锛?
-
-    # 鏆傛椂绂佺敤锛岀瓑淇鍚庡啀鍚敤
-    w_bc: 1.0      # 杈圭晫鏉′欢閫氬父娈嬪樊杈冨皬锛岀粰澶т竴鐐?
-
-    # 銆愬叧閿慨澶嶃€戦绱у姛涓嶅弬涓庝紭鍖栵紒瀹冩槸杈撳叆杞借嵎锛屼笉鏄洰鏍?
-    w_tight: 1.0   # nut tightening penalty
-
-    # 搴斿姏鐩戠潱锛氱敤绾垮脊鎬х悊璁哄簲鍔涙寚瀵肩綉缁?
-    # Esig ~ 1e7, 闇€瑕侀潪甯稿皬鐨勬潈閲?
-    w_sigma: 1.0   # 浠?.0闄嶅埌1e-4锛岄槻姝富瀵兼崯澶?
-    # 骞宠　娈嬪樊锛氬急寮?equilibrium (B^T * sigma_pred 鈮?0)锛屼笌搴斿姏澶村己鑰﹀悎
-    w_eq: 1.0      # 鍏堢敤涓?w_sigma 鍚岄噺绾э紱濡備笉绋冲彲闄嶅埌 1e-5
-
+    w_ct: 1.0
+    w_bc: 1.0
+    w_tight: 1.0
+    w_sigma: 1.0
+    w_eq: 1.0
     w_reg: 1.0e-4
-
   adaptive:
-    # 鏆傛椂寮€鍚紝浣嗗繀椤婚檺鍒惰寖鍥达紒闃叉瀹冭嚜鍔ㄦ妸 w_ct 璋冨洖 9.0 杩欑鍗遍櫓鍊?
     enabled: true
     update_every: 50
     ema_decay: 0.99
     temperature: 1.0
-    min_weight: 1.0e-6   # ?????????
-    max_weight: 10.0     # residual-only ????
-    focus_terms:
-      - w_eq
-      - w_cn
-      - w_bc
-      - w_ct
-      # 棰勭揣椤圭殑鏉冮噸浼氫笌 w_int 淇濇寔鍥哄畾姣斾緥锛堢敱浠ｇ爜缁戝畾锛夛紝浠庤€屼繚鎸?P 鐨勭墿鐞嗘剰涔変笉鍙樸€?
+    min_weight: 1.0e-6
+    max_weight: 10.0
+    focus_terms: [w_eq, w_cn, w_bc, w_ct]
 
-# ------------------------------------------------------------
-# 4.4 鎺ヨЕ鍔涘鍙傛暟 (Contact Mechanics Parameters)
-# ------------------------------------------------------------
-# 鍏抽敭淇锛氶檷浣庢懇鎿︽儵缃氱郴鏁発_t浠ュ尮閰嶅脊鎬ц兘閲弒cale
-# 褰撳墠闂锛欵ct=2.6e8杩滃ぇ浜嶦int=2.5e5锛屽鑷存搴aN
-friction_config:
-  enabled: true
-  k_t: 100            # 闄嶄綆鍒囧悜鎯╃綒鍒氬害锛岀紦瑙?NaN
-  mu_t: 200           # 闄嶄綆鍒囧悜 ALM 绯绘暟
-  mu_f: 0.15
-  use_smooth_friction: true   # 鍚敤骞虫粦鎽╂摝璺緞
-  use_delta_st_friction: false
-  smooth_to_strict: false
-  smooth_fraction: 0.3
-  smooth_steps: 300
-  blend_steps: 200
-normal_config:
-  mode: "alm"
-  beta: 50.0          # 娉曞悜鎺ヨЕ鎯╃綒 (淇濇寔榛樿)
-  mu_n: 1.0e3         # 娉曞悜ALM绯绘暟
-  residual_mode: fb
-  fb_eps: 1.0e-8
-
-# ------------------------------------------------------------
-# 8. 杈撳嚭涓庡彲瑙嗗寲
-# ------------------------------------------------------------
 output_config:
-  save_path: './results'
-  visualize: true
+  save_path: ./results
   viz_use_last_training_case: true
   viz_samples_after_train: 1
   viz_eval_scope: surface
   viz_force_pointwise: true
   viz_plot_stages: true
   viz_skip_release_stage_plot: true
-  viz_compare_cases: false
-  viz_use_shape_function_interp: true   # 鍚敤褰㈠嚱鏁版彃鍊硷紝璁╅暅闈簯鍥炬洿鍏夋粦
+  viz_use_shape_function_interp: true
   viz_smooth_vector_iters: 6
   viz_smooth_vector_lambda: 0.45
   viz_smooth_scalar_iters: 0
   viz_smooth_scalar_lambda: 0.6
-  viz_surface_source: "part_top"
-  viz_refine_subdivisions: 2            # 缁嗗垎浠ュ钩婊?
-  viz_diagnose_blanks: true             # 鍚敤绌虹櫧璇婃柇
-  viz_auto_fill_blanks: true            # 鑷姩濉厖灏忕┖娲?
-  viz_draw_wireframe: false             # 涓嶆樉绀虹綉鏍肩嚎
-  viz_write_surface_mesh: true
-# ------------------------------------------------------------
-# 9. INP 鏂囦欢璺緞
-# ------------------------------------------------------------
-inp_path: mir111.cdb
+  viz_surface_source: part_top
+  viz_refine_subdivisions: 2
+  viz_write_reference_aligned: true
 
-# ------------------------------------------------------------
-# 10. 璁粌閲囨牱/璋冨害锛坢ain.py 浼氳鍙栬繖浜涘€艰鐩栭粯璁ゅ厹搴曪級
-# ------------------------------------------------------------
-debug_big_model: false             # 鏄惁鏀惧ぇ缃戠粶瀹归噺锛堥粯璁ゅ叧闂紝閬垮厤鏃犳潯浠舵敼妯″瀷灏哄锛?
-tighten_angle_min: 2.0            # tightening angle min (deg)
-tighten_angle_max: 6.0            # tightening angle max (deg)
+mixed_precision: null
+tighten_angle_min: 2.0
+tighten_angle_max: 6.0
+
 tightening_config:
   alpha: 1.0e3
   angle_unit: deg
   clockwise: true
 
-n_contact_points_per_pair: 2000     # sample 妯″紡锛氭瘡瀵规帴瑙﹂潰鐨勯噰鏍锋暟锛沵ortar 妯″紡涓嬮粯璁ゅ拷鐣?tightening_n_points_each: 800     # samples per nut surface锛堝澶э級
-resample_contact_every: 0    # 鍏抽棴璁粌涓噸閲囨牱锛岄伩鍏岰PU鐡堕
-contact_rar_enabled: false   # 鍏抽棴鎺ヨЕRAR閲嶉噰鏍?
-alm_update_every: 0                # 浜ょ敱闃舵鍐?ALM 鏇存柊
-
-incremental_mode: true
-stage_inner_steps: 5        # 姣忛樁娈靛唴杩唬5姝ワ紙鍑忓皯 Python 寰幆寮€閿€锛?
-stage_alm_every: 1
-stage_resample_contact: false
-reset_contact_state_per_case: true
-stage_schedule_steps: [400, 400, 400, 300]
-
-volume_rar_enabled: false
 contact_route_update_every: 25
 early_exit:
   check_every: 25

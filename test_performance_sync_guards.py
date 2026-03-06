@@ -28,7 +28,7 @@ class _MatLib:
 
 
 class PerformanceSyncGuardTests(unittest.TestCase):
-    def test_prepare_config_reads_rar_flags_from_yaml(self):
+    def test_prepare_config_enforces_locked_route_even_with_legacy_flags(self):
         fake_yaml = {
             "inp_path": "dummy.cdb",
             "mirror_surface_name": "MIRROR UP",
@@ -36,8 +36,16 @@ class PerformanceSyncGuardTests(unittest.TestCase):
             "part2mat": {"P1": "mat"},
             "tighten_angle_min": 0.0,
             "tighten_angle_max": 1.0,
-            "contact_rar_enabled": False,
-            "volume_rar_enabled": False,
+            "preload_use_stages": False,
+            "incremental_mode": False,
+            "preload_staging": {"mode": "all_at_once", "enabled": False},
+            "stage_resample_contact": True,
+            "resample_contact_every": 20,
+            "contact_rar_enabled": True,
+            "volume_rar_enabled": True,
+            "optimizer_config": {"lbfgs": {"enabled": True}},
+            "friction_config": {"smooth_to_strict": True},
+            "output_config": {"viz_compare_cases": True},
             "contact_route_update_every": 9,
             "early_exit": {"enabled": True, "check_every": 7},
             "contact_pairs": [],
@@ -49,8 +57,19 @@ class PerformanceSyncGuardTests(unittest.TestCase):
         ), patch.object(main.os.path, "exists", return_value=True):
             cfg, _ = main._prepare_config_with_autoguess()
 
-        self.assertFalse(cfg.contact_rar_enabled)
-        self.assertFalse(cfg.volume_rar_enabled)
+        self.assertTrue(cfg.preload_use_stages)
+        self.assertTrue(cfg.incremental_mode)
+        self.assertEqual(str(cfg.total_cfg.preload_stage_mode).strip().lower(), "force_then_lock")
+        for legacy_key in (
+            "stage_resample_contact",
+            "resample_contact_every",
+            "contact_rar_enabled",
+            "volume_rar_enabled",
+            "lbfgs_enabled",
+            "friction_smooth_schedule",
+            "viz_compare_cases",
+        ):
+            self.assertFalse(hasattr(cfg, legacy_key), msg=f"legacy key should be removed: {legacy_key}")
         self.assertEqual(cfg.contact_route_update_every, 9)
         self.assertEqual(cfg.early_exit_check_every, 7)
 
