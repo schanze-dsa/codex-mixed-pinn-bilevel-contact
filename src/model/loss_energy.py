@@ -11,7 +11,7 @@ import tensorflow as tf
 from physics.elasticity_residual import ElasticityResidual
 from physics.elasticity_config import ElasticityConfig
 from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
-from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
+from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig, traction_bc_residual
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig
 
 
@@ -38,6 +38,13 @@ def compute_incremental_ed_penalty(
     if squared:
         pen = pen * pen
     return pen
+
+
+def traction_bc_residual_from_model(model, X, params, normals, target_t):
+    """Compute mixed traction BC residual using the model stress head only."""
+
+    sigma_vec = model.sigma_fn(X, params)
+    return traction_bc_residual(sigma_vec, normals, target_t)
 
 
 @dataclass

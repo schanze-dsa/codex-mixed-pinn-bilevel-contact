@@ -37,6 +37,8 @@ from typing import Optional, Dict, Tuple
 import numpy as np
 import tensorflow as tf
 
+from physics.traction_utils import traction_from_sigma_voigt
+
 
 # -----------------------------
 # Config
@@ -48,6 +50,16 @@ class BoundaryConfig:
     dtype: str = "float32"
     mode: str = "penalty"    # 'penalty' | 'hard' | 'alm'
     mu: float = 1.0e3        # ALM 增广系数（mode='alm' 时生效）
+
+
+def traction_bc_residual(sigma_vec, normals, target_t):
+    """Residual form for traction boundaries in mixed mode."""
+
+    sigma_vec = tf.convert_to_tensor(sigma_vec, dtype=tf.float32)
+    normals = tf.convert_to_tensor(normals, dtype=tf.float32)
+    target_t = tf.convert_to_tensor(target_t, dtype=tf.float32)
+    traction = traction_from_sigma_voigt(sigma_vec, normals)
+    return tf.cast(traction - target_t, tf.float32)
 
 
 # -----------------------------
