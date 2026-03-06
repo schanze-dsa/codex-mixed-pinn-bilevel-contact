@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from model.pinn_model import ModelConfig
 from physics.elasticity_config import ElasticityConfig
+from physics.physical_scales import PhysicalScaleConfig
 from physics.contact.contact_operator import ContactOperatorConfig
 from physics.tightening_model import TighteningConfig
 from model.loss_energy import TotalConfig
@@ -81,6 +82,7 @@ class TrainerConfig:
     )
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     tightening_cfg: TighteningConfig = field(default_factory=TighteningConfig)
+    physical_scales: PhysicalScaleConfig = field(default_factory=PhysicalScaleConfig)
     total_cfg: TotalConfig = field(
         default_factory=lambda: TotalConfig(
             w_int=1.0,

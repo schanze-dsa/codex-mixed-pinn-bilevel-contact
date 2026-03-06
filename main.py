@@ -112,6 +112,7 @@ def _default_saved_model_dir(out_dir: str) -> str:
 from train.trainer import TrainerConfig
 from inp_io.cdb_parser import load_cdb
 from mesh.contact_pairs import guess_surface_key
+from physics.physical_scales import PhysicalScaleConfig
 
 _LOCKED_ROUTE_NAME = "force_then_lock+incremental"
 
@@ -364,17 +365,31 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含螺母拧紧角度
     )
+    scale_cfg_yaml = cfg_yaml.get("physical_scales", {}) or {}
+    cfg.physical_scales = PhysicalScaleConfig(
+        L_ref=float(scale_cfg_yaml.get("L_ref", cfg_yaml.get("L_ref", cfg.physical_scales.L_ref))),
+        u_ref=float(scale_cfg_yaml.get("u_ref", cfg_yaml.get("u_ref", cfg.physical_scales.u_ref))),
+        sigma_ref=float(scale_cfg_yaml.get("sigma_ref", cfg_yaml.get("sigma_ref", cfg.total_cfg.sigma_ref))),
+        E_ref=float(scale_cfg_yaml.get("E_ref", cfg_yaml.get("E_ref", cfg.physical_scales.E_ref))),
+        F_ref=float(scale_cfg_yaml.get("F_ref", cfg_yaml.get("F_ref", cfg.physical_scales.F_ref))),
+        A_ref=float(scale_cfg_yaml.get("A_ref", cfg_yaml.get("A_ref", cfg.physical_scales.A_ref))),
+    )
     # 若 config.yaml 中提供了材料屈服强度，则默认取最小值作为全局屈服参考
     if yield_candidates:
         try:
             cfg.yield_strength = float(min(yield_candidates))
             print(f"[main] 读取材料屈服强度（最小值）: σy={cfg.yield_strength:g}")
             # 用屈服强度作为应力监督的归一化尺度，使 E_sigma 无量纲且量级稳定
-            if cfg.yield_strength and cfg.yield_strength > 0:
-                cfg.total_cfg.sigma_ref = float(cfg.yield_strength)
-                print(f"[main] 应力监督归一化参考: sigma_ref={cfg.total_cfg.sigma_ref:g}")
+            if (
+                cfg.yield_strength
+                and cfg.yield_strength > 0
+                and float(getattr(cfg.physical_scales, "sigma_ref", 0.0)) <= 0.0
+            ):
+                cfg.physical_scales.sigma_ref = float(cfg.yield_strength)
         except Exception:
             pass
+    cfg.total_cfg.sigma_ref = float(cfg.physical_scales.resolved_sigma_ref())
+    print(f"[main] 应力监督归一化参考: sigma_ref={cfg.total_cfg.sigma_ref:g}")
     output_cfg = cfg_yaml.get("output_config", {}) or {}
     if "save_path" in output_cfg:
         cfg.out_dir = str(output_cfg["save_path"])
