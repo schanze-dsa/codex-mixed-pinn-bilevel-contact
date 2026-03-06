@@ -35,6 +35,7 @@ import tensorflow as tf
 
 from .contact_normal_alm import NormalContactALM, NormalALMConfig
 from .contact_friction_alm import FrictionContactALM, FrictionALMConfig
+from .contact_inner_solver import ContactInnerState, ContactInnerResult, solve_contact_inner
 
 
 # -----------------------------
@@ -97,6 +98,7 @@ class ContactOperator:
         self._N: int = 0
         self._step: int = 0
         self._meta: Dict[str, np.ndarray] = {}
+        self._last_inner_state: Optional[ContactInnerState] = None
 
     def _friction_active(self) -> bool:
         cfg = getattr(self.cfg, "friction", None)
@@ -177,6 +179,7 @@ class ContactOperator:
         self._N = 0
         self._step = 0
         self._meta = {}
+        self._last_inner_state = None
 
     def reset_multipliers(self, reset_reference: bool = True):
         """Reset ALM multipliers without changing the current contact samples."""
@@ -187,6 +190,7 @@ class ContactOperator:
         if hasattr(self.friction, "reset_multipliers"):
             self.friction.reset_multipliers(reset_reference=reset_reference)
         self._step = 0
+        self._last_inner_state = None
 
     # ---------- energy & update ----------
 
@@ -329,6 +333,38 @@ class ContactOperator:
         if self._friction_active() and hasattr(self.friction, "last_slip"):
             return self.friction.last_slip()
         return None
+
+    def solve_inner_state(
+        self,
+        lambda_n: tf.Tensor,
+        lambda_t: tf.Tensor,
+        normals: tf.Tensor,
+        t1: tf.Tensor,
+        t2: tf.Tensor,
+        *,
+        force_fail: bool = False,
+    ) -> ContactInnerResult:
+        """Solve (or fallback) one inner-contact state and return tractions."""
+
+        result = solve_contact_inner(
+            lambda_n=lambda_n,
+            lambda_t=lambda_t,
+            normals=normals,
+            t1=t1,
+            t2=t2,
+            force_fail=force_fail,
+            last_feasible_state=self._last_inner_state,
+        )
+        if result.state.converged and not result.state.fallback_used:
+            self._last_inner_state = ContactInnerState(
+                lambda_n=tf.identity(result.state.lambda_n),
+                lambda_t=tf.identity(result.state.lambda_t),
+                converged=True,
+                iters=int(result.state.iters),
+                res_norm=float(result.state.res_norm),
+                fallback_used=False,
+            )
+        return result
 
     # ---------- schedules / setters ----------
 
