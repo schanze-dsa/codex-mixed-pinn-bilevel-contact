@@ -1385,6 +1385,12 @@ class DisplacementModel:
         X, P_hat = self._normalize_inputs(X, params)
         return self._us_fn_compiled(X, P_hat)
 
+    def sigma_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
+        """Stress-only forward in canonical Voigt layout [...,6]."""
+
+        _, sigma = self.us_fn(X, params)
+        return tf.cast(sigma, tf.float32)
+
     def us_fn_pointwise(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """Stress forward that always uses the pointwise MLP path."""
 
