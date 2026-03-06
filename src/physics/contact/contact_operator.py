@@ -36,6 +36,7 @@ import tensorflow as tf
 from .contact_normal_alm import NormalContactALM, NormalALMConfig
 from .contact_friction_alm import FrictionContactALM, FrictionALMConfig
 from .contact_inner_solver import ContactInnerState, ContactInnerResult, solve_contact_inner
+from physics.traction_utils import traction_from_sigma_voigt
 
 
 # -----------------------------
@@ -59,6 +60,16 @@ class ContactOperatorConfig:
 
     # 精度
     dtype: str = "float32"
+
+
+def traction_matching_terms(sigma_s, sigma_m, normals, t1, t2, inner_result):
+    """Residual matching terms based on solved inner-contact traction."""
+
+    del t1, t2
+    traction_s = traction_from_sigma_voigt(sigma_s, normals)
+    traction_m = traction_from_sigma_voigt(sigma_m, normals)
+    tc = tf.cast(inner_result.traction_vec, tf.float32)
+    return traction_s + tc, traction_m - tc
 
 
 class ContactOperator:

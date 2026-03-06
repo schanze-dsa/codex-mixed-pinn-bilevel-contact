@@ -10,7 +10,11 @@ import tensorflow as tf
 
 from physics.elasticity_residual import ElasticityResidual
 from physics.elasticity_config import ElasticityConfig
-from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
+from physics.contact.contact_operator import (
+    ContactOperator,
+    ContactOperatorConfig,
+    traction_matching_terms,
+)
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig, traction_bc_residual
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig
 
@@ -45,6 +49,12 @@ def traction_bc_residual_from_model(model, X, params, normals, target_t):
 
     sigma_vec = model.sigma_fn(X, params)
     return traction_bc_residual(sigma_vec, normals, target_t)
+
+
+def traction_matching_residual(sigma_s, sigma_m, n, t1, t2, inner_result):
+    """Mixed contact residual via traction matching against inner solve result."""
+
+    return traction_matching_terms(sigma_s, sigma_m, n, t1, t2, inner_result)
 
 
 @dataclass
