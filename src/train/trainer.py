@@ -198,6 +198,25 @@ def compute_uncertainty_proxy_sigma(
     return sigma
 
 
+def resolve_mixed_phase_flags(cfg: TrainerConfig) -> Dict[str, Any]:
+    """Resolve mixed-bilevel phase switches from trainer config."""
+
+    phase = getattr(cfg, "mixed_bilevel_phase", None)
+    if phase is None:
+        return {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+    return {
+        "phase_name": str(getattr(phase, "phase_name", "phase0")),
+        "normal_ift_enabled": bool(getattr(phase, "normal_ift_enabled", False)),
+        "tangential_ift_enabled": bool(getattr(phase, "tangential_ift_enabled", False)),
+        "detach_inner_solution": bool(getattr(phase, "detach_inner_solution", True)),
+    }
+
+
 class Trainer(
     TrainerBuildMixin,
     TrainerPreloadMixin,
@@ -223,6 +242,7 @@ class Trainer(
 
     def __init__(self, cfg: TrainerConfig):
         self.cfg = cfg
+        self._mixed_phase_flags = resolve_mixed_phase_flags(cfg)
         self._validate_locked_route()
         np.random.seed(cfg.seed)
         tf.random.set_seed(cfg.seed)

@@ -30,6 +30,20 @@ def _compute_uncertainty_proxy_sigma(
     return sigma
 
 
+def capped_continuation_update(
+    eps_n: float,
+    k_t: float,
+    *,
+    eps_factor: float = 0.7,
+    k_t_factor: float = 1.3,
+):
+    """Apply continuation update with hard per-step caps."""
+
+    eps_scale = max(0.7, float(eps_factor))
+    kt_scale = max(0.0, min(float(k_t_factor), 1.3))
+    return float(eps_n) * eps_scale, float(k_t) * kt_scale
+
+
 class TrainerOptMixin:
     def _collect_trainable_variables(self):
         m = self.model

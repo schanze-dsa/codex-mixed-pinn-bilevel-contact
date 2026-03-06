@@ -60,6 +60,14 @@ stage_inner_steps: 5
 stage_alm_every: 1
 reset_contact_state_per_case: true
 stage_schedule_steps: [400, 400, 400, 300]
+mixed_bilevel_phase:
+  phase_name: phase0
+  normal_ift_enabled: false
+  tangential_ift_enabled: false
+  detach_inner_solution: true
+continuation_caps:
+  eps_shrink: 0.7
+  kt_growth: 1.3
 
 alm_update_every: 0
 

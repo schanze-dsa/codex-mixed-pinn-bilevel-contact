@@ -15,6 +15,14 @@ from model.loss_energy import TotalConfig
 
 
 @dataclass
+class MixedBilevelPhaseConfig:
+    phase_name: str = "phase0"
+    normal_ift_enabled: bool = False
+    tangential_ift_enabled: bool = False
+    detach_inner_solution: bool = True
+
+
+@dataclass
 class TrainerConfig:
     inp_path: str = "data/shuangfan.inp"
     mirror_surface_name: str = "MIRROR up"
@@ -75,6 +83,9 @@ class TrainerConfig:
     stage_alm_every: int = 1
     reset_contact_state_per_case: bool = True
     stage_schedule_steps: List[int] = field(default_factory=list)
+    mixed_bilevel_phase: MixedBilevelPhaseConfig = field(default_factory=MixedBilevelPhaseConfig)
+    continuation_eps_shrink_cap: float = 0.7
+    continuation_kt_growth_cap: float = 1.3
 
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
     elas_cfg: ElasticityConfig = field(
