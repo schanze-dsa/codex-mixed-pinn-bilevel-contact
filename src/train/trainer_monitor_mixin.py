@@ -63,6 +63,32 @@ class TrainerMonitorMixin:
             return True
         return False
 
+    @staticmethod
+    def extract_bilevel_diagnostics(stats: Optional[Mapping[str, Any]]) -> Dict[str, float]:
+        """Pick strict-bilevel diagnostics from stats for monitoring/logging."""
+
+        out: Dict[str, float] = {}
+        if not isinstance(stats, Mapping):
+            return out
+        for key in (
+            "inner_fn_norm",
+            "inner_ft_norm",
+            "ift_linear_residual",
+            "grad_u_norm",
+            "grad_sigma_norm",
+        ):
+            if key not in stats:
+                continue
+            value = stats.get(key)
+            try:
+                if isinstance(value, tf.Tensor):
+                    out[key] = float(tf.cast(value, tf.float32).numpy())
+                else:
+                    out[key] = float(value)
+            except Exception:
+                continue
+        return out
+
     def _contact_route_score(self) -> float:
         if self._contact_route_ema is None:
             return 0.0

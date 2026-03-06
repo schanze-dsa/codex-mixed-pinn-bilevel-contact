@@ -44,6 +44,36 @@ def capped_continuation_update(
     return float(eps_n) * eps_scale, float(k_t) * kt_scale
 
 
+def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, Any]) -> Dict[str, Any]:
+    """Inject strict-bilevel diagnostics into trainer stats with canonical keys."""
+
+    if stats is None:
+        stats = {}
+    diagnostics = diagnostics or {}
+    key_map = {
+        "inner_fn_norm": "fn_norm",
+        "inner_ft_norm": "ft_norm",
+        "ift_linear_residual": "ift_linear_residual",
+        "grad_u_norm": "grad_u_norm",
+        "grad_sigma_norm": "grad_sigma_norm",
+    }
+    for out_key, in_key in key_map.items():
+        if in_key not in diagnostics:
+            continue
+        value = diagnostics[in_key]
+        try:
+            if isinstance(value, tf.Tensor):
+                if value.shape.rank == 0:
+                    stats[out_key] = float(tf.cast(value, tf.float32).numpy())
+                else:
+                    stats[out_key] = value
+            else:
+                stats[out_key] = float(value)
+        except Exception:
+            stats[out_key] = value
+    return stats
+
+
 class TrainerOptMixin:
     def _collect_trainable_variables(self):
         m = self.model
