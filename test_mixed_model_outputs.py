@@ -224,6 +224,69 @@ class MixedModelOutputsTests(unittest.TestCase):
         self.assertEqual(tuple(u.shape), (4, 3))
         self.assertEqual(tuple(sigma.shape), (4, 6))
 
+    def test_adaptive_contact_hybrid_feeds_blended_stress_features_into_semantic_fusion(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+                contact_stress_hybrid_enabled=True,
+                adaptive_depth_enabled=True,
+                adaptive_depth_mode="hard",
+                adaptive_depth_shallow_layers=1,
+                adaptive_depth_threshold=0.5,
+                adaptive_depth_temperature=0.1,
+                adaptive_depth_route_source="contact_residual",
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        z = model.encoder(tf.zeros((1, 3), dtype=tf.float32))
+        sem = tf.constant(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=tf.float32,
+        )
+        model.field.set_node_semantic_features(sem)
+        model.field.set_contact_residual_hint(1.0)
+
+        sentinel = tf.fill((4, 16), 7.0)
+
+        def _fake_blend(stress_feat, local_stress_feat, semantic_feat):
+            del stress_feat, local_stress_feat, semantic_feat
+            return sentinel
+
+        def _fake_fuse(stress_feat, semantic_feat):
+            del semantic_feat
+            tf.debugging.assert_near(stress_feat, sentinel, atol=0.0)
+            return stress_feat
+
+        with patch.object(model.field, "_blend_contact_stress_features", side_effect=_fake_blend):
+            with patch.object(model.field, "_fuse_stress_semantics", side_effect=_fake_fuse):
+                u, sigma = model.field(X, z, return_stress=True)
+
+        self.assertEqual(tuple(u.shape), (4, 3))
+        self.assertEqual(tuple(sigma.shape), (4, 6))
+
 
 if __name__ == "__main__":
     unittest.main()

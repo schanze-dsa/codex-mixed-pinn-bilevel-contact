@@ -1260,7 +1260,7 @@ class DisplacementNet(tf.keras.Model):
             if return_stress or return_stress_features:
                 if stress_hfeat is not None:
                     stress_feat = self._blend_contact_stress_features(stress_hfeat, local_stress_feat, semantic_feat)
-                    stress_feat = self._fuse_stress_semantics(stress_hfeat, semantic_feat)
+                    stress_feat = self._fuse_stress_semantics(stress_feat, semantic_feat)
                     if return_stress:
                         sigma_out = self.predict_stress_from_features(stress_feat)
                 else:
