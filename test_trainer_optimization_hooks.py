@@ -670,6 +670,84 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertAlmostEqual(float(parts["E_cn"].numpy()), 1.0)
         self.assertEqual(stats["strict_route_mode"], "normal_ready")
 
+    def test_strict_mixed_objective_consumes_unified_mixed_residual_terms(self):
+        cfg = SimpleNamespace(
+            w_int=0.0,
+            w_cn=0.0,
+            w_ct=0.0,
+            w_bc=0.0,
+            w_tight=0.0,
+            w_sigma=0.0,
+            w_eq=1.0,
+            w_reg=0.0,
+            w_bi=0.0,
+            w_ed=0.0,
+            w_unc=0.0,
+            w_data=0.0,
+            w_smooth=0.0,
+            sigma_ref=1.0,
+            path_penalty_weight=0.0,
+            fric_path_penalty_weight=0.0,
+            ed_enabled=False,
+            ed_external_scale=1.0,
+            ed_margin=0.0,
+            ed_use_relu=True,
+            ed_square=True,
+            adaptive_scheme="contact_only",
+            update_every_steps=1,
+            dtype="float32",
+        )
+        total = TotalEnergy(cfg)
+
+        calls = {"mixed": 0}
+        case = self
+
+        class _FakeElasticity:
+            cfg = SimpleNamespace(stress_loss_weight=0.0)
+
+            @staticmethod
+            def _eval_u_on_nodes(u_fn, params):
+                del u_fn, params
+                return tf.zeros((0, 3), dtype=tf.float32)
+
+            def mixed_residual_terms(self, u_fn, sigma_fn, params, *, return_cache=False):
+                del u_fn, sigma_fn, params
+                case.assertTrue(return_cache)
+                calls["mixed"] += 1
+                r_eq = tf.ones((2, 3), dtype=tf.float32)
+                return {
+                    "R_const": tf.zeros((2, 6), dtype=tf.float32),
+                    "R_eq": r_eq,
+                    "cache": {
+                        "eps_vec": tf.zeros((2, 6), dtype=tf.float32),
+                        "sigma_pred": tf.zeros((2, 6), dtype=tf.float32),
+                        "sigma_phys": tf.zeros((2, 6), dtype=tf.float32),
+                        "div_sigma": r_eq,
+                        "w_sel": tf.ones((2,), dtype=tf.float32),
+                    },
+                }
+
+        total.attach(elasticity=_FakeElasticity())
+        total.set_mixed_bilevel_flags({"phase_name": "phase2a"})
+
+        def zero_u(X, params=None):
+            del X, params
+            return tf.zeros((2, 3), dtype=tf.float32)
+
+        def zero_us(X, params=None):
+            del X, params
+            return (
+                tf.zeros((2, 3), dtype=tf.float32),
+                tf.zeros((2, 6), dtype=tf.float32),
+            )
+
+        Pi, parts, _ = total.strict_mixed_objective(zero_u, params={}, stress_fn=zero_us)
+
+        self.assertEqual(calls["mixed"], 1)
+        self.assertIn("E_eq", parts)
+        self.assertAlmostEqual(float(parts["E_eq"].numpy()), 3.0, places=6)
+        self.assertAlmostEqual(float(Pi.numpy()), 3.0, places=6)
+
     def test_accumulate_strict_bilevel_rates_and_freeze_request(self):
         trainer = object.__new__(Trainer)
         trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}

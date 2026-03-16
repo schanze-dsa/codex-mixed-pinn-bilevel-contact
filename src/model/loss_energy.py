@@ -682,13 +682,28 @@ class TotalEnergy:
         elastic_cache = None
         if self.elasticity is not None:
             u_nodes = self.elasticity._eval_u_on_nodes(u_fn, params)
-            estates, elastic_cache = self.elasticity.residual_cache(
-                u_fn_elastic,
-                params,
-                stress_fn=stress_fn_elastic,
-                need_sigma=need_sigma,
-                need_eq=need_eq,
+            use_mixed_terms = (
+                stress_fn_elastic is not None
+                and (need_sigma or need_eq or need_reg)
+                and hasattr(self.elasticity, "mixed_residual_terms")
             )
+            if use_mixed_terms:
+                mixed_terms = self.elasticity.mixed_residual_terms(
+                    u_fn_elastic,
+                    stress_fn_elastic,
+                    params,
+                    return_cache=True,
+                )
+                estates = {}
+                elastic_cache = dict(mixed_terms.get("cache") or {})
+            else:
+                estates, elastic_cache = self.elasticity.residual_cache(
+                    u_fn_elastic,
+                    params,
+                    stress_fn=stress_fn_elastic,
+                    need_sigma=need_sigma,
+                    need_eq=need_eq,
+                )
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
         if self.contact is not None:
