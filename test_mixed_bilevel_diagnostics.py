@@ -23,6 +23,9 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
         diagnostics = {
             "fn_norm": 1.1,
             "ft_norm": 2.2,
+            "cone_violation": 2.5,
+            "max_penetration": 2.6,
+            "fallback_used": 1.0,
             "ift_linear_residual": 3.3,
             "grad_u_norm": 4.4,
             "grad_sigma_norm": 5.5,
@@ -33,9 +36,29 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(picked["inner_fn_norm"], 1.1)
         self.assertEqual(picked["inner_ft_norm"], 2.2)
+        self.assertEqual(picked["inner_cone_violation"], 2.5)
+        self.assertEqual(picked["inner_max_penetration"], 2.6)
+        self.assertEqual(picked["inner_fallback_used"], 1.0)
         self.assertEqual(picked["ift_linear_residual"], 3.3)
         self.assertEqual(picked["grad_u_norm"], 4.4)
         self.assertEqual(picked["grad_sigma_norm"], 5.5)
+
+    def test_monitor_reports_aggregate_strict_bilevel_rates(self):
+        picked = TrainerMonitorMixin.extract_bilevel_diagnostics(
+            {
+                "inner_convergence_rate": 0.75,
+                "inner_fallback_rate": 0.25,
+                "inner_skip_rate": 0.125,
+                "continuation_frozen": 1.0,
+                "continuation_freeze_events": 2.0,
+            }
+        )
+
+        self.assertEqual(picked["inner_convergence_rate"], 0.75)
+        self.assertEqual(picked["inner_fallback_rate"], 0.25)
+        self.assertEqual(picked["inner_skip_rate"], 0.125)
+        self.assertEqual(picked["continuation_frozen"], 1.0)
+        self.assertEqual(picked["continuation_freeze_events"], 2.0)
 
 
 if __name__ == "__main__":

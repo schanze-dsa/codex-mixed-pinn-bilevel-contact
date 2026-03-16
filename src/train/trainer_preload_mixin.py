@@ -180,7 +180,8 @@ class TrainerPreloadMixin:
 
         mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
         mode = mode.strip().lower().replace("-", "_")
-        if mode == "force_then_lock":
+        append_release_stage = bool(getattr(self.cfg, "preload_append_release_stage", True))
+        if mode == "force_then_lock" and append_release_stage:
             # Append a final "release" stage so the last stage represents the post-tightening
             # equilibrium (all bolts locked, no active force control). This is where tightening
             # order effects should manifest most clearly.
@@ -201,6 +202,13 @@ class TrainerPreloadMixin:
         }
 
     def _sample_preload_case(self) -> Dict[str, np.ndarray]:
+        dataset = getattr(self, "_supervision_dataset", None)
+        if dataset is not None:
+            case = dataset.next_case("train")
+            if self.cfg.preload_use_stages and "stages" not in case:
+                case.update(self._build_stage_case(case["P"], case["order"]))
+            return case
+
         P = self._sample_P()
         case: Dict[str, np.ndarray] = {"P": P}
         if not self.cfg.preload_use_stages:
@@ -223,6 +231,9 @@ class TrainerPreloadMixin:
         params: Dict[str, Any] = {
             "P": tf.convert_to_tensor(case["P"], dtype=tf.float32)
         }
+        if "X_obs" in case and "U_obs" in case and not self.cfg.preload_use_stages:
+            params["X_obs"] = tf.convert_to_tensor(case["X_obs"], dtype=tf.float32)
+            params["U_obs"] = tf.convert_to_tensor(case["U_obs"], dtype=tf.float32)
         if not self.cfg.preload_use_stages or "stages" not in case:
             return params
 
@@ -321,6 +332,9 @@ class TrainerPreloadMixin:
             stage_dict["stage_last"] = last_tensor
         if rank_matrix_tf is not None:
             stage_dict["stage_rank"] = rank_matrix_tf
+        if "X_obs" in case and "U_obs" in case:
+            stage_dict["X_obs"] = tf.convert_to_tensor(case["X_obs"], dtype=tf.float32)
+            stage_dict["U_obs"] = tf.convert_to_tensor(case["U_obs"], dtype=tf.float32)
         params["stages"] = stage_dict
         params["stage_order"] = order_tf
         if rank_tf is not None:
@@ -384,6 +398,12 @@ class TrainerPreloadMixin:
                         final["stage_rank"] = rank_tensor[-1]
                     else:
                         final["stage_rank"] = rank_tensor
+                obs_x = stages.get("X_obs")
+                if obs_x is not None and getattr(obs_x, "shape", None) is not None and obs_x.shape.rank == 3:
+                    final["X_obs"] = obs_x[-1]
+                obs_u = stages.get("U_obs")
+                if obs_u is not None and getattr(obs_u, "shape", None) is not None and obs_u.shape.rank == 3:
+                    final["U_obs"] = obs_u[-1]
         elif isinstance(stages, (list, tuple)) and stages:
             last_stage = stages[-1]
             if isinstance(last_stage, dict):
@@ -449,6 +469,12 @@ class TrainerPreloadMixin:
                 last_tensor = stages.get("stage_last")
                 if last_tensor is not None and getattr(last_tensor, "shape", None) is not None and last_tensor.shape.rank == 2:
                     out["stage_last"] = last_tensor[idx]
+                obs_x = stages.get("X_obs")
+                if obs_x is not None and getattr(obs_x, "shape", None) is not None and obs_x.shape.rank == 3:
+                    out["X_obs"] = obs_x[idx]
+                obs_u = stages.get("U_obs")
+                if obs_u is not None and getattr(obs_u, "shape", None) is not None and obs_u.shape.rank == 3:
+                    out["U_obs"] = obs_u[idx]
         elif isinstance(stages, (list, tuple)) and stages:
             idx = stage_index % len(stages)
             stage_item = stages[idx]

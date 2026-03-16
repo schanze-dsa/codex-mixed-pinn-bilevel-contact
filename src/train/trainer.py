@@ -244,6 +244,7 @@ class Trainer(
         self.cfg = cfg
         self._mixed_phase_flags = resolve_mixed_phase_flags(cfg)
         self._validate_locked_route()
+        self._resolve_contact_backend()
         np.random.seed(cfg.seed)
         tf.random.set_seed(cfg.seed)
         self._init_runtime_state(cfg)
@@ -356,6 +357,9 @@ class Trainer(
 
     def _assemble_total(self) -> TotalEnergy:
         total = TotalEnergy(self.cfg.total_cfg)
+        mixed_flags = dict(getattr(self, "_mixed_phase_flags", {}) or {})
+        mixed_flags["contact_backend"] = self._resolve_contact_backend()
+        total.set_mixed_bilevel_flags(mixed_flags)
         total.attach(
             elasticity=self.elasticity,
             contact=self.contact,
@@ -371,7 +375,10 @@ class Trainer(
 
         if self.contact is None or not self.cfg.contact_hardening_enabled:
             self._contact_hardening_targets = None
+            self._contact_hardening_frozen = False
             return
+
+        self._contact_hardening_frozen = False
 
         def _to_float(x, fallback: float) -> float:
             try:
@@ -428,6 +435,12 @@ class Trainer(
 
         if self._contact_hardening_targets is None or self.contact is None:
             return
+        if bool(getattr(self, "_contact_hardening_frozen", False)):
+            return
+        if bool(getattr(self, "_strict_bilevel_freeze_requested", False)):
+            self._contact_hardening_frozen = True
+            self._continuation_freeze_events = int(getattr(self, "_continuation_freeze_events", 0) or 0) + 1
+            return
         frac = float(np.clip(self.cfg.contact_hardening_fraction, 0.0, 1.0))
         if frac <= 0.0:
             return
@@ -462,7 +475,9 @@ class Trainer(
         stage_mode = str(getattr(self.cfg.total_cfg, "preload_stage_mode", "") or "")
         stage_mode = stage_mode.strip().lower().replace("-", "_")
         append_release_stage = bool(
-            self.cfg.preload_use_stages and stage_mode == "force_then_lock"
+            self.cfg.preload_use_stages
+            and stage_mode == "force_then_lock"
+            and bool(getattr(self.cfg, "preload_append_release_stage", True))
         )
 
         module = _SavedModelModule(

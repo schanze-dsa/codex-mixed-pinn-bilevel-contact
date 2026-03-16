@@ -53,6 +53,16 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
     key_map = {
         "inner_fn_norm": "fn_norm",
         "inner_ft_norm": "ft_norm",
+        "inner_cone_violation": "cone_violation",
+        "inner_max_penetration": "max_penetration",
+        "inner_fallback_used": "fallback_used",
+        "inner_converged": "converged",
+        "inner_skip_batch": "skip_batch",
+        "inner_convergence_rate": "inner_convergence_rate",
+        "inner_fallback_rate": "inner_fallback_rate",
+        "inner_skip_rate": "inner_skip_rate",
+        "continuation_frozen": "continuation_frozen",
+        "continuation_freeze_events": "continuation_freeze_events",
         "ift_linear_residual": "ift_linear_residual",
         "grad_u_norm": "grad_u_norm",
         "grad_sigma_norm": "grad_sigma_norm",
@@ -75,6 +85,196 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
 
 
 class TrainerOptMixin:
+    _STRICT_MIXED_ALLOWED_KEYS = frozenset(
+        {
+            "E_cn",
+            "E_ct",
+            "E_eq",
+            "E_bc",
+            "E_tight",
+            "E_data",
+            "E_smooth",
+            "E_unc",
+            "E_reg",
+        }
+    )
+    _STRICT_MIXED_DISABLED_KEYS = frozenset(
+        {
+            "E_int",
+            "E_sigma",
+            "E_bi",
+            "E_ed",
+            "path_penalty_total",
+            "fric_path_penalty_total",
+            "R_contact_comp",
+            "R_fric_comp",
+        }
+    )
+    _CONTACT_BACKEND_AUTO = "auto"
+    _CONTACT_BACKEND_LEGACY = "legacy_alm"
+    _CONTACT_BACKEND_INNER = "inner_solver"
+    _VALID_CONTACT_BACKENDS = frozenset(
+        {
+            _CONTACT_BACKEND_AUTO,
+            _CONTACT_BACKEND_LEGACY,
+            _CONTACT_BACKEND_INNER,
+        }
+    )
+
+    @staticmethod
+    def _stat_as_float(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return float(default)
+        try:
+            if isinstance(value, tf.Tensor):
+                if value.dtype == tf.string:
+                    value = value.numpy().decode("utf-8")
+                elif value.shape.rank == 0:
+                    value = value.numpy()
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _stat_as_text(value: Any, default: str = "") -> str:
+        if value is None:
+            return default
+        try:
+            if isinstance(value, tf.Tensor):
+                if value.dtype == tf.string:
+                    return value.numpy().decode("utf-8")
+                if value.shape.rank == 0:
+                    return str(value.numpy())
+            return str(value)
+        except Exception:
+            return default
+
+    def _resolve_bilevel_objective_route(self) -> str:
+        flags = getattr(self, "_mixed_phase_flags", {}) or {}
+        phase_name = str(flags.get("phase_name", "phase0") or "phase0").strip().lower()
+        normal_ift = bool(flags.get("normal_ift_enabled", False))
+        tangential_ift = bool(flags.get("tangential_ift_enabled", False))
+        if phase_name in {"", "phase0"}:
+            return "legacy"
+        if tangential_ift:
+            raise NotImplementedError(
+                "P0 only supports forward-only or normal-ready strict mixed routes; tangential/full IFT remains disabled."
+            )
+        if normal_ift:
+            return "normal_ready"
+        return "forward_only"
+
+    def _resolve_contact_backend(self) -> str:
+        route_mode = self._resolve_bilevel_objective_route()
+        requested = str(getattr(getattr(self, "cfg", None), "contact_backend", self._CONTACT_BACKEND_AUTO) or "")
+        requested = requested.strip().lower() or self._CONTACT_BACKEND_AUTO
+        if requested not in self._VALID_CONTACT_BACKENDS:
+            valid = ", ".join(sorted(self._VALID_CONTACT_BACKENDS))
+            raise ValueError(f"Unsupported contact_backend '{requested}'. Expected one of: {valid}.")
+
+        default_backend = (
+            self._CONTACT_BACKEND_LEGACY
+            if route_mode == "legacy"
+            else self._CONTACT_BACKEND_INNER
+        )
+        if requested == self._CONTACT_BACKEND_AUTO:
+            return default_backend
+        if requested != default_backend:
+            raise ValueError(
+                f"contact_backend='{requested}' is incompatible with strict_route_mode='{route_mode}' "
+                f"(expected '{default_backend}')."
+            )
+        return requested
+
+    def _apply_route_weight_overrides(self, route_mode: str) -> Dict[str, float]:
+        if route_mode == "legacy":
+            self._active_weight_overrides = {}
+            return self._active_weight_overrides
+        overrides = {key: 0.0 for key in self._STRICT_MIXED_DISABLED_KEYS}
+        self._active_weight_overrides = overrides
+        return overrides
+
+    def _evaluate_total_objective(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        stress_fn=None,
+        tape=None,
+    ):
+        route_mode = self._resolve_bilevel_objective_route()
+        self._apply_route_weight_overrides(route_mode)
+        if route_mode == "legacy":
+            Pi, parts, stats = total.energy(self.model.u_fn, params=params, tape=tape, stress_fn=stress_fn)
+        else:
+            if not hasattr(total, "strict_mixed_objective"):
+                raise RuntimeError("TotalEnergy.strict_mixed_objective() is required for strict mixed bilevel mode.")
+            Pi, parts, stats = total.strict_mixed_objective(
+                self.model.u_fn,
+                params=params,
+                tape=tape,
+                stress_fn=stress_fn,
+            )
+        if stats is None:
+            stats = {}
+        else:
+            stats = dict(stats)
+        if tf.inside_function():
+            stats["strict_route_mode"] = tf.constant(route_mode, dtype=tf.string)
+        else:
+            stats["strict_route_mode"] = route_mode
+        return Pi, parts, stats
+
+    def _accumulate_strict_bilevel_stats(
+        self,
+        stats: Optional[Mapping[str, Any]],
+        *,
+        route_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {} if stats is None else dict(stats)
+        if route_mode is None:
+            route_mode = self._stat_as_text(out.get("strict_route_mode"), "legacy")
+        if route_mode == "legacy":
+            out["strict_route_mode"] = route_mode
+            out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
+            out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
+            return out
+
+        counters = getattr(self, "_strict_bilevel_stats", None)
+        if not isinstance(counters, dict):
+            counters = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+            self._strict_bilevel_stats = counters
+
+        converged = self._stat_as_float(
+            out.get("inner_converged", out.get("converged", 0.0)),
+            0.0,
+        ) > 0.5
+        fallback = self._stat_as_float(
+            out.get("inner_fallback_used", out.get("fallback_used", 0.0)),
+            0.0,
+        ) > 0.5
+        skipped = self._stat_as_float(
+            out.get("inner_skip_batch", out.get("mixed_strict_skipped", 0.0)),
+            0.0,
+        ) > 0.5
+
+        counters["total"] = int(counters.get("total", 0)) + 1
+        counters["converged"] = int(counters.get("converged", 0)) + int(converged)
+        counters["fallback"] = int(counters.get("fallback", 0)) + int(fallback)
+        counters["skipped"] = int(counters.get("skipped", 0)) + int(skipped)
+        total_count = max(1, int(counters["total"]))
+
+        if skipped or fallback or (not converged):
+            self._strict_bilevel_freeze_requested = True
+
+        out["inner_convergence_rate"] = float(counters["converged"]) / float(total_count)
+        out["inner_fallback_rate"] = float(counters["fallback"]) / float(total_count)
+        out["inner_skip_rate"] = float(counters["skipped"]) / float(total_count)
+        out["strict_route_mode"] = route_mode
+        out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
+        out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
+        return out
+
     def _collect_trainable_variables(self):
         m = self.model
 
@@ -197,16 +397,20 @@ class TrainerOptMixin:
 
         stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
 
-        Pi_raw, parts, stats = total.energy(self.model.u_fn, params=params, tape=None, stress_fn=stress_fn)
+        Pi_raw, parts, stats = self._evaluate_total_objective(total, params, stress_fn=stress_fn, tape=None)
+        route_mode = self._stat_as_text(stats.get("strict_route_mode"), "legacy")
+        stats = self._accumulate_strict_bilevel_stats(stats, route_mode=route_mode)
         if self._uncertainty_enabled():
             E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
             parts["E_unc"] = tf.cast(E_unc, tf.float32)
             stats.update(unc_stats)
         Pi = Pi_raw
-        if self.loss_state is not None:
-            if adaptive:
-                update_loss_weights(self.loss_state, parts, stats)
-            Pi = combine_loss(parts, self.loss_state)
+        if self.loss_state is not None and adaptive:
+            update_loss_weights(self.loss_state, parts, stats)
+        weights = self._build_weight_vector()
+        weights, floor_diag = self._apply_supervision_contribution_floor(parts, weights)
+        stats.update(floor_diag)
+        Pi = self._loss_from_parts_and_weights(parts, weights)
         reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
         loss = Pi + reg
         return loss, Pi, parts, stats
@@ -231,17 +435,20 @@ class TrainerOptMixin:
 
         stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
 
-        _, parts, stats = total.energy(self.model.u_fn, params=params, tape=None, stress_fn=stress_fn)
+        _, parts, stats = self._evaluate_total_objective(total, params, stress_fn=stress_fn, tape=None)
+        route_mode = self._stat_as_text(stats.get("strict_route_mode"), "legacy")
+        stats = self._accumulate_strict_bilevel_stats(stats, route_mode=route_mode)
         if self._uncertainty_enabled():
             E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
             parts["E_unc"] = tf.cast(E_unc, tf.float32)
             stats.update(unc_stats)
 
-        Pi = total._combine_parts(parts)
-        if self.loss_state is not None:
-            if adaptive:
-                update_loss_weights(self.loss_state, parts, stats)
-            Pi = combine_loss(parts, self.loss_state)
+        if self.loss_state is not None and adaptive:
+            update_loss_weights(self.loss_state, parts, stats)
+        weights = self._build_weight_vector()
+        weights, floor_diag = self._apply_supervision_contribution_floor(parts, weights)
+        stats.update(floor_diag)
+        Pi = self._loss_from_parts_and_weights(parts, weights)
         reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
         loss = Pi + reg
         return loss, Pi, parts, stats
@@ -284,9 +491,13 @@ class TrainerOptMixin:
         if not keys:
             return tf.zeros((0,), dtype=tf.float32)
         sign_map = sign_map or {}
+        overrides = getattr(self, "_active_weight_overrides", {}) or {}
         weights = []
         for key in keys:
-            w = float(weight_map.get(key, 0.0) or 0.0)
+            if key in overrides:
+                w = float(overrides.get(key, 0.0) or 0.0)
+            else:
+                w = float(weight_map.get(key, 0.0) or 0.0)
             sign = float(sign_map.get(key, 1.0))
             weights.append(w * sign)
         return tf.convert_to_tensor(weights, dtype=tf.float32)
@@ -306,11 +517,17 @@ class TrainerOptMixin:
         if not keys:
             return tf.zeros((0,), dtype=tf.float32)
 
+        route_mode = self._resolve_bilevel_objective_route()
+        self._apply_route_weight_overrides(route_mode)
+
         if self.loss_state is not None:
             return self._build_weight_vector_from_maps(
                 self.loss_state.current,
                 self.loss_state.sign_overrides,
             )
+
+        if getattr(self, "_active_weight_overrides", None):
+            return self._build_weight_vector_from_maps(getattr(self, "_base_weights", {}), {})
 
         cached = getattr(self, "_static_weight_vector", None)
         if cached is None:
@@ -319,6 +536,76 @@ class TrainerOptMixin:
         if cached is None:
             return tf.zeros((0,), dtype=tf.float32)
         return cached
+
+    def _loss_key_index(self, key: str) -> Optional[int]:
+        try:
+            return list(getattr(self, "_loss_keys", [])).index(key)
+        except ValueError:
+            return None
+
+    def _apply_supervision_contribution_floor(
+        self,
+        parts: Mapping[str, tf.Tensor],
+        weights: tf.Tensor,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        dtype = tf.float32
+        zero = tf.cast(0.0, dtype)
+        idx_data = self._loss_key_index("E_data")
+        if idx_data is None:
+            return weights, {}
+
+        data_weight = tf.cast(weights[idx_data], dtype)
+        data_loss = tf.cast(parts.get("E_data", zero), dtype)
+        ratio = tf.cast(
+            float(getattr(self.cfg, "supervision_contribution_floor_ratio", 0.0) or 0.0),
+            dtype,
+        )
+        enabled = bool(getattr(self.cfg, "supervision_contribution_floor_enabled", False))
+
+        diag = {
+            "data_eff_w": data_weight,
+            "data_floor_active": zero,
+            "data_floor_target": zero,
+            "data_phys_contrib": zero,
+            "data_eff_contrib": data_weight * data_loss,
+        }
+        if (not enabled) or float(getattr(self.cfg, "supervision_contribution_floor_ratio", 0.0) or 0.0) <= 0.0:
+            return weights, diag
+
+        phys_contrib = zero
+        for key in ("E_sigma", "E_ct"):
+            idx = self._loss_key_index(key)
+            if idx is None:
+                continue
+            phys_contrib = phys_contrib + tf.abs(tf.cast(weights[idx], dtype)) * tf.abs(
+                tf.cast(parts.get(key, zero), dtype)
+            )
+
+        target = ratio * phys_contrib
+        safe_data_loss = tf.maximum(tf.abs(data_loss), tf.cast(1.0e-12, dtype))
+        has_data = tf.abs(data_loss) > tf.cast(1.0e-12, dtype)
+        required_weight = tf.where(has_data, target / safe_data_loss, data_weight)
+        eff_weight = tf.where(has_data, tf.maximum(data_weight, required_weight), data_weight)
+        floor_active = tf.cast(
+            tf.logical_and(
+                has_data,
+                eff_weight > data_weight + tf.cast(1.0e-12, dtype),
+            ),
+            dtype,
+        )
+        weights = tf.tensor_scatter_nd_update(
+            tf.cast(weights, dtype),
+            indices=tf.constant([[idx_data]], dtype=tf.int32),
+            updates=tf.reshape(eff_weight, (1,)),
+        )
+        diag = {
+            "data_eff_w": eff_weight,
+            "data_floor_active": floor_active,
+            "data_floor_target": target,
+            "data_phys_contrib": phys_contrib,
+            "data_eff_contrib": eff_weight * data_loss,
+        }
+        return weights, diag
 
     @tf.function(reduce_retracing=True)
     def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
@@ -336,12 +623,14 @@ class TrainerOptMixin:
         stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
 
         with tf.GradientTape() as tape:
-            _, parts, stats = total.energy(self.model.u_fn, params=params, tape=None, stress_fn=stress_fn)
+            _, parts, stats = self._evaluate_total_objective(total, params, stress_fn=stress_fn, tape=None)
             if self._uncertainty_enabled():
                 E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
                 parts["E_unc"] = tf.cast(E_unc, tf.float32)
                 stats.update(unc_stats)
-            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            eff_weights, floor_diag = self._apply_supervision_contribution_floor(parts, weights)
+            stats.update(floor_diag)
+            loss_no_reg = self._loss_from_parts_and_weights(parts, eff_weights)
             reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
             loss_total = loss_no_reg + reg
 
@@ -377,13 +666,15 @@ class TrainerOptMixin:
         stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
 
         with tf.GradientTape() as tape:
-            _, parts, stats = total.energy(self.model.u_fn, params=params, tape=None, stress_fn=stress_fn)
+            _, parts, stats = self._evaluate_total_objective(total, params, stress_fn=stress_fn, tape=None)
             if self._uncertainty_enabled():
                 E_unc, unc_stats = self._compute_uncertainty_proxy_loss_tf(params, parts)
                 parts["E_unc"] = tf.cast(E_unc, tf.float32)
                 stats.update(unc_stats)
 
-            loss_no_reg = self._loss_from_parts_and_weights(parts, weights)
+            eff_weights, floor_diag = self._apply_supervision_contribution_floor(parts, weights)
+            stats.update(floor_diag)
+            loss_no_reg = self._loss_from_parts_and_weights(parts, eff_weights)
             reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
             loss_total = loss_no_reg + reg
 
@@ -472,6 +763,11 @@ class TrainerOptMixin:
             for _ in range(stage_inner_steps):
                 weight_vec = self._build_weight_vector()
                 loss, loss_no_reg, parts, stats, grads = self._compiled_stage_step(stage_params, weight_vec)
+                route_mode = self._stat_as_text(
+                    stats.get("strict_route_mode") if isinstance(stats, Mapping) else None,
+                    "legacy",
+                )
+                stats = self._accumulate_strict_bilevel_stats(stats, route_mode=route_mode)
 
                 if self.loss_state is not None:
                     update_loss_weights(self.loss_state, parts, stats)

@@ -13,6 +13,49 @@ import tensorflow as tf
 
 
 class TrainerMonitorMixin:
+    def _optimizer_with_learning_rate(self):
+        opt = getattr(self, "optimizer", None)
+        if opt is None:
+            return None
+        for candidate in (opt, getattr(opt, "inner_optimizer", None), getattr(opt, "optimizer", None)):
+            if candidate is not None and hasattr(candidate, "learning_rate"):
+                return candidate
+        return None
+
+    def _get_optimizer_learning_rate(self) -> float:
+        opt = self._optimizer_with_learning_rate()
+        if opt is None:
+            return float("nan")
+        lr = getattr(opt, "learning_rate", None)
+        if lr is None:
+            return float("nan")
+        try:
+            if hasattr(lr, "numpy"):
+                return float(lr.numpy())
+            return float(tf.keras.backend.get_value(lr))
+        except Exception:
+            try:
+                return float(lr)
+            except Exception:
+                return float("nan")
+
+    def _set_optimizer_learning_rate(self, value: float) -> float:
+        opt = self._optimizer_with_learning_rate()
+        if opt is None:
+            return float("nan")
+        lr = getattr(opt, "learning_rate", None)
+        if lr is None:
+            return float("nan")
+        lr_value = float(value)
+        try:
+            if hasattr(lr, "assign"):
+                lr.assign(lr_value)
+            else:
+                setattr(opt, "learning_rate", lr_value)
+        except Exception:
+            setattr(opt, "learning_rate", lr_value)
+        return self._get_optimizer_learning_rate()
+
     @staticmethod
     def _format_seconds(seconds: float) -> str:
         if seconds < 1e-3:
@@ -73,6 +116,16 @@ class TrainerMonitorMixin:
         for key in (
             "inner_fn_norm",
             "inner_ft_norm",
+            "inner_cone_violation",
+            "inner_max_penetration",
+            "inner_fallback_used",
+            "inner_converged",
+            "inner_skip_batch",
+            "inner_convergence_rate",
+            "inner_fallback_rate",
+            "inner_skip_rate",
+            "continuation_frozen",
+            "continuation_freeze_events",
             "ift_linear_residual",
             "grad_u_norm",
             "grad_sigma_norm",
@@ -255,6 +308,8 @@ class TrainerMonitorMixin:
             "E_reg": getattr(self.cfg.total_cfg, "w_reg", 0.0),
             "E_bi": getattr(self.cfg.total_cfg, "w_bi", 0.0),
             "E_ed": getattr(self.cfg.total_cfg, "w_ed", 0.0),
+            "E_data": getattr(self.cfg.total_cfg, "w_data", 0.0),
+            "E_smooth": getattr(self.cfg.total_cfg, "w_smooth", 0.0),
             "E_unc": getattr(self.cfg, "uncertainty_loss_weight", 0.0),
         }
         if self.loss_state is not None:
@@ -263,6 +318,12 @@ class TrainerMonitorMixin:
                     weights[key] = float(value)
                 except Exception:
                     weights[key] = value
+        overrides = getattr(self, "_active_weight_overrides", {}) or {}
+        for key, value in overrides.items():
+            try:
+                weights[key] = float(value)
+            except Exception:
+                weights[key] = value
         return weights
 
     @staticmethod
@@ -292,6 +353,8 @@ class TrainerMonitorMixin:
             ("E_eq", "Eeq"),
             ("E_reg", "Ereg"),
             ("E_ed", "Eed"),
+            ("E_data", "Edata"),
+            ("E_smooth", "Esm"),
             ("E_unc", "Eunc"),
         ]
         aliases = {
@@ -321,6 +384,7 @@ class TrainerMonitorMixin:
         rel_pi: float,
         rel_delta: Optional[float],
         order: Optional[np.ndarray] = None,
+        val_summary: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[Optional[str], str]:
         """Compose the detailed training log postfix for the outer progress bar.
 
@@ -396,6 +460,24 @@ class TrainerMonitorMixin:
                             continue
                 return best_val
 
+            def _get_stat_text(*keys: str) -> Optional[str]:
+                if not isinstance(stats, Mapping):
+                    return None
+                for key in keys:
+                    val = stats.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        if isinstance(val, tf.Tensor):
+                            if val.dtype == tf.string:
+                                return val.numpy().decode("utf-8")
+                            if val.shape.rank == 0:
+                                return str(val.numpy())
+                        return str(val)
+                    except Exception:
+                        continue
+                return None
+
             pen_ratio = _get_stat_float("n_pen_ratio", "cn_pen_ratio", "pen_ratio")
             stick_ratio = _get_stat_float("t_stick_ratio", "stick_ratio")
             slip_ratio = _get_stat_float("t_slip_ratio", "slip_ratio")
@@ -451,6 +533,74 @@ class TrainerMonitorMixin:
                 eq_terms.append(f"regrms={reg_rms:.4e}" if reg_rms is not None else "regrms=--")
             eq_disp = " ".join(eq_terms)
 
+            data_rms = _get_stat_float("data_rms")
+            data_mae = _get_stat_float("data_mae")
+            data_ref_rms = _get_stat_float("data_ref_rms")
+            data_rel_rms = _get_stat_float("data_rel_rms")
+            data_rel_mae = _get_stat_float("data_rel_mae")
+            data_smooth_rel_rms = _get_stat_float("data_smooth_rel_rms")
+            data_smooth_rms = _get_stat_float("data_smooth_rms")
+            data_eff_w = _get_stat_float("data_eff_w")
+            data_floor_active = _get_stat_float("data_floor_active")
+            data_terms: List[str] = []
+            if data_rms is not None:
+                data_terms.append(f"drms={data_rms:.4e}")
+            if data_mae is not None:
+                data_terms.append(f"dmae={data_mae:.4e}")
+            if data_ref_rms is not None:
+                data_terms.append(f"dref={data_ref_rms:.4e}")
+            if data_rel_rms is not None:
+                data_terms.append(f"drrms={data_rel_rms:.4e}")
+            if data_rel_mae is not None:
+                data_terms.append(f"drmae={data_rel_mae:.4e}")
+            if data_smooth_rel_rms is not None:
+                data_terms.append(f"smrms={data_smooth_rel_rms:.4e}")
+            elif data_smooth_rms is not None:
+                data_terms.append(f"smrms={data_smooth_rms:.4e}")
+            if data_eff_w is not None:
+                data_terms.append(f"dsmw={data_eff_w:.4e}")
+            if data_floor_active is not None:
+                data_terms.append(f"dsmf={int(data_floor_active > 0.5)}")
+            if isinstance(val_summary, Mapping):
+                val_drrms = val_summary.get("val_drrms_mean")
+                val_ratio = val_summary.get("val_ratio_median")
+                if val_drrms is not None:
+                    data_terms.append(f"vdr={float(val_drrms):.4e}")
+                if val_ratio is not None:
+                    data_terms.append(f"vrat={float(val_ratio):.4e}")
+            lr_val = self._get_optimizer_learning_rate()
+            if np.isfinite(lr_val):
+                data_terms.append(f"vlr={lr_val:.4e}")
+            data_disp = " ".join(data_terms)
+
+            strict_terms: List[str] = []
+            strict_route = _get_stat_text("strict_route_mode")
+            contact_backend = None
+            try:
+                contact_backend = self._resolve_contact_backend()
+            except Exception:
+                contact_backend = _get_stat_text("contact_backend")
+            inner_convergence_rate = _get_stat_float("inner_convergence_rate")
+            inner_fallback_rate = _get_stat_float("inner_fallback_rate")
+            inner_skip_rate = _get_stat_float("inner_skip_rate")
+            continuation_frozen = _get_stat_float("continuation_frozen")
+            continuation_freeze_events = _get_stat_float("continuation_freeze_events")
+            if strict_route:
+                strict_terms.append(f"smode={strict_route}")
+            if contact_backend:
+                strict_terms.append(f"cback={contact_backend}")
+            if inner_convergence_rate is not None:
+                strict_terms.append(f"iconv={inner_convergence_rate:.4e}")
+            if inner_fallback_rate is not None:
+                strict_terms.append(f"ifb={inner_fallback_rate:.4e}")
+            if inner_skip_rate is not None:
+                strict_terms.append(f"iskip={inner_skip_rate:.4e}")
+            if continuation_frozen is not None:
+                strict_terms.append(f"cfrz={int(continuation_frozen > 0.5)}")
+            if continuation_freeze_events is not None:
+                strict_terms.append(f"cfrze={int(round(continuation_freeze_events))}")
+            strict_disp = " ".join(strict_terms)
+
             # Von Mises 应力及屈服比（若提供 yield_strength）
             vm_phys_max = _get_stat_float("stress_vm_phys_max")
             vm_pred_max = _get_stat_float("stress_vm_pred_max")
@@ -498,7 +648,7 @@ class TrainerMonitorMixin:
             angle_txt = ",".join(f"{a:.4f}" for a in angles)
             postfix = (
                 f"theta=[{angle_txt}]{unit}{order_txt} Π={pin:.6e} | {parts_disp}{tight_txt} "
-                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {eq_disp} {vm_disp} {vm_ratio_disp}"
+                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {eq_disp} {data_disp} {strict_disp} {vm_disp} {vm_ratio_disp}"
             )
             return postfix, "已记录"
         except Exception:

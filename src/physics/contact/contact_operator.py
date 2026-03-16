@@ -36,6 +36,7 @@ import tensorflow as tf
 from .contact_normal_alm import NormalContactALM, NormalALMConfig
 from .contact_friction_alm import FrictionContactALM, FrictionALMConfig
 from .contact_inner_solver import ContactInnerState, ContactInnerResult, solve_contact_inner
+from .contact_inner_kernel_primitives import compose_contact_traction
 from physics.traction_utils import traction_from_sigma_voigt
 
 
@@ -82,6 +83,23 @@ class ContactOperator:
         - update_multipliers(u_fn, params=None)
         - multiply_weights(extra_w)  # runtime 再叠乘一层权重（比如 IRLS）
     """
+
+    BACKEND_LEGACY_ALM = "legacy_alm"
+    BACKEND_INNER_SOLVER = "inner_solver"
+    DEFAULT_BACKEND = BACKEND_LEGACY_ALM
+    VALID_BACKENDS = frozenset({BACKEND_LEGACY_ALM, BACKEND_INNER_SOLVER})
+
+    @classmethod
+    def resolve_backend(cls, backend: Optional[str] = None) -> str:
+        resolved = str(backend or cls.DEFAULT_BACKEND).strip().lower() or cls.DEFAULT_BACKEND
+        if resolved not in cls.VALID_BACKENDS:
+            valid = ", ".join(sorted(cls.VALID_BACKENDS))
+            raise ValueError(f"Unsupported contact backend '{resolved}'. Expected one of: {valid}.")
+        return resolved
+
+    @classmethod
+    def uses_inner_solver_backend(cls, backend: Optional[str] = None) -> bool:
+        return cls.resolve_backend(backend) == cls.BACKEND_INNER_SOLVER
 
     def __init__(self, cfg: Optional[ContactOperatorConfig] = None):
         self.cfg = cfg or ContactOperatorConfig()
@@ -345,6 +363,111 @@ class ContactOperator:
             return self.friction.last_slip()
         return None
 
+    def current_contact_frame(self) -> Dict[str, tf.Tensor]:
+        """Return the current batch geometry/basis tensors for strict mixed assembly."""
+
+        if not self._built:
+            raise RuntimeError("[ContactOperator] call build_from_cat() before requesting contact frame.")
+
+        meta = self._meta or {}
+        normals = self.normal.n if getattr(self.normal, "n", None) is not None else meta.get("n")
+        xs = self.normal.xs if getattr(self.normal, "xs", None) is not None else meta.get("xs")
+        xm = self.normal.xm if getattr(self.normal, "xm", None) is not None else meta.get("xm")
+        weights = self.normal.w if getattr(self.normal, "w", None) is not None else meta.get("w_area")
+        t1 = getattr(self.friction, "t1", None)
+        if t1 is None:
+            t1 = meta.get("t1")
+        t2 = getattr(self.friction, "t2", None)
+        if t2 is None:
+            t2 = meta.get("t2")
+
+        if normals is None or xs is None or xm is None or weights is None or t1 is None or t2 is None:
+            raise RuntimeError("[ContactOperator] current batch is missing strict mixed contact tensors.")
+
+        return {
+            "xs": tf.cast(xs, tf.float32),
+            "xm": tf.cast(xm, tf.float32),
+            "normals": tf.cast(normals, tf.float32),
+            "t1": tf.cast(t1, tf.float32),
+            "t2": tf.cast(t2, tf.float32),
+            "weights": tf.cast(weights, tf.float32),
+        }
+
+    def strict_mixed_inputs(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> Dict[str, tf.Tensor]:
+        """Build geometry-driven strict-mixed inner-solver inputs from the current batch."""
+
+        if not self._built:
+            raise RuntimeError("[ContactOperator] call build_from_cat() before strict_mixed_inputs().")
+
+        frame = self.current_contact_frame()
+        g_n = tf.cast(self.normal._gap(u_fn, params, u_nodes=u_nodes), tf.float32)
+        if self._friction_active():
+            ds_t = tf.cast(
+                self.friction._relative_slip_t(u_fn, params, u_nodes=u_nodes, update_cache=True),
+                tf.float32,
+            )
+            mu = tf.cast(self.friction.mu_f, tf.float32)
+            k_t = tf.cast(self.friction.k_t, tf.float32)
+        else:
+            ds_t = tf.zeros((tf.shape(frame["normals"])[0], 2), dtype=tf.float32)
+            mu = tf.cast(0.0, tf.float32)
+            k_t = tf.cast(0.0, tf.float32)
+
+        return {
+            "g_n": g_n,
+            "ds_t": ds_t,
+            "normals": frame["normals"],
+            "t1": frame["t1"],
+            "t2": frame["t2"],
+            "weights": frame["weights"],
+            "xs": frame["xs"],
+            "xm": frame["xm"],
+            "mu": mu,
+            "eps_n": tf.cast(getattr(self.normal.cfg, "fb_eps", 1.0e-8), tf.float32),
+            "k_t": k_t,
+        }
+
+    def solve_strict_inner(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        strict_inputs: Optional[Dict[str, tf.Tensor]] = None,
+        tol_n: float = 1.0e-5,
+        tol_t: float = 1.0e-5,
+        max_inner_iters: int = 8,
+        damping: float = 1.0,
+    ) -> ContactInnerResult:
+        """Solve strict mixed inner state from the current contact batch and cache warm start."""
+
+        if strict_inputs is None:
+            strict_inputs = self.strict_mixed_inputs(u_fn, params, u_nodes=u_nodes)
+        result = solve_contact_inner(
+            strict_inputs["g_n"],
+            strict_inputs["ds_t"],
+            strict_inputs["normals"],
+            strict_inputs["t1"],
+            strict_inputs["t2"],
+            mu=strict_inputs["mu"],
+            eps_n=strict_inputs["eps_n"],
+            k_t=strict_inputs["k_t"],
+            init_state=self._last_inner_state,
+            tol_n=tol_n,
+            tol_t=tol_t,
+            max_inner_iters=max_inner_iters,
+            damping=damping,
+        )
+        self._last_inner_state = ContactInnerState(
+            lambda_n=tf.identity(result.state.lambda_n),
+            lambda_t=tf.identity(result.state.lambda_t),
+            converged=False,
+            iters=0,
+            res_norm=0.0,
+            fallback_used=False,
+        )
+        return result
+
     def solve_inner_state(
         self,
         lambda_n: tf.Tensor,
@@ -355,16 +478,43 @@ class ContactOperator:
         *,
         force_fail: bool = False,
     ) -> ContactInnerResult:
-        """Solve (or fallback) one inner-contact state and return tractions."""
+        """Legacy compatibility wrapper for callers that still provide precomputed lambdas."""
 
-        result = solve_contact_inner(
-            lambda_n=lambda_n,
-            lambda_t=lambda_t,
-            normals=normals,
-            t1=t1,
-            t2=t2,
-            force_fail=force_fail,
-            last_feasible_state=self._last_inner_state,
+        lambda_n = tf.cast(lambda_n, tf.float32)
+        lambda_t = tf.cast(lambda_t, tf.float32)
+        normals = tf.cast(normals, tf.float32)
+        t1 = tf.cast(t1, tf.float32)
+        t2 = tf.cast(t2, tf.float32)
+
+        if force_fail and self._last_inner_state is not None:
+            state = ContactInnerState(
+                lambda_n=tf.cast(self._last_inner_state.lambda_n, tf.float32),
+                lambda_t=tf.cast(self._last_inner_state.lambda_t, tf.float32),
+                converged=False,
+                iters=0,
+                res_norm=float(getattr(self._last_inner_state, "res_norm", 0.0) or 0.0),
+                fallback_used=True,
+            )
+        else:
+            state = ContactInnerState(
+                lambda_n=lambda_n,
+                lambda_t=lambda_t,
+                converged=not force_fail,
+                iters=1,
+                res_norm=0.0,
+                fallback_used=False,
+            )
+
+        traction_vec = compose_contact_traction(state.lambda_n, state.lambda_t, normals, t1, t2)
+        result = ContactInnerResult(
+            state=state,
+            traction_vec=traction_vec,
+            traction_tangent=state.lambda_t,
+            diagnostics={
+                "fn_norm": tf.sqrt(tf.reduce_sum(tf.square(state.lambda_n))),
+                "ft_norm": tf.sqrt(tf.reduce_sum(tf.square(state.lambda_t))),
+                "fallback_used": tf.cast(1.0 if state.fallback_used else 0.0, tf.float32),
+            },
         )
         if result.state.converged and not result.state.fallback_used:
             self._last_inner_state = ContactInnerState(

@@ -17,6 +17,7 @@ from physics.contact.contact_operator import (
 )
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig, traction_bc_residual
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig
+from physics.traction_utils import normal_tangential_components
 
 
 def compute_incremental_ed_penalty(
@@ -71,7 +72,10 @@ class TotalConfig:
     w_bi: float = 0.0
     w_ed: float = 0.0
     w_unc: float = 0.0
+    w_data: float = 0.0
+    w_smooth: float = 0.0
     sigma_ref: float = 1.0
+    data_smoothing_k: int = 0
     path_penalty_weight: float = 1.0
     fric_path_penalty_weight: float = 1.0
     ed_enabled: bool = False
@@ -85,6 +89,26 @@ class TotalConfig:
 
 
 class TotalEnergy:
+    STRICT_MIXED_ACTIVE_KEYS = (
+        "E_cn",
+        "E_ct",
+        "E_eq",
+        "E_bc",
+        "E_tight",
+        "E_data",
+        "E_smooth",
+        "E_unc",
+        "E_reg",
+    )
+    STRICT_MIXED_ZERO_KEYS = (
+        "E_int",
+        "E_sigma",
+        "E_bi",
+        "E_ed",
+        "path_penalty_total",
+        "fric_path_penalty_total",
+    )
+
     def __init__(self, cfg: Optional[TotalConfig] = None):
         self.cfg = cfg or TotalConfig()
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
@@ -94,6 +118,13 @@ class TotalEnergy:
         self.tightening: Optional[NutTighteningPenalty] = None
         self._ensure_weight_vars()
         self._built = False
+        self.mixed_bilevel_flags = {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+        self._strict_mixed_last_active = False
 
     def _ensure_weight_vars(self):
         if not hasattr(self, "w_int"):
@@ -118,6 +149,10 @@ class TotalEnergy:
             self.w_ed = tf.Variable(getattr(self.cfg, "w_ed", 0.0), dtype=self.dtype, trainable=False, name="w_ed")
         if not hasattr(self, "w_unc"):
             self.w_unc = tf.Variable(getattr(self.cfg, "w_unc", 0.0), dtype=self.dtype, trainable=False, name="w_unc")
+        if not hasattr(self, "w_data"):
+            self.w_data = tf.Variable(getattr(self.cfg, "w_data", 0.0), dtype=self.dtype, trainable=False, name="w_data")
+        if not hasattr(self, "w_smooth"):
+            self.w_smooth = tf.Variable(getattr(self.cfg, "w_smooth", 0.0), dtype=self.dtype, trainable=False, name="w_smooth")
 
     def _loss_mode(self) -> str:
         mode = str(getattr(self.cfg, "loss_mode", "energy") or "energy").strip().lower()
@@ -138,6 +173,232 @@ class TotalEnergy:
         if callable(alt):
             return alt
         return fn
+
+    def set_mixed_bilevel_flags(self, flags: Optional[Dict[str, object]] = None):
+        """Attach trainer-resolved mixed-bilevel phase flags to this total-energy assembly."""
+
+        merged = {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+        if isinstance(flags, dict):
+            merged.update(flags)
+        self.mixed_bilevel_flags = merged
+        self._strict_mixed_last_active = False
+
+    def _strict_mixed_requested(self) -> bool:
+        phase_name = str(self.mixed_bilevel_flags.get("phase_name", "phase0") or "phase0").strip().lower()
+        return phase_name not in {"", "phase0"}
+
+    def _strict_mixed_skip_stats(self, reason: str) -> Dict[str, tf.Tensor]:
+        return {
+            "mixed_strict_active": tf.cast(0.0, self.dtype),
+            "mixed_strict_skipped": tf.cast(1.0, self.dtype),
+            "inner_converged": tf.cast(0.0, self.dtype),
+            "inner_skip_batch": tf.cast(1.0, self.dtype),
+            "skip_batch": tf.cast(1.0, self.dtype),
+            "inner_fallback_used": tf.cast(0.0, self.dtype),
+            "mixed_strict_skip_reason": tf.constant(str(reason), dtype=tf.string),
+        }
+
+    def _strict_mixed_contact_terms(
+        self,
+        u_fn,
+        params,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+        stress_fn=None,
+    ) -> Tuple[bool, Dict[str, tf.Tensor], Dict[str, tf.Tensor]]:
+        dtype = self.dtype
+        zero = tf.cast(0.0, dtype)
+
+        if self.contact is None or not self._strict_mixed_requested():
+            self._strict_mixed_last_active = False
+            return False, {}, {}
+
+        stress_fn_contact = self._resolve_bound_variant(stress_fn, "us_fn_pointwise")
+        if stress_fn_contact is None:
+            self._strict_mixed_last_active = False
+            return False, {}, self._strict_mixed_skip_stats("stress_fn_missing")
+        if not hasattr(self.contact, "strict_mixed_inputs") or not hasattr(self.contact, "solve_strict_inner"):
+            self._strict_mixed_last_active = False
+            return False, {}, self._strict_mixed_skip_stats("strict_contact_adapter_missing")
+
+        strict_inputs = self.contact.strict_mixed_inputs(u_fn, params, u_nodes=u_nodes)
+        inner_result = self.contact.solve_strict_inner(
+            u_fn,
+            params,
+            u_nodes=u_nodes,
+            strict_inputs=strict_inputs,
+        )
+        detach_inner = bool(self.mixed_bilevel_flags.get("detach_inner_solution", True))
+
+        lambda_n = tf.cast(inner_result.state.lambda_n, dtype)
+        lambda_t = tf.cast(inner_result.state.lambda_t, dtype)
+        traction_vec = tf.cast(inner_result.traction_vec, dtype)
+        ds_t = tf.cast(strict_inputs["ds_t"], dtype)
+        if detach_inner:
+            lambda_n = tf.stop_gradient(lambda_n)
+            lambda_t = tf.stop_gradient(lambda_t)
+            traction_vec = tf.stop_gradient(traction_vec)
+            ds_t = tf.stop_gradient(ds_t)
+
+        _, sigma_s = stress_fn_contact(strict_inputs["xs"], params)
+        _, sigma_m = stress_fn_contact(strict_inputs["xm"], params)
+        sigma_s = tf.cast(sigma_s, dtype)
+        sigma_m = tf.cast(sigma_m, dtype)
+
+        basis = tf.stack([strict_inputs["t1"], strict_inputs["t2"]], axis=1)
+        inner_for_match = type("StrictInnerMatch", (), {"traction_vec": traction_vec})()
+        rs, rm = traction_matching_residual(
+            sigma_s,
+            sigma_m,
+            strict_inputs["normals"],
+            strict_inputs["t1"],
+            strict_inputs["t2"],
+            inner_for_match,
+        )
+        rs = tf.cast(rs, dtype)
+        rm = tf.cast(rm, dtype)
+
+        rs_n, rs_t = normal_tangential_components(rs, strict_inputs["normals"], basis)
+        rm_n, rm_t = normal_tangential_components(rm, strict_inputs["normals"], basis)
+        rs_n = tf.squeeze(tf.cast(rs_n, dtype), axis=-1)
+        rm_n = tf.squeeze(tf.cast(rm_n, dtype), axis=-1)
+        rs_t = tf.cast(rs_t, dtype)
+        rm_t = tf.cast(rm_t, dtype)
+
+        weights = tf.cast(strict_inputs["weights"], dtype)
+        denom = tf.reduce_sum(weights) + tf.cast(1.0e-12, dtype)
+        rn_sq = tf.square(rs_n) + tf.square(rm_n)
+        rt_sq = tf.reduce_sum(tf.square(rs_t), axis=1) + tf.reduce_sum(tf.square(rm_t), axis=1)
+        e_cn = tf.reduce_sum(weights * rn_sq) / (2.0 * denom)
+        e_ct = tf.reduce_sum(weights * rt_sq) / (2.0 * denom)
+
+        rt_norm = tf.sqrt(tf.reduce_sum(tf.square(rs_t), axis=1) + tf.cast(1.0e-12, dtype))
+        rm_t_norm = tf.sqrt(tf.reduce_sum(tf.square(rm_t), axis=1) + tf.cast(1.0e-12, dtype))
+        r_contact = tf.reduce_sum(weights * 0.5 * (tf.abs(rs_n) + tf.abs(rm_n)))
+        r_fric = tf.reduce_sum(weights * 0.5 * (rt_norm + rm_t_norm))
+
+        mu = tf.cast(strict_inputs["mu"], dtype)
+        eps_bi = tf.cast(1.0e-8, dtype)
+        st_norm = tf.sqrt(tf.reduce_sum(tf.square(ds_t), axis=1) + eps_bi)
+        bi_raw = mu * tf.maximum(lambda_n, tf.cast(0.0, dtype)) * st_norm - tf.reduce_sum(lambda_t * ds_t, axis=1)
+        bi_pos = tf.nn.relu(bi_raw)
+        e_bi = tf.reduce_sum(weights * bi_pos * bi_pos) / denom
+
+        diagnostics = dict(inner_result.diagnostics)
+        fn_norm = tf.cast(diagnostics.get("fn_norm", zero), dtype)
+        ft_norm = tf.cast(diagnostics.get("ft_norm", zero), dtype)
+        cone_violation = tf.cast(diagnostics.get("cone_violation", zero), dtype)
+        max_penetration = tf.cast(diagnostics.get("max_penetration", zero), dtype)
+        fallback_used = tf.cast(diagnostics.get("fallback_used", zero), dtype)
+        converged = tf.cast(diagnostics.get("converged", tf.cast(1.0, dtype) - fallback_used), dtype)
+
+        parts = {
+            "E_cn": e_cn,
+            "E_ct": e_ct,
+            "E_bi": e_bi,
+            "R_contact_comp": r_contact,
+            "R_fric_comp": r_fric,
+        }
+        stats = {
+            "mixed_strict_active": tf.cast(1.0, dtype),
+            "mixed_strict_skipped": tf.cast(0.0, dtype),
+            "fn_norm": fn_norm,
+            "ft_norm": ft_norm,
+            "cone_violation": cone_violation,
+            "max_penetration": max_penetration,
+            "fallback_used": fallback_used,
+            "converged": converged,
+            "skip_batch": tf.cast(0.0, dtype),
+            "inner_converged": converged,
+            "inner_skip_batch": tf.cast(0.0, dtype),
+            "inner_fn_norm": fn_norm,
+            "inner_ft_norm": ft_norm,
+            "inner_cone_violation": cone_violation,
+            "inner_max_penetration": max_penetration,
+            "inner_fallback_used": fallback_used,
+            "R_contact_comp": r_contact,
+            "R_fric_comp": r_fric,
+            "traction_match_n_rms": tf.sqrt(e_cn + tf.cast(1.0e-20, dtype)),
+            "traction_match_t_rms": tf.sqrt(e_ct + tf.cast(1.0e-20, dtype)),
+        }
+        self._strict_mixed_last_active = True
+        return True, parts, stats
+
+    def _compute_data_smoothing_terms(
+        self,
+        X_obs: tf.Tensor,
+        U_pred: tf.Tensor,
+        data_ref_rms: tf.Tensor,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+        dtype = self.dtype
+        zero = tf.cast(0.0, dtype)
+        k = int(getattr(self.cfg, "data_smoothing_k", 0) or 0)
+        if k <= 0 or float(getattr(self.cfg, "w_smooth", 0.0) or 0.0) <= 0.0:
+            return zero, {}
+
+        X_obs = tf.cast(tf.reshape(X_obs, (-1, tf.shape(X_obs)[-1])), dtype)
+        U_pred = tf.cast(tf.reshape(U_pred, (-1, tf.shape(U_pred)[-1])), dtype)
+        n_static = X_obs.shape[0]
+        if n_static is not None and int(n_static) <= 1:
+            return zero, {}
+        if n_static is not None:
+            k = min(k, max(int(n_static) - 1, 1))
+        if k <= 0:
+            return zero, {}
+
+        x2 = tf.reduce_sum(tf.square(X_obs), axis=1, keepdims=True)
+        dist2 = x2 - 2.0 * tf.matmul(X_obs, X_obs, transpose_b=True) + tf.transpose(x2)
+        dist2 = tf.maximum(dist2, tf.cast(0.0, dtype))
+        n = tf.shape(dist2)[0]
+        dist2 = dist2 + tf.eye(n, dtype=dtype) * tf.cast(1.0e30, dtype)
+        _, nbr_idx = tf.math.top_k(-dist2, k=k)
+        nbr_u = tf.gather(U_pred, nbr_idx)
+        nbr_mean = tf.reduce_mean(nbr_u, axis=1)
+        smooth_res = U_pred - nbr_mean
+        smooth_rel = smooth_res / tf.maximum(data_ref_rms, tf.cast(1.0e-12, dtype))
+        loss = tf.reduce_mean(tf.square(smooth_rel))
+        stats = {
+            "data_smooth_rms": tf.sqrt(tf.reduce_mean(tf.square(smooth_res)) + tf.cast(1.0e-20, dtype)),
+            "data_smooth_rel_rms": tf.sqrt(tf.reduce_mean(tf.square(smooth_rel)) + tf.cast(1.0e-20, dtype)),
+        }
+        return loss, stats
+
+    def _compute_data_supervision_terms(self, u_fn, params) -> Tuple[tf.Tensor, tf.Tensor, Dict[str, tf.Tensor]]:
+        dtype = self.dtype
+        zero = tf.cast(0.0, dtype)
+        if not isinstance(params, dict):
+            return zero, zero, {}
+
+        X_obs = params.get("X_obs")
+        U_obs = params.get("U_obs")
+        if X_obs is None or U_obs is None:
+            return zero, zero, {}
+
+        X_obs = tf.cast(tf.convert_to_tensor(X_obs), dtype)
+        U_obs = tf.cast(tf.convert_to_tensor(U_obs), dtype)
+
+        U_pred = tf.cast(u_fn(X_obs, params), dtype)
+        diff = U_pred - U_obs
+        data_ref_rms = tf.sqrt(tf.reduce_mean(tf.square(U_obs)) + tf.cast(1.0e-20, dtype))
+        data_ref_rms = tf.maximum(data_ref_rms, tf.cast(1.0e-12, dtype))
+        diff_rel = diff / data_ref_rms
+        loss = tf.reduce_mean(tf.square(diff_rel))
+        loss_smooth, smooth_stats = self._compute_data_smoothing_terms(X_obs, U_pred, data_ref_rms)
+        stats = {
+            "data_rms": tf.sqrt(tf.reduce_mean(tf.square(diff)) + tf.cast(1.0e-20, dtype)),
+            "data_mae": tf.reduce_mean(tf.abs(diff)),
+            "data_ref_rms": data_ref_rms,
+            "data_rel_rms": tf.sqrt(tf.reduce_mean(tf.square(diff_rel)) + tf.cast(1.0e-20, dtype)),
+            "data_rel_mae": tf.reduce_mean(tf.abs(diff_rel)),
+            "data_n_obs": tf.cast(tf.shape(X_obs)[0], dtype),
+        }
+        stats.update(smooth_stats)
+        return loss, loss_smooth, stats
 
     def attach(self, elasticity: Optional[ElasticityResidual] = None,
                contact: Optional[ContactOperator] = None,
@@ -185,7 +446,29 @@ class TotalEnergy:
         parts, stats = self._compute_parts(u_fn, params or {}, tape, stress_fn=stress_fn)
         Pi = self._combine_parts(parts)
         return Pi, parts, stats
-    def _compute_parts(self, u_fn, params, tape=None, stress_fn=None):
+
+    def strict_mixed_objective(self, u_fn, params=None, tape=None, stress_fn=None):
+        self._ensure_weight_vars()
+        if not self._built:
+            raise RuntimeError("[TotalEnergy] attach(...) must be called before strict_mixed_objective().")
+        params = params or {}
+        if isinstance(params, dict) and params.get("stages"):
+            Pi, parts, stats = self._residual_staged(u_fn, params["stages"], params, tape, stress_fn=stress_fn)
+        else:
+            parts, stats = self._compute_parts_residual(
+                u_fn,
+                params,
+                tape,
+                stress_fn=stress_fn,
+                allow_legacy_contact_fallback=False,
+            )
+            Pi = self._combine_parts_with_keys(parts, self.STRICT_MIXED_ACTIVE_KEYS)
+        for key in self.STRICT_MIXED_ZERO_KEYS:
+            if key in parts:
+                parts[key] = tf.cast(0.0, self.dtype)
+        return Pi, parts, stats
+
+    def _compute_parts(self, u_fn, params, tape=None, stress_fn=None, *, allow_legacy_contact_fallback: bool = True):
         dtype = self.dtype
         zero = tf.cast(0.0, dtype)
         parts: Dict[str, tf.Tensor] = {
@@ -200,6 +483,8 @@ class TotalEnergy:
             "E_bi": zero,
             "E_ed": zero,
             "E_unc": zero,
+            "E_data": zero,
+            "E_smooth": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
 
@@ -224,23 +509,36 @@ class TotalEnergy:
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
         if self.contact is not None:
-            _, cparts, stats_cn, stats_ct = self.contact.energy(u_fn, params, u_nodes=u_nodes)
-            if "E_cn" in cparts:
-                parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
-            elif "E_n" in cparts:
-                parts["E_cn"] = tf.cast(cparts["E_n"], dtype)
-            if "E_ct" in cparts:
-                parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
-            elif "E_t" in cparts:
-                parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
-            stats.update(stats_cn)
-            stats.update(stats_ct)
-            if "R_fric_comp" in stats_ct:
-                parts["R_fric_comp"] = tf.cast(stats_ct["R_fric_comp"], dtype)
-            if "R_contact_comp" in stats_cn:
-                parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
-            if "E_bi" in stats_ct:
-                parts["E_bi"] = tf.cast(stats_ct["E_bi"], dtype)
+            strict_requested = self._strict_mixed_requested()
+            strict_active, strict_parts, strict_stats = self._strict_mixed_contact_terms(
+                u_fn,
+                params,
+                u_nodes=u_nodes,
+                stress_fn=stress_fn,
+            )
+            stats.update(strict_stats)
+            if strict_active:
+                for key in ("E_cn", "E_ct", "E_bi", "R_fric_comp", "R_contact_comp"):
+                    if key in strict_parts:
+                        parts[key] = tf.cast(strict_parts[key], dtype)
+            elif (not strict_requested) or allow_legacy_contact_fallback:
+                _, cparts, stats_cn, stats_ct = self.contact.energy(u_fn, params, u_nodes=u_nodes)
+                if "E_cn" in cparts:
+                    parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
+                elif "E_n" in cparts:
+                    parts["E_cn"] = tf.cast(cparts["E_n"], dtype)
+                if "E_ct" in cparts:
+                    parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
+                elif "E_t" in cparts:
+                    parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
+                stats.update(stats_cn)
+                stats.update(stats_ct)
+                if "R_fric_comp" in stats_ct:
+                    parts["R_fric_comp"] = tf.cast(stats_ct["R_fric_comp"], dtype)
+                if "R_contact_comp" in stats_cn:
+                    parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
+                if "E_bi" in stats_ct:
+                    parts["E_bi"] = tf.cast(stats_ct["E_bi"], dtype)
 
         if self.bcs:
             bc_terms = []
@@ -255,6 +553,11 @@ class TotalEnergy:
             E_tight, tstats = self.tightening.energy(u_fn, params, u_nodes=u_nodes)
             parts["E_tight"] = tf.cast(E_tight, dtype)
             stats.update(tstats)
+
+        E_data, E_smooth, data_stats = self._compute_data_supervision_terms(u_fn, params)
+        parts["E_data"] = tf.cast(E_data, dtype)
+        parts["E_smooth"] = tf.cast(E_smooth, dtype)
+        stats.update(data_stats)
 
         w_sigma = float(getattr(self.cfg, "w_sigma", 0.0))
         w_eq = float(getattr(self.cfg, "w_eq", 0.0))
@@ -337,7 +640,15 @@ class TotalEnergy:
 
         return parts, stats
 
-    def _compute_parts_residual(self, u_fn, params, tape=None, stress_fn=None):
+    def _compute_parts_residual(
+        self,
+        u_fn,
+        params,
+        tape=None,
+        stress_fn=None,
+        *,
+        allow_legacy_contact_fallback: bool = True,
+    ):
         dtype = self.dtype
         zero = tf.cast(0.0, dtype)
         parts: Dict[str, tf.Tensor] = {
@@ -352,6 +663,8 @@ class TotalEnergy:
             "E_bi": zero,
             "E_ed": zero,
             "E_unc": zero,
+            "E_data": zero,
+            "E_smooth": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
 
@@ -379,23 +692,36 @@ class TotalEnergy:
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
         if self.contact is not None:
-            _, cparts, stats_cn, stats_ct = self.contact.residual(u_fn, params, u_nodes=u_nodes)
-            if "E_cn" in cparts:
-                parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
-            elif "E_n" in cparts:
-                parts["E_cn"] = tf.cast(cparts["E_n"], dtype)
-            if "E_ct" in cparts:
-                parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
-            elif "E_t" in cparts:
-                parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
-            stats.update(stats_cn)
-            stats.update(stats_ct)
-            if "R_fric_comp" in stats_ct:
-                parts["R_fric_comp"] = tf.cast(stats_ct["R_fric_comp"], dtype)
-            if "R_contact_comp" in stats_cn:
-                parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
-            if "E_bi" in stats_ct:
-                parts["E_bi"] = tf.cast(stats_ct["E_bi"], dtype)
+            strict_requested = self._strict_mixed_requested()
+            strict_active, strict_parts, strict_stats = self._strict_mixed_contact_terms(
+                u_fn,
+                params,
+                u_nodes=u_nodes,
+                stress_fn=stress_fn,
+            )
+            stats.update(strict_stats)
+            if strict_active:
+                for key in ("E_cn", "E_ct", "E_bi", "R_fric_comp", "R_contact_comp"):
+                    if key in strict_parts:
+                        parts[key] = tf.cast(strict_parts[key], dtype)
+            elif (not strict_requested) or allow_legacy_contact_fallback:
+                _, cparts, stats_cn, stats_ct = self.contact.residual(u_fn, params, u_nodes=u_nodes)
+                if "E_cn" in cparts:
+                    parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
+                elif "E_n" in cparts:
+                    parts["E_cn"] = tf.cast(cparts["E_n"], dtype)
+                if "E_ct" in cparts:
+                    parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
+                elif "E_t" in cparts:
+                    parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
+                stats.update(stats_cn)
+                stats.update(stats_ct)
+                if "R_fric_comp" in stats_ct:
+                    parts["R_fric_comp"] = tf.cast(stats_ct["R_fric_comp"], dtype)
+                if "R_contact_comp" in stats_cn:
+                    parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
+                if "E_bi" in stats_ct:
+                    parts["E_bi"] = tf.cast(stats_ct["E_bi"], dtype)
 
         if self.bcs:
             bc_terms = []
@@ -410,6 +736,11 @@ class TotalEnergy:
             E_tight, tstats = self.tightening.residual(u_fn, params, u_nodes=u_nodes)
             parts["E_tight"] = tf.cast(E_tight, dtype)
             stats.update(tstats)
+
+        E_data, E_smooth, data_stats = self._compute_data_supervision_terms(u_fn, params)
+        parts["E_data"] = tf.cast(E_data, dtype)
+        parts["E_smooth"] = tf.cast(E_smooth, dtype)
+        stats.update(data_stats)
 
         use_stress = stress_fn_elastic is not None and elastic_cache is not None
         use_sigma = use_stress and w_sigma > 1e-15 and stress_weight > 0.0
@@ -521,11 +852,36 @@ class TotalEnergy:
             + self.w_bi * parts.get("E_bi", tf.cast(0.0, self.dtype))
             + self.w_ed * parts.get("E_ed", tf.cast(0.0, self.dtype))
             + self.w_unc * parts.get("E_unc", tf.cast(0.0, self.dtype))
+            + self.w_data * parts.get("E_data", tf.cast(0.0, self.dtype))
+            + self.w_smooth * parts.get("E_smooth", tf.cast(0.0, self.dtype))
         )
+
+    def _combine_parts_with_keys(self, parts: Dict[str, tf.Tensor], active_keys) -> tf.Tensor:
+        active = set(active_keys or ())
+        combined = tf.cast(0.0, self.dtype)
+        for key, weight in (
+            ("E_int", self.w_int),
+            ("E_cn", self.w_cn),
+            ("E_ct", self.w_ct),
+            ("E_bc", self.w_bc),
+            ("E_tight", self.w_tight),
+            ("E_sigma", self.w_sigma),
+            ("E_eq", self.w_eq),
+            ("E_reg", self.w_reg),
+            ("E_bi", self.w_bi),
+            ("E_ed", self.w_ed),
+            ("E_unc", self.w_unc),
+            ("E_data", self.w_data),
+            ("E_smooth", self.w_smooth),
+        ):
+            if key not in active:
+                continue
+            combined = combined + weight * parts.get(key, tf.cast(0.0, self.dtype))
+        return combined
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc"]
+        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc", "E_data", "E_smooth"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -538,6 +894,8 @@ class TotalEnergy:
             stage_tensor_rank = stages.get("stage_rank")
             stage_tensor_mask = stages.get("stage_mask")
             stage_tensor_last = stages.get("stage_last")
+            stage_tensor_x_obs = stages.get("X_obs")
+            stage_tensor_u_obs = stages.get("U_obs")
             if stage_tensor_P is None or stage_tensor_feat is None:
                 stage_seq: List[Dict[str, tf.Tensor]] = []
             else:
@@ -550,6 +908,12 @@ class TotalEnergy:
                 stacked_last = None
                 if stage_tensor_last is not None:
                     stacked_last = tf.convert_to_tensor(stage_tensor_last)
+                stacked_x_obs = None
+                if stage_tensor_x_obs is not None:
+                    stacked_x_obs = tf.convert_to_tensor(stage_tensor_x_obs)
+                stacked_u_obs = None
+                if stage_tensor_u_obs is not None:
+                    stacked_u_obs = tf.convert_to_tensor(stage_tensor_u_obs)
                 stage_seq = []
                 for idx, (p, z) in enumerate(zip(tf.unstack(stage_tensor_P, axis=0), tf.unstack(stage_tensor_feat, axis=0))):
                     entry = {"P": p, "P_hat": z}
@@ -559,6 +923,10 @@ class TotalEnergy:
                         entry["stage_mask"] = stacked_mask[idx]
                     if stacked_last is not None:
                         entry["stage_last"] = stacked_last[idx]
+                    if stacked_x_obs is not None:
+                        entry["X_obs"] = stacked_x_obs[idx]
+                    if stacked_u_obs is not None:
+                        entry["U_obs"] = stacked_u_obs[idx]
                     stage_seq.append(entry)
         else:
             stage_seq = []
@@ -681,7 +1049,7 @@ class TotalEnergy:
 
     def _residual_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc"]
+        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc", "E_data", "E_smooth"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -694,6 +1062,8 @@ class TotalEnergy:
             stage_tensor_rank = stages.get("stage_rank")
             stage_tensor_mask = stages.get("stage_mask")
             stage_tensor_last = stages.get("stage_last")
+            stage_tensor_x_obs = stages.get("X_obs")
+            stage_tensor_u_obs = stages.get("U_obs")
             if stage_tensor_P is None or stage_tensor_feat is None:
                 stage_seq: List[Dict[str, tf.Tensor]] = []
             else:
@@ -706,6 +1076,12 @@ class TotalEnergy:
                 stacked_last = None
                 if stage_tensor_last is not None:
                     stacked_last = tf.convert_to_tensor(stage_tensor_last)
+                stacked_x_obs = None
+                if stage_tensor_x_obs is not None:
+                    stacked_x_obs = tf.convert_to_tensor(stage_tensor_x_obs)
+                stacked_u_obs = None
+                if stage_tensor_u_obs is not None:
+                    stacked_u_obs = tf.convert_to_tensor(stage_tensor_u_obs)
                 stage_seq = []
                 for idx, (p, z) in enumerate(zip(tf.unstack(stage_tensor_P, axis=0), tf.unstack(stage_tensor_feat, axis=0))):
                     entry = {"P": p, "P_hat": z}
@@ -715,6 +1091,10 @@ class TotalEnergy:
                         entry["stage_mask"] = stacked_mask[idx]
                     if stacked_last is not None:
                         entry["stage_last"] = stacked_last[idx]
+                    if stacked_x_obs is not None:
+                        entry["X_obs"] = stacked_x_obs[idx]
+                    if stacked_u_obs is not None:
+                        entry["U_obs"] = stacked_u_obs[idx]
                     stage_seq.append(entry)
         else:
             stage_seq = []
@@ -840,7 +1220,7 @@ class TotalEnergy:
                         staged_updates.append(entry)
                         target_params = entry
 
-        if self.contact is not None:
+        if self.contact is not None and not self._strict_mixed_last_active:
             if staged_updates:
                 for st_params in staged_updates:
                     u_nodes = None

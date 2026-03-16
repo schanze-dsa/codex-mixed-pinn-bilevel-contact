@@ -23,6 +23,48 @@ class MixedBilevelPhaseConfig:
 
 
 @dataclass
+class SupervisionConfig:
+    enabled: bool = False
+    case_table_path: Optional[str] = None
+    stage_dir: Optional[str] = None
+    stage_count: int = 3
+    split_group_key: str = "base_id"
+    split_stratify_key: Optional[str] = "source"
+    test_group_quotas: Dict[str, int] = field(
+        default_factory=lambda: {
+            "boundary": 1,
+            "corner": 1,
+            "interior": 3,
+        }
+    )
+    cv_n_folds: int = 5
+    cv_fold_index: int = 0
+    train_splits: Tuple[str, ...] = ("train",)
+    eval_splits: Tuple[str, ...] = ("val",)
+    export_eval_reports: bool = True
+    export_eval_plots: bool = True
+    shuffle: bool = True
+    seed: int = 42
+
+
+@dataclass
+class TwoStagePhaseConfig:
+    max_steps: Optional[int] = None
+    lr: Optional[float] = None
+    save_best_on: Optional[str] = None
+    validation_eval_every: Optional[int] = None
+    supervision_contribution_floor_ratio: Optional[float] = None
+    base_weights: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class TwoStageTrainingConfig:
+    enabled: bool = False
+    phase1: TwoStagePhaseConfig = field(default_factory=TwoStagePhaseConfig)
+    phase2: TwoStagePhaseConfig = field(default_factory=TwoStagePhaseConfig)
+
+
+@dataclass
 class TrainerConfig:
     inp_path: str = "data/shuangfan.inp"
     mirror_surface_name: str = "MIRROR up"
@@ -77,6 +119,7 @@ class TrainerConfig:
 
     preload_use_stages: bool = True
     preload_randomize_order: bool = False
+    preload_append_release_stage: bool = True
 
     incremental_mode: bool = True
     stage_inner_steps: int = 1
@@ -84,6 +127,7 @@ class TrainerConfig:
     reset_contact_state_per_case: bool = True
     stage_schedule_steps: List[int] = field(default_factory=list)
     mixed_bilevel_phase: MixedBilevelPhaseConfig = field(default_factory=MixedBilevelPhaseConfig)
+    contact_backend: str = "auto"
     continuation_eps_shrink_cap: float = 0.7
     continuation_kt_growth_cap: float = 1.3
 
@@ -106,6 +150,10 @@ class TrainerConfig:
             w_reg=1.0e-4,
         )
     )
+    supervision: SupervisionConfig = field(default_factory=SupervisionConfig)
+    two_stage_training: TwoStageTrainingConfig = field(default_factory=TwoStageTrainingConfig)
+    resume_ckpt_path: Optional[str] = None
+    run_phase_name: Optional[str] = None
 
     loss_adaptive_enabled: bool = True
     loss_update_every: int = 1
@@ -116,12 +164,15 @@ class TrainerConfig:
     loss_max_weight: Optional[float] = None
     loss_gamma: float = 2.0
     loss_focus_terms: Tuple[str, ...] = field(default_factory=tuple)
+    supervision_contribution_floor_enabled: bool = False
+    supervision_contribution_floor_ratio: float = 0.0
 
     max_steps: int = 1000
     adam_steps: Optional[int] = None
     lr: float = 1e-3
     grad_clip_norm: Optional[float] = 1.0
     log_every: int = 1
+    validation_eval_every: int = 0
     alm_update_every: int = 0
     early_exit_enabled: bool = True
     early_exit_warmup_steps: int = 200
@@ -136,6 +187,12 @@ class TrainerConfig:
     uncertainty_proxy_scale: float = 1.0
     uncertainty_logvar_min: float = -8.0
     uncertainty_logvar_max: float = 6.0
+    val_plateau_lr_decay_enabled: bool = False
+    val_plateau_lr_decay_metric: str = "val_drrms"
+    val_plateau_lr_decay_warmup: int = 0
+    val_plateau_lr_decay_patience: int = 0
+    val_plateau_lr_decay_factor: float = 0.5
+    val_plateau_lr_decay_min_lr: float = 1.0e-6
 
     build_bar_color: Optional[str] = "cyan"
     train_bar_color: Optional[str] = "cyan"
@@ -194,6 +251,11 @@ class TrainerConfig:
     viz_skip_release_stage_plot: bool = False
     viz_compare_cmap: str = "coolwarm"
     viz_compare_common_scale: bool = True
+    viz_supervision_compare_enabled: bool = False
+    viz_supervision_compare_split: str = "test"
+    viz_supervision_compare_sources: Tuple[str, ...] = ("boundary", "corner", "interior")
+    viz_same_pipeline_supervision_debug: bool = False
+    viz_export_final_and_best: bool = False
     save_best_on: str = "Pi"
 
     yield_strength: Optional[float] = None

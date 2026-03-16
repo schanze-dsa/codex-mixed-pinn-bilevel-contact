@@ -25,6 +25,8 @@ import re
 import atexit
 import argparse
 import math
+import copy
+from dataclasses import dataclass
 from datetime import datetime
 import yaml  # 新增：读取 config.yaml
 
@@ -108,6 +110,96 @@ def _default_saved_model_dir(out_dir: str) -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     return os.path.join(base, f"saved_model_{ts}")
 
+
+@dataclass
+class _TrainingPhaseResult:
+    phase_name: str
+    trainer: object
+    best_ckpt_path: str = ""
+    final_ckpt_path: str = ""
+    out_dir: str = ""
+    ckpt_dir: str = ""
+    export_dir: str = ""
+
+
+def _derive_phase_config(base_cfg: "TrainerConfig", phase_name: str) -> "TrainerConfig":
+    """Clone the parsed trainer config and apply one two-stage phase override."""
+
+    phase_key = str(phase_name or "").strip().lower()
+    if phase_key not in {"phase1", "phase2"}:
+        raise ValueError(f"Unsupported two-stage phase: {phase_name!r}")
+
+    cfg = copy.deepcopy(base_cfg)
+    phase_override = getattr(cfg.two_stage_training, phase_key)
+
+    if phase_override.max_steps is not None:
+        cfg.max_steps = int(phase_override.max_steps)
+        cfg.adam_steps = int(phase_override.max_steps)
+    if phase_override.lr is not None:
+        cfg.lr = float(phase_override.lr)
+    if phase_override.save_best_on is not None:
+        cfg.save_best_on = str(phase_override.save_best_on)
+    if phase_override.validation_eval_every is not None:
+        cfg.validation_eval_every = int(phase_override.validation_eval_every)
+    if phase_override.supervision_contribution_floor_ratio is not None:
+        cfg.supervision_contribution_floor_ratio = float(phase_override.supervision_contribution_floor_ratio)
+
+    phase_weight_map = {
+        "w_int": "w_int",
+        "w_cn": "w_cn",
+        "w_ct": "w_ct",
+        "w_bc": "w_bc",
+        "w_tight": "w_tight",
+        "w_sigma": "w_sigma",
+        "w_eq": "w_eq",
+        "w_reg": "w_reg",
+        "w_data": "w_data",
+        "w_smooth": "w_smooth",
+    }
+    for key, value in (phase_override.base_weights or {}).items():
+        attr = phase_weight_map.get(str(key).strip())
+        if attr is None:
+            continue
+        setattr(cfg.total_cfg, attr, float(value))
+
+    cfg.run_phase_name = phase_key
+    cfg.out_dir = os.path.join(base_cfg.out_dir, phase_key)
+    cfg.ckpt_dir = os.path.join(base_cfg.ckpt_dir, phase_key)
+    return cfg
+
+
+def _allocate_run_checkpoint_dir(base_ckpt_dir: str) -> str:
+    """Create a per-run checkpoint directory under the requested phase root."""
+
+    root_dir = base_ckpt_dir or "checkpoints"
+    ts_tag = datetime.now().strftime("run-%Y%m%d-%H%M%S")
+    candidate = os.path.join(root_dir, ts_tag)
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(root_dir, f"{ts_tag}-{suffix}")
+        suffix += 1
+    os.makedirs(candidate, exist_ok=True)
+    return candidate
+
+
+def _resolve_export_dir(cfg: "TrainerConfig", export_saved_model):
+    """Resolve the SavedModel export directory for one training phase."""
+
+    if export_saved_model is None:
+        return ""
+
+    export_dir = str(export_saved_model or "").strip()
+    if export_dir:
+        export_dir = os.path.abspath(export_dir)
+        parent_dir = os.path.dirname(export_dir)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        return export_dir
+
+    export_dir = _default_saved_model_dir(cfg.out_dir)
+    print(f"[main] 鏈彁渚?--export锛屽皢 SavedModel 鍐欏叆: {export_dir}")
+    return export_dir
+
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
 from inp_io.cdb_parser import load_cdb
@@ -169,12 +261,13 @@ def _canonicalize_locked_route(cfg: TrainerConfig) -> None:
 
 
 # ---------- 工具：读取 config.yaml（容错） ----------
-def _load_yaml_config():
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"未找到 config.yaml（路径: {CONFIG_PATH}），请先准备配置文件后再运行。")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+def _load_yaml_config(config_path=None):
+    path = str(config_path).strip() if config_path else CONFIG_PATH
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"未找到配置文件（路径: {path}），请先准备配置文件后再运行。")
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    print(f"[main] 成功读取 config.yaml。")
+    print(f"[main] 成功读取 {os.path.basename(path)}。")
     return data
 
 
@@ -204,9 +297,31 @@ def _auto_resolve_surface_keys(asm, key_or_hint: str) -> str:
 
 
 # ---------- 读取 CDB + 组装 TrainerConfig（并返回 asm 以供审计打印） ----------
-def _prepare_config_with_autoguess():
+def _prepare_config_with_autoguess(config_path=None):
+    config_path = str(config_path).strip() if config_path else CONFIG_PATH
+    config_path = os.path.abspath(config_path)
+    config_dir = os.path.dirname(config_path)
+
+    def _resolve_optional_path(raw_val):
+        if raw_val is None:
+            return None
+        txt = str(raw_val).strip()
+        if not txt:
+            return None
+        if os.path.isabs(txt):
+            return txt
+        candidates = [
+            os.path.join(config_dir, txt),
+            os.path.join(ROOT, txt),
+            os.path.join(os.path.dirname(ROOT), txt),
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                return os.path.abspath(cand)
+        return os.path.abspath(os.path.join(ROOT, txt))
+
     # 0) 读取 config.yaml（若存在）
-    cfg_yaml = _load_yaml_config()
+    cfg_yaml = _load_yaml_config(config_path)
 
     # 1) 模型路径 (inp / cdb)
     inp_path = (
@@ -455,6 +570,21 @@ def _prepare_config_with_autoguess():
         cfg.viz_eval_batch_size = int(output_cfg["viz_eval_batch_size"])
     if "viz_force_pointwise" in output_cfg:
         cfg.viz_force_pointwise = bool(output_cfg["viz_force_pointwise"])
+    if "viz_supervision_compare_enabled" in output_cfg:
+        cfg.viz_supervision_compare_enabled = bool(output_cfg["viz_supervision_compare_enabled"])
+    if "viz_supervision_compare_split" in output_cfg:
+        cfg.viz_supervision_compare_split = str(output_cfg["viz_supervision_compare_split"])
+    if "viz_supervision_compare_sources" in output_cfg:
+        raw = output_cfg.get("viz_supervision_compare_sources") or ()
+        if isinstance(raw, str):
+            raw = [x.strip() for x in raw.split(",")]
+        cfg.viz_supervision_compare_sources = tuple(str(x).strip() for x in raw if str(x).strip())
+    if "viz_same_pipeline_supervision_debug" in output_cfg:
+        cfg.viz_same_pipeline_supervision_debug = bool(output_cfg["viz_same_pipeline_supervision_debug"])
+    if "viz_export_final_and_best" in output_cfg:
+        cfg.viz_export_final_and_best = bool(output_cfg["viz_export_final_and_best"])
+    if "save_best_on" in output_cfg:
+        cfg.save_best_on = str(output_cfg["save_best_on"])
     cfg.adam_steps = cfg.max_steps
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
@@ -462,8 +592,24 @@ def _prepare_config_with_autoguess():
         cfg.grad_clip_norm = float(optimizer_cfg["grad_clip_norm"])
     if "log_every" in optimizer_cfg:
         cfg.log_every = int(optimizer_cfg["log_every"])
+    if "validation_eval_every" in optimizer_cfg:
+        cfg.validation_eval_every = int(optimizer_cfg["validation_eval_every"])
     if "contact_route_update_every" in cfg_yaml:
         cfg.contact_route_update_every = int(cfg_yaml["contact_route_update_every"])
+    lr_decay_cfg = optimizer_cfg.get("lr_decay_on_plateau", {}) or {}
+    if isinstance(lr_decay_cfg, dict):
+        if "enabled" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_enabled = bool(lr_decay_cfg["enabled"])
+        if "metric" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_metric = str(lr_decay_cfg["metric"])
+        if "warmup_steps" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_warmup = int(lr_decay_cfg["warmup_steps"])
+        if "patience" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_patience = int(lr_decay_cfg["patience"])
+        if "factor" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_factor = float(lr_decay_cfg["factor"])
+        if "min_lr" in lr_decay_cfg:
+            cfg.val_plateau_lr_decay_min_lr = float(lr_decay_cfg["min_lr"])
     early_exit_cfg = optimizer_cfg.get("early_exit", None)
     if not isinstance(early_exit_cfg, dict):
         early_exit_cfg = cfg_yaml.get("early_exit", {}) or {}
@@ -486,6 +632,33 @@ def _prepare_config_with_autoguess():
     elif "early_exit_check_every" in cfg_yaml:
         cfg.early_exit_check_every = int(cfg_yaml["early_exit_check_every"])
 
+    two_stage_cfg = cfg_yaml.get("two_stage_training", {}) or {}
+    if isinstance(two_stage_cfg, dict) and two_stage_cfg:
+        if "enabled" in two_stage_cfg:
+            cfg.two_stage_training.enabled = bool(two_stage_cfg["enabled"])
+
+        def _apply_two_stage_phase_overrides(phase_cfg, phase_yaml):
+            if not isinstance(phase_yaml, dict):
+                return
+            if "max_steps" in phase_yaml:
+                phase_cfg.max_steps = int(phase_yaml["max_steps"])
+            if "learning_rate" in phase_yaml:
+                phase_cfg.lr = float(phase_yaml["learning_rate"])
+            if "save_best_on" in phase_yaml:
+                phase_cfg.save_best_on = str(phase_yaml["save_best_on"])
+            if "validation_eval_every" in phase_yaml:
+                phase_cfg.validation_eval_every = int(phase_yaml["validation_eval_every"])
+            if "supervision_contribution_floor_ratio" in phase_yaml:
+                phase_cfg.supervision_contribution_floor_ratio = float(
+                    phase_yaml["supervision_contribution_floor_ratio"]
+                )
+            base_weights = phase_yaml.get("base_weights", phase_yaml.get("loss_weights", {})) or {}
+            if isinstance(base_weights, dict) and base_weights:
+                phase_cfg.base_weights = {str(k): float(v) for k, v in base_weights.items()}
+
+        _apply_two_stage_phase_overrides(cfg.two_stage_training.phase1, two_stage_cfg.get("phase1", {}) or {})
+        _apply_two_stage_phase_overrides(cfg.two_stage_training.phase2, two_stage_cfg.get("phase2", {}) or {})
+
     # ===== 拧紧分阶段 / 顺序设置 =====
     staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
     stage_mode_top = cfg_yaml.get("preload_stage_mode", None)
@@ -506,6 +679,12 @@ def _prepare_config_with_autoguess():
         cfg.preload_randomize_order = bool(random_order_val)
     if "randomize_order" in staging_cfg:
         cfg.preload_randomize_order = bool(staging_cfg["randomize_order"])
+    append_release_stage_val = cfg_yaml.get("preload_append_release_stage", None)
+    if append_release_stage_val is None and "append_release_stage" in staging_cfg:
+        append_release_stage_val = staging_cfg["append_release_stage"]
+    append_release_stage_explicit = append_release_stage_val is not None
+    if append_release_stage_explicit:
+        cfg.preload_append_release_stage = bool(append_release_stage_val)
 
     if "repeat" in staging_cfg:
         cfg.preload_sequence_repeat = int(staging_cfg["repeat"])
@@ -523,6 +702,52 @@ def _prepare_config_with_autoguess():
 
     if cfg.preload_sequence:
         cfg.preload_use_stages = True
+
+    supervision_cfg = cfg_yaml.get("supervision", {}) or {}
+    if isinstance(supervision_cfg, dict) and supervision_cfg:
+        if "enabled" in supervision_cfg:
+            cfg.supervision.enabled = bool(supervision_cfg["enabled"])
+        else:
+            cfg.supervision.enabled = True
+        if "case_table_path" in supervision_cfg:
+            cfg.supervision.case_table_path = _resolve_optional_path(supervision_cfg["case_table_path"])
+        if "stage_dir" in supervision_cfg:
+            cfg.supervision.stage_dir = _resolve_optional_path(supervision_cfg["stage_dir"])
+        if "stage_count" in supervision_cfg:
+            cfg.supervision.stage_count = int(supervision_cfg["stage_count"])
+        if "shuffle" in supervision_cfg:
+            cfg.supervision.shuffle = bool(supervision_cfg["shuffle"])
+        if "seed" in supervision_cfg:
+            cfg.supervision.seed = int(supervision_cfg["seed"])
+        if "split_group_key" in supervision_cfg:
+            cfg.supervision.split_group_key = str(supervision_cfg["split_group_key"])
+        if "split_stratify_key" in supervision_cfg:
+            raw = supervision_cfg["split_stratify_key"]
+            cfg.supervision.split_stratify_key = None if raw is None else str(raw)
+        if "test_group_quotas" in supervision_cfg:
+            raw = supervision_cfg.get("test_group_quotas") or {}
+            cfg.supervision.test_group_quotas = {str(k): int(v) for k, v in dict(raw).items()}
+        if "cv_n_folds" in supervision_cfg:
+            cfg.supervision.cv_n_folds = int(supervision_cfg["cv_n_folds"])
+        if "cv_fold_index" in supervision_cfg:
+            cfg.supervision.cv_fold_index = int(supervision_cfg["cv_fold_index"])
+        if "train_splits" in supervision_cfg:
+            raw = supervision_cfg.get("train_splits") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            cfg.supervision.train_splits = tuple(str(x) for x in raw)
+        if "eval_splits" in supervision_cfg:
+            raw = supervision_cfg.get("eval_splits") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            cfg.supervision.eval_splits = tuple(str(x) for x in raw)
+        if "export_eval_reports" in supervision_cfg:
+            cfg.supervision.export_eval_reports = bool(supervision_cfg["export_eval_reports"])
+        if "export_eval_plots" in supervision_cfg:
+            cfg.supervision.export_eval_plots = bool(supervision_cfg["export_eval_plots"])
+        if cfg.supervision.enabled and not append_release_stage_explicit:
+            n_bolts = max(1, len(cfg.preload_specs) or 3)
+            cfg.preload_append_release_stage = int(cfg.supervision.stage_count) > n_bolts
 
     # ===== Incremental Mode A (per-stage backprop) =====
     if "incremental_mode" in cfg_yaml:
@@ -558,6 +783,8 @@ def _prepare_config_with_autoguess():
         "w_reg": ("w_reg", "E_reg"),
         "w_ed": ("w_ed", "E_ed"),
         "w_unc": ("w_unc", "E_unc"),
+        "w_data": ("w_data", "E_data"),
+        "w_smooth": ("w_smooth", "E_smooth"),
         "w_path": ("path_penalty_weight", "path_penalty_total"),
         "w_fric_path": ("fric_path_penalty_weight", "fric_path_penalty_total"),
     }
@@ -693,13 +920,22 @@ def _prepare_config_with_autoguess():
 
     focus_terms_yaml = adaptive_cfg.get("focus_terms", []) or []
     focus_terms = []
+    skip_supervision_focus = bool(getattr(cfg.supervision, "enabled", False))
+    skipped_focus_terms = []
     for item in focus_terms_yaml:
         key = str(item).strip()
         mapping = weight_key_map.get(key)
         if mapping is None:
             continue
-        focus_terms.append(mapping[1])
+        loss_key = mapping[1]
+        if skip_supervision_focus and loss_key == "E_data":
+            skipped_focus_terms.append(key)
+            continue
+        focus_terms.append(loss_key)
     cfg.loss_focus_terms = tuple(focus_terms)
+    if skipped_focus_terms:
+        skipped = ", ".join(skipped_focus_terms)
+        print(f"[main] Adaptive focus skips supervision term(s): {skipped} -> E_data")
     cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
 
     ed_cfg = loss_cfg_yaml.get("energy_dissipation", {}) or {}
@@ -716,6 +952,17 @@ def _prepare_config_with_autoguess():
             cfg.total_cfg.ed_square = bool(ed_cfg["squared"])
     if float(getattr(cfg.total_cfg, "w_ed", 0.0) or 0.0) > 0.0 and "enabled" not in ed_cfg:
         cfg.total_cfg.ed_enabled = True
+
+    if "supervision_contribution_floor_enabled" in loss_cfg_yaml:
+        cfg.supervision_contribution_floor_enabled = bool(
+            loss_cfg_yaml["supervision_contribution_floor_enabled"]
+        )
+    if "supervision_contribution_floor_ratio" in loss_cfg_yaml:
+        cfg.supervision_contribution_floor_ratio = float(
+            loss_cfg_yaml["supervision_contribution_floor_ratio"]
+        )
+    if "data_smoothing_k" in loss_cfg_yaml:
+        cfg.total_cfg.data_smoothing_k = int(loss_cfg_yaml["data_smoothing_k"])
 
     unc_cfg = cfg_yaml.get("uncertainty_config", {}) or {}
     if isinstance(unc_cfg, dict) and unc_cfg:
@@ -943,10 +1190,76 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
         f"\n[OK] 训练完成！请到 '{out_dir_disp}' 查看镜面变形云图（数量取决于可视化配置）。"
     )
     print("   如需修改 CDB 路径、表面名或超参，请编辑 config.yaml。")
+def _run_single_training_phase(cfg, asm, export_saved_model: str = ""):
+    from train.trainer import Trainer  # 鍐嶅涓€娆＄‘淇濊矾寰勫氨缁?
+
+    phase_name = str(getattr(cfg, "run_phase_name", "") or "single")
+    cfg.ckpt_dir = _allocate_run_checkpoint_dir(cfg.ckpt_dir)
+    print(f"[main] {phase_name}: checkpoint dir = {cfg.ckpt_dir}")
+
+    trainer = Trainer(cfg)
+    trainer.run()
+
+    export_dir = _resolve_export_dir(cfg, export_saved_model)
+    if export_dir:
+        trainer.export_saved_model(export_dir)
+        print(f"[main] {phase_name}: SavedModel exported to {export_dir}")
+    else:
+        print(f"[main] {phase_name}: SavedModel export skipped")
+
+    result = _TrainingPhaseResult(
+        phase_name=phase_name,
+        trainer=trainer,
+        best_ckpt_path=str(getattr(trainer, "_best_ckpt_path", "") or ""),
+        final_ckpt_path=str(getattr(trainer, "_final_ckpt_path", "") or ""),
+        out_dir=str(getattr(cfg, "out_dir", "") or ""),
+        ckpt_dir=str(getattr(cfg, "ckpt_dir", "") or ""),
+        export_dir=str(export_dir or ""),
+    )
+    print(f"[main] {phase_name}: completed; best={result.best_ckpt_path or '-'} final={result.final_ckpt_path or '-'}")
+    return result
+
+
+def _run_two_stage_training(cfg, asm, export_saved_model: str = ""):
+    print("[main] Two-stage training enabled: phase1 -> phase2")
+    phase1_cfg = _derive_phase_config(cfg, "phase1")
+    phase1_result = _run_single_training_phase(phase1_cfg, asm, export_saved_model=None)
+
+    phase1_best = str(getattr(phase1_result, "best_ckpt_path", "") or "").strip()
+    if not phase1_best:
+        raise RuntimeError("Phase 1 did not produce a best checkpoint for Phase 2 handoff.")
+
+    print(f"[main] Phase 1 handoff checkpoint: {phase1_best}")
+    phase2_cfg = _derive_phase_config(cfg, "phase2")
+    phase2_cfg.resume_ckpt_path = phase1_best
+    print(f"[main] Phase 2 resume checkpoint: {phase2_cfg.resume_ckpt_path}")
+    phase2_result = _run_single_training_phase(phase2_cfg, asm, export_saved_model=export_saved_model)
+
+    out_dir_disp = str(getattr(phase2_result, "out_dir", "") or "outputs")
+    print(f"\n[OK] Two-stage training finished. Outputs: '{out_dir_disp}'")
+    print("   Edit config.yaml to change the CDB path, surface names, or hyperparameters.")
+    return {"phase1": phase1_result, "phase2": phase2_result}
+
+
+def _run_training(cfg, asm, export_saved_model: str = ""):
+    if bool(getattr(getattr(cfg, "two_stage_training", None), "enabled", False)):
+        return _run_two_stage_training(cfg, asm, export_saved_model=export_saved_model)
+
+    result = _run_single_training_phase(cfg, asm, export_saved_model=export_saved_model)
+    out_dir_disp = str(getattr(result, "out_dir", "") or "outputs")
+    print(f"\n[OK] Training finished. Outputs: '{out_dir_disp}'")
+    print("   Edit config.yaml to change the CDB path, surface names, or hyperparameters.")
+    return result
+
+
 def main(argv=None):
     _setup_run_logs()
     parser = argparse.ArgumentParser(
         description="Train the DFEM/PINN model."
+    )
+    parser.add_argument(
+        "--config", default="",
+        help="可选配置文件路径；默认读取仓库根目录下的 config.yaml。"
     )
     parser.add_argument(
         "--export", default="",
@@ -955,7 +1268,7 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    cfg, asm = _prepare_config_with_autoguess()
+    cfg, asm = _prepare_config_with_autoguess(config_path=args.config or None)
     _run_training(cfg, asm, export_saved_model=args.export)
 
 

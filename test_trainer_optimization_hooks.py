@@ -20,6 +20,7 @@ if SRC not in sys.path:
 
 from train.trainer import Trainer, TrainerConfig, _SavedModelModule
 from model.pinn_model import ModelConfig, FieldConfig, EncoderConfig, create_displacement_model
+from model.loss_energy import TotalEnergy
 from physics.contact.contact_normal_alm import NormalContactALM
 from physics.contact.contact_friction_alm import FrictionContactALM
 
@@ -166,6 +167,328 @@ class TrainerOptimizationHookTests(unittest.TestCase):
             atol=1.0e-6,
         )
 
+    def test_build_stage_case_can_disable_release_stage(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            preload_append_release_stage=False,
+            total_cfg=SimpleNamespace(preload_stage_mode="force_then_lock"),
+        )
+
+        case = trainer._build_stage_case(
+            np.asarray([2.0, 5.0, 4.0], dtype=np.float32),
+            np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertEqual(case["stages"].shape, (3, 3))
+        np.testing.assert_allclose(
+            case["stages"][-1],
+            np.asarray([2.0, 5.0, 4.0], dtype=np.float32),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_make_preload_params_carries_stage_supervision_tensors(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            preload_use_stages=True,
+            preload_append_release_stage=False,
+            total_cfg=SimpleNamespace(preload_stage_mode="force_then_lock"),
+            model_cfg=SimpleNamespace(preload_shift=0.0, preload_scale=1.0),
+        )
+        case = {
+            "P": np.asarray([2.0, 5.0, 4.0], dtype=np.float32),
+            "order": np.asarray([0, 1, 2], dtype=np.int32),
+            "X_obs": np.asarray(
+                [
+                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+                    [[0.0, 2.0, 0.0], [1.0, 2.0, 0.0]],
+                ],
+                dtype=np.float32,
+            ),
+            "U_obs": np.asarray(
+                [
+                    [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]],
+                    [[0.3, 0.0, 0.0], [0.4, 0.0, 0.0]],
+                    [[0.5, 0.0, 0.0], [0.6, 0.0, 0.0]],
+                ],
+                dtype=np.float32,
+            ),
+        }
+        case.update(trainer._build_stage_case(case["P"], case["order"]))
+
+        params_full = trainer._make_preload_params(case)
+        stage2 = trainer._extract_stage_params(params_full, 1, keep_context=True)
+
+        self.assertIn("X_obs", params_full["stages"])
+        self.assertIn("U_obs", params_full["stages"])
+        self.assertEqual(tuple(params_full["stages"]["X_obs"].shape), (3, 2, 3))
+        self.assertEqual(tuple(stage2["X_obs"].shape), (2, 3))
+        np.testing.assert_allclose(
+            stage2["U_obs"].numpy(),
+            np.asarray([[0.3, 0.0, 0.0], [0.4, 0.0, 0.0]], dtype=np.float32),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_sample_preload_case_prefers_supervision_dataset(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            preload_use_stages=True,
+            preload_append_release_stage=False,
+            total_cfg=SimpleNamespace(preload_stage_mode="force_then_lock"),
+        )
+
+        class _Dataset:
+            def __init__(self):
+                self.calls = []
+
+            def next_case(self, split="train"):
+                self.calls.append(split)
+                return {
+                    "P": np.asarray([6.0, 2.0, 4.0], dtype=np.float32),
+                    "order": np.asarray([2, 0, 1], dtype=np.int32),
+                    "X_obs": np.asarray(
+                        [
+                            [[0.0, 0.0, 0.0]],
+                            [[0.0, 0.0, 0.0]],
+                            [[0.0, 0.0, 0.0]],
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "U_obs": np.asarray(
+                        [
+                            [[0.1, 0.0, 0.0]],
+                            [[0.2, 0.0, 0.0]],
+                            [[0.3, 0.0, 0.0]],
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+
+        trainer._supervision_dataset = _Dataset()
+
+        case = trainer._sample_preload_case()
+
+        self.assertEqual(trainer._supervision_dataset.calls, ["train"])
+        self.assertIn("stages", case)
+        np.testing.assert_allclose(
+            case["stages"],
+            np.asarray(
+                [
+                    [0.0, 0.0, 4.0],
+                    [6.0, 0.0, 4.0],
+                    [6.0, 2.0, 4.0],
+                ],
+                dtype=np.float32,
+            ),
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            case["U_obs"][-1],
+            np.asarray([[0.3, 0.0, 0.0]], dtype=np.float32),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_total_energy_data_loss_tracks_exact_and_inexact_observations(self):
+        cfg = SimpleNamespace(
+            w_int=0.0,
+            w_cn=0.0,
+            w_ct=0.0,
+            w_bc=0.0,
+            w_tight=0.0,
+            w_sigma=0.0,
+            w_eq=0.0,
+            w_reg=0.0,
+            w_bi=0.0,
+            w_ed=0.0,
+            w_unc=0.0,
+            w_data=1.0,
+            sigma_ref=1.0,
+            path_penalty_weight=0.0,
+            fric_path_penalty_weight=0.0,
+            ed_enabled=False,
+            ed_external_scale=1.0,
+            ed_margin=0.0,
+            ed_use_relu=True,
+            ed_square=True,
+            adaptive_scheme="contact_only",
+            update_every_steps=1,
+            dtype="float32",
+        )
+        total = TotalEnergy(cfg)
+        total.attach()
+
+        X = tf.constant([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=tf.float32)
+        U = tf.constant([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=tf.float32)
+
+        def exact_u(_x, params=None):
+            del _x
+            return tf.cast(params["U_obs"], tf.float32)
+
+        Pi0, parts0, _ = total.energy(exact_u, params={"X_obs": X, "U_obs": U})
+        self.assertAlmostEqual(float(parts0["E_data"].numpy()), 0.0, places=7)
+        self.assertAlmostEqual(float(Pi0.numpy()), 0.0, places=7)
+
+        def zero_u(x, params=None):
+            del x, params
+            return tf.zeros_like(U)
+
+        Pi1, parts1, _ = total.energy(zero_u, params={"X_obs": X, "U_obs": U})
+        self.assertGreater(float(parts1["E_data"].numpy()), 0.0)
+        self.assertGreater(float(Pi1.numpy()), 0.0)
+
+    def test_total_energy_data_loss_is_relative_to_observation_scale(self):
+        cfg = SimpleNamespace(
+            w_int=0.0,
+            w_cn=0.0,
+            w_ct=0.0,
+            w_bc=0.0,
+            w_tight=0.0,
+            w_sigma=0.0,
+            w_eq=0.0,
+            w_reg=0.0,
+            w_bi=0.0,
+            w_ed=0.0,
+            w_unc=0.0,
+            w_data=1.0,
+            sigma_ref=1.0,
+            path_penalty_weight=0.0,
+            fric_path_penalty_weight=0.0,
+            ed_enabled=False,
+            ed_external_scale=1.0,
+            ed_margin=0.0,
+            ed_use_relu=True,
+            ed_square=True,
+            adaptive_scheme="contact_only",
+            update_every_steps=1,
+            dtype="float32",
+        )
+        total = TotalEnergy(cfg)
+        total.attach()
+
+        X = tf.constant([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=tf.float32)
+        u_small = tf.constant([[1.0e-3, 0.0, 0.0], [2.0e-3, 0.0, 0.0]], dtype=tf.float32)
+        u_large = tf.constant([[1.0e-2, 0.0, 0.0], [2.0e-2, 0.0, 0.0]], dtype=tf.float32)
+
+        def zero_u(x, params=None):
+            del x, params
+            return tf.zeros((2, 3), dtype=tf.float32)
+
+        _, parts_small, _ = total.energy(zero_u, params={"X_obs": X, "U_obs": u_small})
+        _, parts_large, _ = total.energy(zero_u, params={"X_obs": X, "U_obs": u_large})
+
+        self.assertAlmostEqual(float(parts_small["E_data"].numpy()), 1.0, places=6)
+        self.assertAlmostEqual(
+            float(parts_small["E_data"].numpy()),
+            float(parts_large["E_data"].numpy()),
+            places=6,
+        )
+
+    def test_data_smoothing_loss_penalizes_high_frequency_supervision_noise(self):
+        cfg = SimpleNamespace(
+            w_int=0.0,
+            w_cn=0.0,
+            w_ct=0.0,
+            w_bc=0.0,
+            w_tight=0.0,
+            w_sigma=0.0,
+            w_eq=0.0,
+            w_reg=0.0,
+            w_bi=0.0,
+            w_ed=0.0,
+            w_unc=0.0,
+            w_data=0.0,
+            w_smooth=1.0,
+            sigma_ref=1.0,
+            path_penalty_weight=0.0,
+            fric_path_penalty_weight=0.0,
+            ed_enabled=False,
+            ed_external_scale=1.0,
+            ed_margin=0.0,
+            ed_use_relu=True,
+            ed_square=True,
+            adaptive_scheme="contact_only",
+            update_every_steps=1,
+            dtype="float32",
+            data_smoothing_k=2,
+        )
+        total = TotalEnergy(cfg)
+        total.attach()
+
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            dtype=tf.float32,
+        )
+        U_obs = tf.constant(
+            [
+                [1.0e-3, 0.0, 0.0],
+                [1.0e-3, 0.0, 0.0],
+                [1.0e-3, 0.0, 0.0],
+                [1.0e-3, 0.0, 0.0],
+            ],
+            dtype=tf.float32,
+        )
+
+        def smooth_u(x, params=None):
+            del x, params
+            return tf.identity(U_obs)
+
+        def noisy_u(x, params=None):
+            del x, params
+            return tf.constant(
+                [
+                    [2.0e-3, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [2.0e-3, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                dtype=tf.float32,
+            )
+
+        _, parts_smooth, stats_smooth = total.energy(smooth_u, params={"X_obs": X, "U_obs": U_obs})
+        _, parts_noisy, stats_noisy = total.energy(noisy_u, params={"X_obs": X, "U_obs": U_obs})
+
+        self.assertAlmostEqual(float(parts_smooth["E_smooth"].numpy()), 0.0, places=7)
+        self.assertGreater(float(parts_noisy["E_smooth"].numpy()), 0.0)
+        self.assertGreater(
+            float(parts_noisy["E_smooth"].numpy()),
+            float(parts_smooth["E_smooth"].numpy()),
+        )
+        self.assertGreater(float(stats_noisy["data_smooth_rms"].numpy()), 0.0)
+
+    def test_weight_vector_enforces_supervision_contribution_floor(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            supervision_contribution_floor_enabled=True,
+            supervision_contribution_floor_ratio=0.1,
+        )
+        trainer._loss_keys = ["E_sigma", "E_ct", "E_data"]
+
+        weights = tf.constant([0.5, 1.0, 1.0], dtype=tf.float32)
+        parts = {
+            "E_sigma": tf.constant(100.0, dtype=tf.float32),
+            "E_ct": tf.constant(20.0, dtype=tf.float32),
+            "E_data": tf.constant(1.0, dtype=tf.float32),
+        }
+
+        adjusted, diag = trainer._apply_supervision_contribution_floor(parts, weights)
+
+        adjusted_np = adjusted.numpy()
+        self.assertAlmostEqual(adjusted_np[0], 0.5, places=6)
+        self.assertAlmostEqual(adjusted_np[1], 1.0, places=6)
+        self.assertAlmostEqual(adjusted_np[2], 7.0, places=6)
+        self.assertAlmostEqual(float(diag["data_eff_w"].numpy()), 7.0, places=6)
+        self.assertAlmostEqual(float(diag["data_floor_target"].numpy()), 7.0, places=6)
+        self.assertEqual(float(diag["data_floor_active"].numpy()), 1.0)
+
     def test_resolve_viz_cases_prefers_fixed_cases_by_default(self):
         trainer = object.__new__(Trainer)
         trainer.cfg = SimpleNamespace(viz_use_last_training_case=False)
@@ -193,6 +516,21 @@ class TrainerOptimizationHookTests(unittest.TestCase):
 
         self.assertEqual(len(cases), 1)
         np.testing.assert_allclose(cases[0]["P"], np.asarray([3.0, 4.0, 5.0], dtype=np.float32))
+
+    def test_supervision_load_splits_includes_compare_split_when_enabled(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            supervision=SimpleNamespace(
+                train_splits=("train",),
+                eval_splits=("val",),
+            ),
+            viz_supervision_compare_enabled=True,
+            viz_supervision_compare_split="test",
+        )
+
+        splits = trainer._supervision_load_splits()
+
+        self.assertEqual(splits, ("train", "val", "test"))
 
     def test_contact_route_update_interval_gate(self):
         trainer = object.__new__(Trainer)
@@ -247,6 +585,166 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         w2 = trainer._build_weight_vector().numpy()
         np.testing.assert_allclose(w2, np.asarray([7.0, 0.25, 0.0], dtype=np.float32), rtol=0.0, atol=0.0)
 
+    def test_strict_mixed_weight_profile_zeros_legacy_outer_terms(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer._loss_keys = ["E_int", "E_cn", "E_ct", "E_sigma", "E_eq", "E_bi", "E_data", "E_ed"]
+        trainer._base_weights = {
+            "E_int": 2.0,
+            "E_cn": 3.0,
+            "E_ct": 4.0,
+            "E_sigma": 5.0,
+            "E_eq": 6.0,
+            "E_bi": 7.0,
+            "E_data": 8.0,
+            "E_ed": 9.0,
+        }
+        trainer._static_weight_vector = None
+        trainer._active_weight_overrides = {}
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2a",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+
+        route_mode = trainer._resolve_bilevel_objective_route()
+        trainer._apply_route_weight_overrides(route_mode)
+        weights = trainer._build_weight_vector().numpy()
+
+        np.testing.assert_allclose(
+            weights,
+            np.asarray([0.0, 3.0, 4.0, 0.0, 6.0, 0.0, 8.0, 0.0], dtype=np.float32),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_strict_mixed_route_rejects_tangential_ift_in_p0(self):
+        trainer = object.__new__(Trainer)
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2b",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": True,
+            "detach_inner_solution": True,
+        }
+
+        with self.assertRaises(NotImplementedError):
+            trainer._resolve_bilevel_objective_route()
+
+    def test_evaluate_total_objective_dispatches_to_strict_mixed_path(self):
+        trainer = object.__new__(Trainer)
+        trainer.model = SimpleNamespace(u_fn=lambda X, params=None: X)
+        trainer.loss_state = None
+        trainer._base_weights = {}
+        trainer._loss_keys = []
+        trainer._static_weight_vector = None
+        trainer._active_weight_overrides = {}
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2a",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+
+        calls = {"energy": 0, "strict": 0}
+
+        class _FakeTotal:
+            def energy(self, *args, **kwargs):
+                del args, kwargs
+                calls["energy"] += 1
+                raise AssertionError("legacy total.energy() should not be used in strict mixed route")
+
+            def strict_mixed_objective(self, *args, **kwargs):
+                del args, kwargs
+                calls["strict"] += 1
+                return (
+                    tf.constant(0.0, dtype=tf.float32),
+                    {"E_cn": tf.constant(1.0, dtype=tf.float32)},
+                    {},
+                )
+
+        _, parts, stats = trainer._evaluate_total_objective(_FakeTotal(), params={}, stress_fn=None, tape=None)
+
+        self.assertEqual(calls["energy"], 0)
+        self.assertEqual(calls["strict"], 1)
+        self.assertAlmostEqual(float(parts["E_cn"].numpy()), 1.0)
+        self.assertEqual(stats["strict_route_mode"], "normal_ready")
+
+    def test_accumulate_strict_bilevel_rates_and_freeze_request(self):
+        trainer = object.__new__(Trainer)
+        trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+        trainer._strict_bilevel_freeze_requested = False
+        trainer._contact_hardening_frozen = False
+        trainer._continuation_freeze_events = 0
+
+        stats1 = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 1.0,
+                "inner_fallback_used": 0.0,
+                "inner_skip_batch": 0.0,
+            },
+            route_mode="forward_only",
+        )
+        stats2 = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 0.0,
+                "inner_fallback_used": 1.0,
+                "inner_skip_batch": 1.0,
+            },
+            route_mode="normal_ready",
+        )
+
+        self.assertAlmostEqual(float(stats1["inner_convergence_rate"]), 1.0)
+        self.assertAlmostEqual(float(stats2["inner_convergence_rate"]), 0.5)
+        self.assertAlmostEqual(float(stats2["inner_fallback_rate"]), 0.5)
+        self.assertAlmostEqual(float(stats2["inner_skip_rate"]), 0.5)
+        self.assertEqual(stats2["strict_route_mode"], "normal_ready")
+        self.assertTrue(trainer._strict_bilevel_freeze_requested)
+
+    def test_resolve_contact_backend_accepts_explicit_legacy_backend_for_legacy_route(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(contact_backend="legacy_alm")
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+
+        self.assertEqual(trainer._resolve_contact_backend(), "legacy_alm")
+
+    def test_resolve_contact_backend_rejects_contradictory_route_backend_pairs(self):
+        cases = [
+            (
+                "phase0",
+                "inner_solver",
+                {
+                    "phase_name": "phase0",
+                    "normal_ift_enabled": False,
+                    "tangential_ift_enabled": False,
+                    "detach_inner_solution": True,
+                },
+            ),
+            (
+                "phase2a",
+                "legacy_alm",
+                {
+                    "phase_name": "phase2a",
+                    "normal_ift_enabled": False,
+                    "tangential_ift_enabled": False,
+                    "detach_inner_solution": True,
+                },
+            ),
+        ]
+
+        for phase_name, backend, flags in cases:
+            trainer = object.__new__(Trainer)
+            trainer.cfg = SimpleNamespace(contact_backend=backend)
+            trainer._mixed_phase_flags = flags
+            with self.subTest(phase_name=phase_name, backend=backend):
+                with self.assertRaises(ValueError):
+                    trainer._resolve_contact_backend()
+
     def test_format_energy_summary_is_skipped_when_step_bar_disabled(self):
         trainer = object.__new__(Trainer)
         trainer._tqdm_enabled = True
@@ -263,6 +761,415 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         out = trainer._format_energy_summary_if_needed({"E_int": tf.constant(1.0, tf.float32)})
         self.assertEqual(out, "")
         self.assertEqual(called["count"], 0)
+
+    def test_format_energy_summary_includes_supervision_term(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.cfg = SimpleNamespace(
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=2.5,
+            ),
+            uncertainty_loss_weight=0.0,
+        )
+
+        summary = trainer._format_energy_summary({"E_data": tf.constant(0.125, tf.float32)})
+
+        self.assertIn("Edata=1.250000e-01(w=2.5)", summary)
+
+    def test_format_train_log_postfix_includes_supervision_error_metrics(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer.cfg = SimpleNamespace(
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, note = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={
+                "data_rms": tf.constant(0.25, dtype=tf.float32),
+                "data_mae": tf.constant(0.125, dtype=tf.float32),
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertEqual(note, "已记录")
+        self.assertIsNotNone(postfix)
+        self.assertIn("drms=2.5000e-01", postfix)
+        self.assertIn("dmae=1.2500e-01", postfix)
+
+    def test_format_train_log_postfix_includes_relative_supervision_metrics(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer.cfg = SimpleNamespace(
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={
+                "data_rms": tf.constant(0.25, dtype=tf.float32),
+                "data_mae": tf.constant(0.125, dtype=tf.float32),
+                "data_ref_rms": tf.constant(0.05, dtype=tf.float32),
+                "data_rel_rms": tf.constant(5.0, dtype=tf.float32),
+                "data_rel_mae": tf.constant(2.5, dtype=tf.float32),
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("dref=5.0000e-02", postfix)
+        self.assertIn("drrms=5.0000e+00", postfix)
+        self.assertIn("drmae=2.5000e+00", postfix)
+
+    def test_format_train_log_postfix_includes_validation_metrics_and_lr(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer.optimizer = tf.keras.optimizers.Adam(1.0e-4)
+        trainer.cfg = SimpleNamespace(
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={
+                "data_rms": tf.constant(0.25, dtype=tf.float32),
+                "data_mae": tf.constant(0.125, dtype=tf.float32),
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+            val_summary={
+                "val_drrms_mean": 1.25,
+                "val_ratio_median": 1.10,
+            },
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("vdr=1.2500e+00", postfix)
+        self.assertIn("vrat=1.1000e+00", postfix)
+        self.assertIn("vlr=1.0000e-04", postfix)
+
+    def test_format_train_log_postfix_includes_strict_bilevel_aggregate_metrics(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer.optimizer = tf.keras.optimizers.Adam(1.0e-4)
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2a",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+        trainer.cfg = SimpleNamespace(
+            contact_backend="auto",
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=1.0,
+                w_ct=1.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=1.0,
+                w_reg=1.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+                w_smooth=0.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={
+                "E_cn": tf.constant(0.5, dtype=tf.float32),
+                "E_ct": tf.constant(0.25, dtype=tf.float32),
+                "E_eq": tf.constant(0.125, dtype=tf.float32),
+                "E_reg": tf.constant(0.0625, dtype=tf.float32),
+                "E_data": tf.constant(0.03125, dtype=tf.float32),
+            },
+            stats={
+                "inner_convergence_rate": 0.75,
+                "inner_fallback_rate": 0.25,
+                "inner_skip_rate": 0.125,
+                "strict_route_mode": "normal_ready",
+                "continuation_frozen": 1.0,
+                "continuation_freeze_events": 2.0,
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("smode=normal_ready", postfix)
+        self.assertIn("iconv=7.5000e-01", postfix)
+        self.assertIn("ifb=2.5000e-01", postfix)
+        self.assertIn("iskip=1.2500e-01", postfix)
+        self.assertIn("cback=inner_solver", postfix)
+        self.assertIn("cfrz=1", postfix)
+        self.assertIn("cfrze=2", postfix)
+
+    def test_format_train_log_postfix_includes_legacy_contact_backend_token(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+        trainer.cfg = SimpleNamespace(
+            contact_backend="auto",
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+                w_smooth=0.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={"strict_route_mode": "legacy"},
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("cback=legacy_alm", postfix)
+
+    def test_supervision_validation_summary_aggregates_rows(self):
+        trainer = object.__new__(Trainer)
+
+        summary = trainer._summarize_supervision_eval_rows(
+            [
+                {
+                    "rmse_vec_mm": 0.20,
+                    "pred_rms_vec_mm": 0.15,
+                    "true_rms_vec_mm": 0.10,
+                },
+                {
+                    "rmse_vec_mm": 0.30,
+                    "pred_rms_vec_mm": 0.20,
+                    "true_rms_vec_mm": 0.40,
+                },
+            ]
+        )
+
+        self.assertAlmostEqual(summary["val_rmse_vec_mm_mean"], 0.25)
+        self.assertAlmostEqual(summary["val_ratio_median"], 1.0)
+        self.assertAlmostEqual(summary["val_drrms_mean"], 1.375)
+        self.assertEqual(summary["val_rows"], 2)
+
+    def test_best_metric_uses_validation_drrms_when_configured(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(save_best_on="val_drrms")
+        trainer.best_metric = 2.0
+        saved = []
+
+        def _fake_save(step):
+            saved.append(step)
+            return f"ckpt-{step}"
+
+        trainer._save_checkpoint_best_effort = _fake_save  # type: ignore[method-assign]
+
+        note1 = trainer._maybe_save_best_checkpoint(
+            step=50,
+            pi_val=10.0,
+            parts={"E_int": tf.constant(7.0, dtype=tf.float32)},
+            val_summary={"val_drrms_mean": 1.5},
+        )
+        note2 = trainer._maybe_save_best_checkpoint(
+            step=100,
+            pi_val=1.0,
+            parts={"E_int": tf.constant(0.1, dtype=tf.float32)},
+            val_summary={"val_drrms_mean": 1.8},
+        )
+
+        self.assertEqual(saved, [50])
+        self.assertAlmostEqual(trainer.best_metric, 1.5)
+        self.assertIn("ckpt-50", note1)
+        self.assertEqual(note2, "")
+
+    def test_trainer_records_phase_checkpoint_paths_for_two_stage_resume(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(save_best_on="val_drrms", resume_ckpt_path="phase1-best")
+        trainer.best_metric = float("inf")
+        trainer._best_ckpt_path = None
+        trainer._final_ckpt_path = None
+        trainer._resumed_ckpt_path = None
+
+        class _Status:
+            def __init__(self):
+                self.expect_partial_called = False
+
+            def expect_partial(self):
+                self.expect_partial_called = True
+
+        class _Checkpoint:
+            def __init__(self):
+                self.paths = []
+                self.status = _Status()
+
+            def restore(self, path):
+                self.paths.append(path)
+                return self.status
+
+        trainer.ckpt = _Checkpoint()
+        trainer._restore_resume_checkpoint_if_needed()
+
+        self.assertEqual(trainer.ckpt.paths, ["phase1-best"])
+        self.assertEqual(trainer._resumed_ckpt_path, "phase1-best")
+        self.assertTrue(trainer.ckpt.status.expect_partial_called)
+
+        trainer._save_checkpoint_best_effort = lambda step: f"ckpt-{step}"  # type: ignore[method-assign]
+
+        note = trainer._maybe_save_best_checkpoint(
+            step=50,
+            pi_val=10.0,
+            parts={"E_int": tf.constant(7.0, dtype=tf.float32)},
+            val_summary={"val_drrms_mean": 1.5},
+        )
+        final_ckpt = trainer._save_final_checkpoint(150)
+
+        self.assertIn("ckpt-50", note)
+        self.assertEqual(trainer._best_ckpt_path, "ckpt-50")
+        self.assertEqual(final_ckpt, "ckpt-150")
+        self.assertEqual(trainer._final_ckpt_path, "ckpt-150")
+
+    def test_validation_plateau_decay_reduces_learning_rate(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(
+            val_plateau_lr_decay_enabled=True,
+            val_plateau_lr_decay_metric="val_drrms",
+            val_plateau_lr_decay_warmup=100,
+            val_plateau_lr_decay_patience=2,
+            val_plateau_lr_decay_factor=0.5,
+            val_plateau_lr_decay_min_lr=2.5e-5,
+        )
+        trainer.optimizer = tf.keras.optimizers.Adam(1.0e-4)
+        trainer._val_plateau_best = None
+        trainer._val_plateau_bad_count = 0
+
+        msg0 = trainer._maybe_apply_val_plateau_lr_decay(100, {"val_drrms_mean": 1.0})
+        msg1 = trainer._maybe_apply_val_plateau_lr_decay(150, {"val_drrms_mean": 1.1})
+        msg2 = trainer._maybe_apply_val_plateau_lr_decay(200, {"val_drrms_mean": 1.2})
+        lr_after_first = trainer._get_optimizer_learning_rate()
+        msg3 = trainer._maybe_apply_val_plateau_lr_decay(250, {"val_drrms_mean": 0.9})
+        msg4 = trainer._maybe_apply_val_plateau_lr_decay(300, {"val_drrms_mean": 1.0})
+        msg5 = trainer._maybe_apply_val_plateau_lr_decay(350, {"val_drrms_mean": 1.1})
+        lr_after_second = trainer._get_optimizer_learning_rate()
+        msg6 = trainer._maybe_apply_val_plateau_lr_decay(400, {"val_drrms_mean": 1.2})
+        msg7 = trainer._maybe_apply_val_plateau_lr_decay(450, {"val_drrms_mean": 1.3})
+        lr_after_third = trainer._get_optimizer_learning_rate()
+
+        self.assertIsNone(msg0)
+        self.assertIsNone(msg1)
+        self.assertIsInstance(msg2, str)
+        self.assertIn("lr_decay", msg2)
+        self.assertAlmostEqual(lr_after_first, 5.0e-5)
+        self.assertIsNone(msg3)
+        self.assertEqual(trainer._val_plateau_bad_count, 0)
+        self.assertIsNone(msg4)
+        self.assertIsInstance(msg5, str)
+        self.assertIn("lr_decay", msg5)
+        self.assertAlmostEqual(lr_after_second, 2.5e-5)
+        self.assertIsNone(msg6)
+        self.assertIsInstance(msg7, str)
+        self.assertIn("lr_decay", msg7)
+        self.assertAlmostEqual(lr_after_third, 2.5e-5)
 
     def test_legacy_route_helpers_are_removed(self):
         legacy_methods = [

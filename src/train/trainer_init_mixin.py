@@ -40,13 +40,30 @@ class TrainerInitMixin:
         self._base_weights: Dict[str, float] = {}
         self._loss_keys: List[str] = []
         self._static_weight_vector: Optional[tf.Tensor] = None
+        self._active_weight_overrides: Dict[str, float] = {}
         self._apply_gradients_kwargs: Dict[str, Any] = {}
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
         self._contact_hardening_targets: Optional[Dict[str, float]] = None
+        self._contact_hardening_frozen: bool = False
+        self._strict_bilevel_stats: Dict[str, int] = {
+            "total": 0,
+            "converged": 0,
+            "fallback": 0,
+            "skipped": 0,
+        }
+        self._strict_bilevel_freeze_requested: bool = False
+        self._continuation_freeze_events: int = 0
+        self._supervision_dataset = None
         self._tqdm_enabled: bool = self._resolve_tqdm_enabled()
         self._viz_reference_cache_path: Optional[str] = None
         self._viz_reference_cache: Optional[Dict[str, Any]] = None
         self._asm_node_ids: Optional[set[int]] = None
+        self._latest_val_summary: Optional[Dict[str, float]] = None
+        self._latest_val_step: int = 0
+        self._val_plateau_best: Optional[float] = None
+        self._val_plateau_bad_count: int = 0
+        self._best_ckpt_path: Optional[str] = None
+        self._final_ckpt_path: Optional[str] = None
 
     def _init_preload_sequence(self, cfg) -> None:
         if cfg.preload_specs:
@@ -190,6 +207,9 @@ class TrainerInitMixin:
         self.ckpt = None
         self.ckpt_manager = None
         self.best_metric = float("inf")
+        self._best_ckpt_path = None
+        self._final_ckpt_path = None
+        self._resumed_ckpt_path = None
 
         self.X_vol = None
         self.w_vol = None

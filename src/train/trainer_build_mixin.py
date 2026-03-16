@@ -19,9 +19,30 @@ from model.pinn_model import create_displacement_model, _knn_to_adj
 from physics.elasticity_residual import ElasticityResidual
 from physics.contact.contact_operator import ContactOperator
 from physics.tightening_model import NutTighteningPenalty, NutSpec
+from train.ansys_supervision import load_ansys_supervision_dataset
 
 
 class TrainerBuildMixin:
+    def _supervision_load_splits(self) -> Tuple[str, ...]:
+        sup_cfg = getattr(self.cfg, "supervision", None)
+        if sup_cfg is None:
+            return ("train",)
+
+        ordered: List[str] = []
+        for raw in (
+            getattr(sup_cfg, "train_splits", ("train",)) or ("train",),
+            getattr(sup_cfg, "eval_splits", ()) or (),
+        ):
+            for split in raw:
+                name = str(split).strip()
+                if name and name not in ordered:
+                    ordered.append(name)
+        if bool(getattr(self.cfg, "viz_supervision_compare_enabled", False)):
+            name = str(getattr(self.cfg, "viz_supervision_compare_split", "test") or "").strip()
+            if name and name not in ordered:
+                ordered.append(name)
+        return tuple(ordered) if ordered else ("train",)
+
     def _autoguess_contacts_from_inp(self, asm: AssemblyModel) -> List[Dict[str, str]]:
         candidates = []
         try:
@@ -139,6 +160,25 @@ class TrainerBuildMixin:
             print(f"[INFO] Loaded {mesh_tag}: surfaces={len(self.asm.surfaces)} "
                   f"elsets={len(self.asm.elsets)} contact_pairs(raw)={len(getattr(self.asm, 'contact_pairs', []))}")
             pb.update(1)
+
+            self._supervision_dataset = None
+            sup_cfg = getattr(cfg, "supervision", None)
+            if bool(getattr(sup_cfg, "enabled", False)):
+                self._supervision_dataset = load_ansys_supervision_dataset(
+                    case_table_path=str(getattr(sup_cfg, "case_table_path", "") or ""),
+                    stage_dir=str(getattr(sup_cfg, "stage_dir", "") or ""),
+                    asm=self.asm,
+                    splits=self._supervision_load_splits(),
+                    stage_count=int(getattr(sup_cfg, "stage_count", 3) or 3),
+                    shuffle=bool(getattr(sup_cfg, "shuffle", True)),
+                    seed=int(getattr(sup_cfg, "seed", cfg.seed)),
+                    split_group_key=str(getattr(sup_cfg, "split_group_key", "base_id") or "base_id"),
+                    split_stratify_key=getattr(sup_cfg, "split_stratify_key", "source"),
+                    test_group_quotas=getattr(sup_cfg, "test_group_quotas", None),
+                    cv_n_folds=int(getattr(sup_cfg, "cv_n_folds", 5)),
+                    cv_fold_index=int(getattr(sup_cfg, "cv_fold_index", 0)),
+                )
+                print(f"[supervision] loaded staged ANSYS cases: {self._supervision_dataset.counts()}")
 
             # 2) 体积分点 & 材料映射（严格检查）
             self.matlib = MaterialLibrary(cfg.materials)

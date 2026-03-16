@@ -141,13 +141,6 @@ optimizer_config:
   epochs: 1500
   log_every: 50
   validation_eval_every: 100
-  lr_decay_on_plateau:
-    enabled: true
-    metric: val_drrms
-    warmup_steps: 800
-    patience: 2
-    factor: 0.5
-    min_lr: 2.5e-6
 
 elasticity_config:
   coord_scale: 1.0
@@ -203,8 +196,6 @@ output_config:
   viz_supervision_compare_enabled: true
   viz_supervision_compare_split: test
   viz_supervision_compare_sources: [boundary, corner, interior]
-  viz_same_pipeline_supervision_debug: true
-  viz_export_final_and_best: true
 
 two_stage_training:
   enabled: true
