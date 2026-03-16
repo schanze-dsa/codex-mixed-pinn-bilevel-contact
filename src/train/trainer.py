@@ -107,6 +107,26 @@ def _find_node_id_in_boundary_raw(raw: str) -> Optional[int]:
     return None
 
 
+def _find_boundary_dof_flags(raw: str) -> Tuple[float, float, float]:
+    """Extract boundary DOF flags for UX/UY/UZ-like constraints."""
+
+    txt = str(raw or "").strip().upper()
+    if not txt:
+        return 0.0, 0.0, 0.0
+    tokens = [tok.strip().upper() for tok in re.split(r"[,\s]+", txt) if tok.strip()]
+    if not tokens:
+        return 0.0, 0.0, 0.0
+
+    dof_token = tokens[2] if len(tokens) >= 3 and tokens[0] == "D" else ""
+    if dof_token in {"ALL", "U", "UXYZ", "XYZ"}:
+        return 1.0, 1.0, 1.0
+
+    ux = float("UX" in tokens or dof_token == "X")
+    uy = float("UY" in tokens or dof_token == "Y")
+    uz = float("UZ" in tokens or dof_token == "Z")
+    return ux, uy, uz
+
+
 def build_node_semantic_features(
     asm: AssemblyModel,
     sorted_node_ids: np.ndarray,
@@ -115,20 +135,24 @@ def build_node_semantic_features(
 ) -> np.ndarray:
     """Build CDB engineering semantic features aligned with sorted global node ids.
 
-    Feature layout (N, 4):
+    Feature layout (N, 8):
     - [:,0] contact flag
     - [:,1] boundary-condition flag
     - [:,2] mirror-region flag
     - [:,3] normalized material id (0~1)
+    - [:,4] UX-constrained flag
+    - [:,5] UY-constrained flag
+    - [:,6] UZ-constrained flag
+    - [:,7] generic surface-like flag (contact or constrained or mirror)
     """
 
     node_ids = np.asarray(sorted_node_ids, dtype=np.int64).reshape(-1)
     n = int(node_ids.shape[0])
     if n == 0:
-        return np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((0, 8), dtype=np.float32)
 
     node_pos = {int(nid): i for i, nid in enumerate(node_ids.tolist())}
-    feats = np.zeros((n, 4), dtype=np.float32)
+    feats = np.zeros((n, 8), dtype=np.float32)
 
     contact_nodes: set[int] = set()
     cpart = getattr(asm, "parts", {}).get("__CONTACT__")
@@ -146,6 +170,10 @@ def build_node_semantic_features(
         pos = node_pos.get(int(nid))
         if pos is not None:
             feats[pos, 1] = 1.0
+            ux, uy, uz = _find_boundary_dof_flags(getattr(bc, "raw", ""))
+            feats[pos, 4] = max(feats[pos, 4], ux)
+            feats[pos, 5] = max(feats[pos, 5], uy)
+            feats[pos, 6] = max(feats[pos, 6], uz)
 
     mirror_nodes: set[int] = set()
     mirror_key = str(mirror_surface_name or "").strip().upper()
@@ -177,6 +205,8 @@ def build_node_semantic_features(
                 continue
             if feats[pos, 3] == 0.0:
                 feats[pos, 3] = np.float32(mid)
+
+    feats[:, 7] = np.maximum.reduce([feats[:, 0], feats[:, 1], feats[:, 2]])
 
     return feats
 

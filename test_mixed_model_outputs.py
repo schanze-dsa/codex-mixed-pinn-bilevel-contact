@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import tensorflow as tf
 
@@ -138,6 +139,90 @@ class MixedModelOutputsTests(unittest.TestCase):
         self.assertEqual(tuple(u.shape), (4, 3))
         self.assertEqual(tuple(sigma.shape), (4, 6))
         tf.debugging.assert_near(sigma_only, sigma)
+
+    def test_engineering_semantics_affect_stress_path_but_not_displacement_path(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=False,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        z = model.encoder(tf.zeros((1, 3), dtype=tf.float32))
+
+        model.field.set_node_semantic_features(tf.zeros((4, 8), dtype=tf.float32))
+        u0, sigma0 = model.field(X, z, return_stress=True)
+
+        model.field.set_node_semantic_features(tf.ones((4, 8), dtype=tf.float32) * 5.0)
+        u1, sigma1 = model.field(X, z, return_stress=True)
+
+        tf.debugging.assert_near(u0, u1, atol=1.0e-6)
+        self.assertEqual(tuple(sigma0.shape), (4, 6))
+        self.assertEqual(tuple(sigma1.shape), (4, 6))
+        tf.debugging.assert_all_finite(sigma0, "sigma must stay finite with zero semantics")
+        tf.debugging.assert_all_finite(sigma1, "sigma must stay finite with rich semantics")
+
+    def test_contact_stress_hybrid_bypasses_stress_graph_branch_for_contact_nodes(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+                contact_stress_hybrid_enabled=True,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        z = model.encoder(tf.zeros((1, 3), dtype=tf.float32))
+        sem = tf.constant(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        model.field.set_node_semantic_features(sem)
+
+        with patch.object(
+            model.field.stress_branch_graph_layers[0],
+            "call",
+            side_effect=RuntimeError("stress graph branch should be bypassed"),
+        ):
+            u, sigma = model.field(X, z, return_stress=True)
+
+        self.assertEqual(tuple(u.shape), (4, 3))
+        self.assertEqual(tuple(sigma.shape), (4, 6))
 
 
 if __name__ == "__main__":

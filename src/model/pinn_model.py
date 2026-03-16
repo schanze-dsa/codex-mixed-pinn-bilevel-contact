@@ -108,6 +108,7 @@ class FieldConfig:
     adaptive_depth_route_source: str = "z_norm"  # z_norm | contact_residual
     stress_branch_early_split: bool = False
     use_eps_guided_stress_head: bool = False
+    contact_stress_hybrid_enabled: bool = False
 
 @dataclass
 class ModelConfig:
@@ -659,6 +660,7 @@ class DisplacementNet(tf.keras.Model):
         self.use_engineering_semantics = bool(getattr(cfg, "use_engineering_semantics", False))
         self.stress_branch_early_split = bool(getattr(cfg, "stress_branch_early_split", False))
         self.use_eps_guided_stress_head = bool(getattr(cfg, "use_eps_guided_stress_head", False))
+        self.contact_stress_hybrid_enabled = bool(getattr(cfg, "contact_stress_hybrid_enabled", False))
         self.adaptive_depth_enabled = bool(getattr(cfg, "adaptive_depth_enabled", False))
         self.adaptive_depth_mode = str(getattr(cfg, "adaptive_depth_mode", "hard") or "hard").strip().lower()
         if self.adaptive_depth_mode not in {"hard", "soft"}:
@@ -705,8 +707,6 @@ class DisplacementNet(tf.keras.Model):
         base_feat_dim = cfg.node_emb_dim if self.dfem_mode else self.pe.out_dim
         if self.use_finite_spectral:
             base_feat_dim += self.finite_pe.out_dim
-        if self.use_engineering_semantics:
-            base_feat_dim += max(0, int(getattr(cfg, "semantic_feat_dim", 0)))
 
         if self.dfem_mode:
             if cfg.n_nodes is None or cfg.n_nodes <= 0:
@@ -842,6 +842,8 @@ class DisplacementNet(tf.keras.Model):
         self.stress_out_mlp_deep = None
         self.stress_out_eps = None
         self.stress_out_eps_mlp = None
+        self.stress_semantic_proj_mlp = None
+        self.stress_semantic_proj_graph = None
         if cfg.stress_out_dim > 0:
             self.stress_out = tf.keras.layers.Dense(
                 cfg.stress_out_dim,
@@ -884,6 +886,17 @@ class DisplacementNet(tf.keras.Model):
                     cfg.stress_out_dim,
                     kernel_initializer="glorot_uniform",
                     name="stress_head_mlp_eps",
+                )
+            if self.use_engineering_semantics and int(getattr(cfg, "semantic_feat_dim", 0) or 0) > 0:
+                self.stress_semantic_proj_mlp = tf.keras.layers.Dense(
+                    cfg.width,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_semantic_proj_mlp",
+                )
+                self.stress_semantic_proj_graph = tf.keras.layers.Dense(
+                    cfg.graph_width,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_semantic_proj_graph",
                 )
         self.uncertainty_out = None
         self.uncertainty_out_mlp = None
@@ -970,13 +983,86 @@ class DisplacementNet(tf.keras.Model):
 
         feats = tf.convert_to_tensor(features, dtype=tf.float32)
         feats = tf.ensure_shape(feats, (None, None))
+        expected_dim = int(getattr(self.cfg, "semantic_feat_dim", 0) or 0)
         if self.dfem_mode and self.cfg.n_nodes is not None:
             n = int(self.cfg.n_nodes)
             if feats.shape.rank is not None and feats.shape[0] is not None and int(feats.shape[0]) != n:
                 raise ValueError(
                     f"semantic feature rows must match n_nodes={n}, got {int(feats.shape[0])}"
                 )
+        if expected_dim > 0 and feats.shape.rank is not None and feats.shape[-1] is not None:
+            if int(feats.shape[-1]) != expected_dim:
+                raise ValueError(
+                    f"semantic feature columns must match semantic_feat_dim={expected_dim}, "
+                    f"got {int(feats.shape[-1])}"
+                )
         self._node_semantic_features = feats
+
+    def _resolve_semantic_features(self, n_rows: tf.Tensor, *, dtype: tf.dtypes.DType) -> Optional[tf.Tensor]:
+        if not self.use_engineering_semantics:
+            return None
+        sem_dim = int(getattr(self.cfg, "semantic_feat_dim", 0) or 0)
+        if sem_dim <= 0:
+            return None
+        if self._node_semantic_features is not None:
+            n_sem = tf.shape(self._node_semantic_features)[0]
+            sem = tf.cond(
+                tf.equal(n_sem, n_rows),
+                lambda: self._node_semantic_features,
+                lambda: tf.zeros((n_rows, sem_dim), dtype=tf.float32),
+            )
+        else:
+            sem = tf.zeros((n_rows, sem_dim), dtype=tf.float32)
+        return tf.cast(sem, dtype)
+
+    def _fuse_stress_semantics(
+        self,
+        stress_feat: tf.Tensor,
+        semantic_feat: Optional[tf.Tensor],
+    ) -> tf.Tensor:
+        if semantic_feat is None:
+            return stress_feat
+
+        stress_feat = tf.convert_to_tensor(stress_feat)
+        semantic_feat = tf.cast(semantic_feat, stress_feat.dtype)
+        use_graph_proj = (
+            self.stress_semantic_proj_graph is not None
+            and stress_feat.shape.rank is not None
+            and stress_feat.shape[-1] == self.cfg.graph_width
+        )
+        proj_layer = self.stress_semantic_proj_graph if use_graph_proj else self.stress_semantic_proj_mlp
+        if proj_layer is None:
+            return stress_feat
+        return stress_feat + tf.cast(proj_layer(semantic_feat), stress_feat.dtype)
+
+    def _contact_mask_from_semantics(
+        self,
+        semantic_feat: Optional[tf.Tensor],
+        *,
+        dtype: tf.dtypes.DType,
+    ) -> Optional[tf.Tensor]:
+        if not self.contact_stress_hybrid_enabled:
+            return None
+        if semantic_feat is None:
+            raise ValueError(
+                "contact_stress_hybrid_enabled=True requires engineering semantic features with a contact mask."
+            )
+        return tf.cast(tf.greater(semantic_feat[:, 0:1], 0.5), dtype)
+
+    def _blend_contact_stress_features(
+        self,
+        stress_feat: tf.Tensor,
+        local_stress_feat: Optional[tf.Tensor],
+        semantic_feat: Optional[tf.Tensor],
+    ) -> tf.Tensor:
+        if local_stress_feat is None:
+            return stress_feat
+        contact_mask = self._contact_mask_from_semantics(semantic_feat, dtype=stress_feat.dtype)
+        if contact_mask is None:
+            return stress_feat
+        one = tf.cast(1.0, stress_feat.dtype)
+        local_stress_feat = tf.cast(local_stress_feat, stress_feat.dtype)
+        return (one - contact_mask) * stress_feat + contact_mask * local_stress_feat
 
     def prebuild_adjacency(self, X_nodes: tf.Tensor | np.ndarray):
         """
@@ -1075,20 +1161,8 @@ class DisplacementNet(tf.keras.Model):
                 x_spec = self.finite_pe(tf.cast(x, tf.float32))
                 x_feat = tf.concat([x_feat, tf.cast(x_spec, x_feat.dtype)], axis=-1)
 
-        if self.use_engineering_semantics and int(getattr(self.cfg, "semantic_feat_dim", 0) or 0) > 0:
-            sem_dim = int(self.cfg.semantic_feat_dim)
-            sem = None
-            if self._node_semantic_features is not None:
-                n_sem = tf.shape(self._node_semantic_features)[0]
-                sem = tf.cond(
-                    tf.equal(n_sem, N),
-                    lambda: self._node_semantic_features,
-                    lambda: tf.zeros((N, sem_dim), dtype=tf.float32),
-                )
-            else:
-                sem = tf.zeros((N, sem_dim), dtype=tf.float32)
-            x_feat = tf.concat([x_feat, tf.cast(sem, x_feat.dtype)], axis=-1)
-            
+        semantic_feat = self._resolve_semantic_features(N, dtype=feat_dtype)
+
         if x_feat.dtype != feat_dtype:
             x_feat = tf.cast(x_feat, feat_dtype)
         
@@ -1099,6 +1173,8 @@ class DisplacementNet(tf.keras.Model):
             coords: tf.Tensor,
             hfeat: tf.Tensor,
             stress_hfeat: Optional[tf.Tensor] = None,
+            semantic_feat: Optional[tf.Tensor] = None,
+            local_stress_feat: Optional[tf.Tensor] = None,
         ):
             # Output scaling: network predicts normalized displacement first.
             scale = tf.cast(self.output_scale, u_out.dtype)
@@ -1118,6 +1194,9 @@ class DisplacementNet(tf.keras.Model):
                 u_out = u_out * mask[:, None] * dof_mask
 
             stress_feat = stress_hfeat if stress_hfeat is not None else hfeat
+            if return_stress or return_stress_features:
+                stress_feat = self._blend_contact_stress_features(stress_feat, local_stress_feat, semantic_feat)
+                stress_feat = self._fuse_stress_semantics(stress_feat, semantic_feat)
             sigma_out = None
             if return_stress:
                 sigma_out = self.predict_stress_from_features(stress_feat)
@@ -1155,6 +1234,8 @@ class DisplacementNet(tf.keras.Model):
             *,
             use_mlp_head: bool,
             stress_hfeat: Optional[tf.Tensor] = None,
+            semantic_feat: Optional[tf.Tensor] = None,
+            local_stress_feat: Optional[tf.Tensor] = None,
         ):
             alpha = self._sample_route_alpha(z, u_deep.dtype)
             one = tf.cast(1.0, u_deep.dtype)
@@ -1178,8 +1259,10 @@ class DisplacementNet(tf.keras.Model):
             stress_feat = stress_hfeat
             if return_stress or return_stress_features:
                 if stress_hfeat is not None:
+                    stress_feat = self._blend_contact_stress_features(stress_hfeat, local_stress_feat, semantic_feat)
+                    stress_feat = self._fuse_stress_semantics(stress_hfeat, semantic_feat)
                     if return_stress:
-                        sigma_out = self.predict_stress_from_features(stress_hfeat)
+                        sigma_out = self.predict_stress_from_features(stress_feat)
                 else:
                     if use_mlp_head:
                         shallow_head = self.stress_out_mlp_shallow or self.stress_out_mlp
@@ -1187,11 +1270,11 @@ class DisplacementNet(tf.keras.Model):
                     else:
                         shallow_head = self.stress_out_shallow or self.stress_out
                         deep_head = self.stress_out_deep or self.stress_out
-                    sigma_shallow = shallow_head(hfeat_shallow)
-                    sigma_deep = deep_head(hfeat_deep)
                     stress_feat = (one - alpha) * hfeat_shallow + alpha * hfeat_deep
+                    stress_feat = self._blend_contact_stress_features(stress_feat, local_stress_feat, semantic_feat)
+                    stress_feat = self._fuse_stress_semantics(stress_feat, semantic_feat)
                     if return_stress:
-                        sigma_out = (one - alpha) * sigma_shallow + alpha * sigma_deep
+                        sigma_out = self.predict_stress_from_features(stress_feat)
 
             log_var = None
             if return_uncertainty:
@@ -1255,7 +1338,7 @@ class DisplacementNet(tf.keras.Model):
                 stress_hfeat = None
                 if stress_split is not None and stress_source is not None:
                     stress_hfeat = _run_stress_branch_mlp(stress_source)
-                return _apply_output(u_out, x, hcur, stress_hfeat=stress_hfeat)
+                return _apply_output(u_out, x, hcur, stress_hfeat=stress_hfeat, semantic_feat=semantic_feat)
 
             shallow_depth = min(
                 self.adaptive_depth_shallow_layers,
@@ -1289,6 +1372,7 @@ class DisplacementNet(tf.keras.Model):
                 h_deep,
                 use_mlp_head=True,
                 stress_hfeat=stress_hfeat,
+                semantic_feat=semantic_feat,
             )
 
         def graph_forward():
@@ -1319,6 +1403,9 @@ class DisplacementNet(tf.keras.Model):
                 knn_idx, adj = tf.cond(use_cached, _use_cache, _build_dynamic)
 
             hcur = self.graph_proj(h)
+            local_stress_feat = None
+            if (return_stress or return_stress_features) and self.contact_stress_hybrid_enabled:
+                local_stress_feat = hcur
             stress_split = None
             if return_stress and self.stress_branch_early_split and self.stress_branch_graph_layers:
                 stress_split = self.stress_branch_graph_split_index
@@ -1353,8 +1440,24 @@ class DisplacementNet(tf.keras.Model):
                 u_out = self.graph_out(hcur)
                 stress_hfeat = None
                 if stress_split is not None and stress_source is not None:
-                    stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
-                return _apply_output(u_out, coords, hcur, stress_hfeat=stress_hfeat)
+                    contact_mask = self._contact_mask_from_semantics(semantic_feat, dtype=hcur.dtype)
+                    if (
+                        contact_mask is not None
+                        and tf.executing_eagerly()
+                        and bool(tf.reduce_all(contact_mask > 0.5).numpy())
+                    ):
+                        stress_hfeat = local_stress_feat
+                        local_stress_feat = None
+                    else:
+                        stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
+                return _apply_output(
+                    u_out,
+                    coords,
+                    hcur,
+                    stress_hfeat=stress_hfeat,
+                    semantic_feat=semantic_feat,
+                    local_stress_feat=local_stress_feat,
+                )
 
             h_shallow_norm = self.graph_norm(h_shallow)
             h_deep_norm = self.graph_norm(hcur)
@@ -1364,7 +1467,16 @@ class DisplacementNet(tf.keras.Model):
             u_deep = deep_head(h_deep_norm)
             stress_hfeat = None
             if stress_split is not None and stress_source is not None:
-                stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
+                contact_mask = self._contact_mask_from_semantics(semantic_feat, dtype=hcur.dtype)
+                if (
+                    contact_mask is not None
+                    and tf.executing_eagerly()
+                    and bool(tf.reduce_all(contact_mask > 0.5).numpy())
+                ):
+                    stress_hfeat = local_stress_feat
+                    local_stress_feat = None
+                else:
+                    stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
             return _apply_output_adaptive(
                 u_shallow,
                 u_deep,
@@ -1373,6 +1485,8 @@ class DisplacementNet(tf.keras.Model):
                 h_deep_norm,
                 use_mlp_head=False,
                 stress_hfeat=stress_hfeat,
+                semantic_feat=semantic_feat,
+                local_stress_feat=local_stress_feat,
             )
         # --- Decide graph vs MLP ---
         if force_pointwise:

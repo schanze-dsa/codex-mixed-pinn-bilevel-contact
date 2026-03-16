@@ -106,10 +106,15 @@ class InnovationHookTests(unittest.TestCase):
             part2mat=part2mat,
             mirror_surface_name="MIRROR UP",
         )
-        self.assertEqual(feats.shape, (4, 4))
+        self.assertEqual(feats.shape, (4, 8))
         self.assertGreater(float(feats[1, 0]), 0.5)
         self.assertGreater(float(feats[2, 0]), 0.5)
         self.assertGreater(float(feats[0, 1]), 0.5)
+        self.assertGreater(float(feats[0, 2]), 0.5)
+        self.assertGreater(float(feats[0, 4]), 0.5)
+        self.assertGreater(float(feats[0, 5]), 0.5)
+        self.assertAlmostEqual(float(feats[0, 6]), 0.0, places=6)
+        self.assertGreater(float(feats[0, 7]), 0.5)
         self.assertTrue(np.all(np.isfinite(feats)))
 
     def test_residual_driven_sigma_calibration_is_monotonic(self):
