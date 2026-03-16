@@ -20,6 +20,7 @@ if SRC not in sys.path:
 from physics.elasticity_config import ElasticityConfig
 from physics.elasticity_residual import ElasticityResidual
 from physics.material_lib import MaterialLibrary
+from model.pinn_model import ModelConfig, EncoderConfig, FieldConfig, create_displacement_model
 
 
 class MixedElasticityResidualTests(unittest.TestCase):
@@ -67,6 +68,30 @@ class MixedElasticityResidualTests(unittest.TestCase):
 
         div_sigma = residual.equilibrium_residual(sigma_fn, params={})
         tf.debugging.assert_near(div_sigma, tf.zeros_like(div_sigma), atol=1.0e-6)
+
+    def test_eps_guided_stress_head_keeps_mixed_residual_paths_computable(self):
+        residual = self._make_residual()
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=False,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=True,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        params = {"P_hat": tf.zeros((1, 3), dtype=tf.float32)}
+
+        constitutive = residual.constitutive_residual(model.u_fn, model.sigma_fn, params)
+        equilibrium = residual.equilibrium_residual(model.sigma_fn, params)
+
+        self.assertIsNotNone(model.field.stress_out_eps_mlp)
+        self.assertEqual(tuple(constitutive.shape), (4, 6))
+        self.assertEqual(tuple(equilibrium.shape), (4, 3))
+        tf.debugging.assert_all_finite(constitutive, "constitutive residual must stay finite")
+        tf.debugging.assert_all_finite(equilibrium, "equilibrium residual must stay finite")
 
 
 if __name__ == "__main__":

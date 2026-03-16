@@ -106,6 +106,8 @@ class FieldConfig:
     adaptive_depth_threshold: float = 0.5
     adaptive_depth_temperature: float = 1.0
     adaptive_depth_route_source: str = "z_norm"  # z_norm | contact_residual
+    stress_branch_early_split: bool = False
+    use_eps_guided_stress_head: bool = False
 
 @dataclass
 class ModelConfig:
@@ -152,6 +154,43 @@ def _maybe_mixed_precision(policy: Optional[str]):
             print(f"[pinn_model] Mixed precision policy set to: {policy}")
         except Exception as e:
             print(f"[pinn_model] Failed to set mixed precision '{policy}': {e}")
+
+
+def _stress_split_index(total_layers: int) -> int:
+    total_layers = int(max(total_layers, 0))
+    if total_layers <= 0:
+        return 0
+    return max(1, total_layers - 2)
+
+
+def _engineering_strain_from_tape(
+    tape: tf.GradientTape,
+    coords: tf.Tensor,
+    u: tf.Tensor,
+) -> tf.Tensor:
+    du_dx = tape.gradient(
+        tf.reduce_sum(u[:, 0]),
+        coords,
+        unconnected_gradients=tf.UnconnectedGradients.ZERO,
+    )
+    dv_dx = tape.gradient(
+        tf.reduce_sum(u[:, 1]),
+        coords,
+        unconnected_gradients=tf.UnconnectedGradients.ZERO,
+    )
+    dw_dx = tape.gradient(
+        tf.reduce_sum(u[:, 2]),
+        coords,
+        unconnected_gradients=tf.UnconnectedGradients.ZERO,
+    )
+
+    eps_xx = du_dx[:, 0]
+    eps_yy = dv_dx[:, 1]
+    eps_zz = dw_dx[:, 2]
+    gamma_yz = dv_dx[:, 2] + dw_dx[:, 1]
+    gamma_xz = du_dx[:, 2] + dw_dx[:, 0]
+    gamma_xy = du_dx[:, 1] + dv_dx[:, 0]
+    return tf.stack([eps_xx, eps_yy, eps_zz, gamma_yz, gamma_xz, gamma_xy], axis=1)
 
 
 # -----------------------------
@@ -618,6 +657,8 @@ class DisplacementNet(tf.keras.Model):
         self.use_film = bool(getattr(cfg, "use_film", False))
         self.use_finite_spectral = bool(getattr(cfg, "use_finite_spectral", False))
         self.use_engineering_semantics = bool(getattr(cfg, "use_engineering_semantics", False))
+        self.stress_branch_early_split = bool(getattr(cfg, "stress_branch_early_split", False))
+        self.use_eps_guided_stress_head = bool(getattr(cfg, "use_eps_guided_stress_head", False))
         self.adaptive_depth_enabled = bool(getattr(cfg, "adaptive_depth_enabled", False))
         self.adaptive_depth_mode = str(getattr(cfg, "adaptive_depth_mode", "hard") or "hard").strip().lower()
         if self.adaptive_depth_mode not in {"hard", "soft"}:
@@ -698,6 +739,18 @@ class DisplacementNet(tf.keras.Model):
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
         )
+        self.stress_branch_mlp_split_index = _stress_split_index(len(self.mlp_layers))
+        self.stress_branch_mlp_layers: list[tf.keras.layers.Layer] = []
+        if self.stress_branch_early_split and cfg.stress_out_dim > 0:
+            mlp_branch_depth = max(1, len(self.mlp_layers) - self.stress_branch_mlp_split_index)
+            for bi in range(mlp_branch_depth):
+                self.stress_branch_mlp_layers.append(
+                    tf.keras.layers.Dense(
+                        cfg.width,
+                        kernel_initializer="he_uniform",
+                        name=f"stress_branch_mlp_{bi}",
+                    )
+                )
         self.mlp_out_shallow = None
         self.mlp_out_deep = None
         if self.adaptive_depth_enabled:
@@ -727,6 +780,22 @@ class DisplacementNet(tf.keras.Model):
             for _ in range(cfg.graph_layers)
         ]
         # FiLM 璋冨埗锛氫负姣忓眰鍑嗗 纬/尾锛屽垵濮嬩负鎭掔瓑锛埼?1, 尾=0锛?
+        self.stress_branch_graph_split_index = _stress_split_index(len(self.graph_layers))
+        self.stress_branch_graph_layers: list[GraphConvLayer] = []
+        self.stress_branch_graph_norm = None
+        if self.stress_branch_early_split and cfg.stress_out_dim > 0:
+            graph_branch_depth = max(1, len(self.graph_layers) - self.stress_branch_graph_split_index)
+            self.stress_branch_graph_layers = [
+                GraphConvLayer(
+                    hidden_dim=cfg.graph_width,
+                    k=cfg.graph_k,
+                    act=cfg.act,
+                    dropout=cfg.graph_dropout,
+                    chunk_size=cfg.graph_knn_chunk,
+                )
+                for _ in range(graph_branch_depth)
+            ]
+            self.stress_branch_graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
         self.film_gamma: list[tf.keras.layers.Layer] = []
         self.film_beta: list[tf.keras.layers.Layer] = []
         if self.use_film:
@@ -771,6 +840,8 @@ class DisplacementNet(tf.keras.Model):
         self.stress_out_deep = None
         self.stress_out_mlp_shallow = None
         self.stress_out_mlp_deep = None
+        self.stress_out_eps = None
+        self.stress_out_eps_mlp = None
         if cfg.stress_out_dim > 0:
             self.stress_out = tf.keras.layers.Dense(
                 cfg.stress_out_dim,
@@ -802,6 +873,17 @@ class DisplacementNet(tf.keras.Model):
                     cfg.stress_out_dim,
                     kernel_initializer="glorot_uniform",
                     name="stress_head_mlp_deep",
+                )
+            if self.use_eps_guided_stress_head:
+                self.stress_out_eps = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_graph_eps",
+                )
+                self.stress_out_eps_mlp = tf.keras.layers.Dense(
+                    cfg.stress_out_dim,
+                    kernel_initializer="glorot_uniform",
+                    name="stress_head_mlp_eps",
                 )
         self.uncertainty_out = None
         self.uncertainty_out_mlp = None
@@ -854,6 +936,35 @@ class DisplacementNet(tf.keras.Model):
         else:
             self.output_scale = tf.cast(scale_init, tf.float32)
 
+    def _uses_mlp_stress_head(self, stress_feat: tf.Tensor) -> bool:
+        return bool(
+            self.stress_out_mlp is not None
+            and (stress_feat.shape.rank is None or stress_feat.shape[-1] != self.cfg.graph_width)
+        )
+
+    def predict_stress_from_features(
+        self,
+        stress_feat: tf.Tensor,
+        eps_bridge: Optional[tf.Tensor] = None,
+    ) -> tf.Tensor:
+        if self.stress_out is None:
+            raise ValueError("stress head disabled (stress_out_dim<=0)")
+
+        stress_feat = tf.convert_to_tensor(stress_feat)
+        use_mlp_head = self._uses_mlp_stress_head(stress_feat)
+
+        if eps_bridge is not None:
+            eps_bridge = tf.cast(eps_bridge, stress_feat.dtype)
+            fused = tf.concat([stress_feat, eps_bridge], axis=-1)
+            if use_mlp_head and self.stress_out_eps_mlp is not None:
+                return self.stress_out_eps_mlp(fused)
+            if self.stress_out_eps is not None:
+                return self.stress_out_eps(fused)
+
+        if use_mlp_head:
+            return self.stress_out_mlp(stress_feat)
+        return self.stress_out(stress_feat)
+
     def set_node_semantic_features(self, features: np.ndarray | tf.Tensor):
         """Attach per-node engineering semantic features (N_nodes, F)."""
 
@@ -899,6 +1010,7 @@ class DisplacementNet(tf.keras.Model):
         z: tf.Tensor,
         training: bool | None = False,
         return_stress: bool = False,
+        return_stress_features: bool = False,
         return_uncertainty: bool = False,
         force_pointwise: bool = False,
     ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor] | Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -982,7 +1094,12 @@ class DisplacementNet(tf.keras.Model):
         
         h = tf.concat([x_feat, zb], axis=-1)
 
-        def _apply_output(u_out: tf.Tensor, coords: tf.Tensor, hfeat: tf.Tensor):
+        def _apply_output(
+            u_out: tf.Tensor,
+            coords: tf.Tensor,
+            hfeat: tf.Tensor,
+            stress_hfeat: Optional[tf.Tensor] = None,
+        ):
             # Output scaling: network predicts normalized displacement first.
             scale = tf.cast(self.output_scale, u_out.dtype)
             u_out = u_out * scale
@@ -1000,17 +1117,10 @@ class DisplacementNet(tf.keras.Model):
                 dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
                 u_out = u_out * mask[:, None] * dof_mask
 
+            stress_feat = stress_hfeat if stress_hfeat is not None else hfeat
             sigma_out = None
             if return_stress:
-                if self.stress_out is None:
-                    raise ValueError("stress head disabled (stress_out_dim<=0)")
-                if (
-                    self.stress_out_mlp is not None
-                    and (hfeat.shape.rank is None or hfeat.shape[-1] != self.cfg.graph_width)
-                ):
-                    sigma_out = self.stress_out_mlp(hfeat)
-                else:
-                    sigma_out = self.stress_out(hfeat)
+                sigma_out = self.predict_stress_from_features(stress_feat)
 
             log_var = None
             if return_uncertainty:
@@ -1024,6 +1134,10 @@ class DisplacementNet(tf.keras.Model):
                 else:
                     log_var = self.uncertainty_out(hfeat)
 
+            if return_stress_features and return_uncertainty:
+                return u_out, stress_feat, log_var
+            if return_stress_features:
+                return u_out, stress_feat
             if return_stress and return_uncertainty:
                 return u_out, sigma_out, log_var
             if return_stress:
@@ -1040,6 +1154,7 @@ class DisplacementNet(tf.keras.Model):
             hfeat_deep: tf.Tensor,
             *,
             use_mlp_head: bool,
+            stress_hfeat: Optional[tf.Tensor] = None,
         ):
             alpha = self._sample_route_alpha(z, u_deep.dtype)
             one = tf.cast(1.0, u_deep.dtype)
@@ -1060,18 +1175,23 @@ class DisplacementNet(tf.keras.Model):
                 u_out = u_out * mask[:, None] * dof_mask
 
             sigma_out = None
-            if return_stress:
-                if self.stress_out is None:
-                    raise ValueError("stress head disabled (stress_out_dim<=0)")
-                if use_mlp_head:
-                    shallow_head = self.stress_out_mlp_shallow or self.stress_out_mlp
-                    deep_head = self.stress_out_mlp_deep or self.stress_out_mlp
+            stress_feat = stress_hfeat
+            if return_stress or return_stress_features:
+                if stress_hfeat is not None:
+                    if return_stress:
+                        sigma_out = self.predict_stress_from_features(stress_hfeat)
                 else:
-                    shallow_head = self.stress_out_shallow or self.stress_out
-                    deep_head = self.stress_out_deep or self.stress_out
-                sigma_shallow = shallow_head(hfeat_shallow)
-                sigma_deep = deep_head(hfeat_deep)
-                sigma_out = (one - alpha) * sigma_shallow + alpha * sigma_deep
+                    if use_mlp_head:
+                        shallow_head = self.stress_out_mlp_shallow or self.stress_out_mlp
+                        deep_head = self.stress_out_mlp_deep or self.stress_out_mlp
+                    else:
+                        shallow_head = self.stress_out_shallow or self.stress_out
+                        deep_head = self.stress_out_deep or self.stress_out
+                    sigma_shallow = shallow_head(hfeat_shallow)
+                    sigma_deep = deep_head(hfeat_deep)
+                    stress_feat = (one - alpha) * hfeat_shallow + alpha * hfeat_deep
+                    if return_stress:
+                        sigma_out = (one - alpha) * sigma_shallow + alpha * sigma_deep
 
             log_var = None
             if return_uncertainty:
@@ -1087,6 +1207,10 @@ class DisplacementNet(tf.keras.Model):
                 log_var_deep = deep_head(hfeat_deep)
                 log_var = (one - alpha) * log_var_shallow + alpha * log_var_deep
 
+            if return_stress_features and return_uncertainty:
+                return u_out, stress_feat, log_var
+            if return_stress_features:
+                return u_out, stress_feat
             if return_stress and return_uncertainty:
                 return u_out, sigma_out, log_var
             if return_stress:
@@ -1095,13 +1219,43 @@ class DisplacementNet(tf.keras.Model):
                 return u_out, log_var
             return u_out
 
+        def _run_stress_branch_mlp(shared_feat: tf.Tensor) -> tf.Tensor:
+            stress_feat = shared_feat
+            for layer in self.stress_branch_mlp_layers:
+                stress_feat = self.mlp_act(layer(stress_feat))
+            return stress_feat
+
+        def _run_stress_branch_graph(
+            shared_feat: tf.Tensor,
+            coords: tf.Tensor,
+            knn_idx: tf.Tensor,
+            adj: tf.sparse.SparseTensor | None,
+        ) -> tf.Tensor:
+            stress_feat = shared_feat
+            for layer in self.stress_branch_graph_layers:
+                stress_feat = layer(stress_feat, coords, knn_idx, adj=adj, training=training)
+            if self.stress_branch_graph_norm is not None:
+                stress_feat = self.stress_branch_graph_norm(stress_feat)
+            return stress_feat
+
         def mlp_forward():
             hcur = h
+            stress_split = None
+            if return_stress and self.stress_branch_early_split and self.stress_branch_mlp_layers:
+                stress_split = self.stress_branch_mlp_split_index
+            stress_source = hcur if stress_split == 0 else None
             if not self.adaptive_depth_enabled:
-                for layer in self.mlp_layers:
+                for li, layer in enumerate(self.mlp_layers, start=1):
                     hcur = self.mlp_act(layer(hcur))
+                    if stress_split is not None and li == stress_split:
+                        stress_source = hcur
+                if stress_split is not None and stress_source is None:
+                    stress_source = hcur
                 u_out = self.mlp_out(hcur)
-                return _apply_output(u_out, x, hcur)
+                stress_hfeat = None
+                if stress_split is not None and stress_source is not None:
+                    stress_hfeat = _run_stress_branch_mlp(stress_source)
+                return _apply_output(u_out, x, hcur, stress_hfeat=stress_hfeat)
 
             shallow_depth = min(
                 self.adaptive_depth_shallow_layers,
@@ -1110,8 +1264,12 @@ class DisplacementNet(tf.keras.Model):
             h_shallow = None
             for li, layer in enumerate(self.mlp_layers, start=1):
                 hcur = self.mlp_act(layer(hcur))
+                if stress_split is not None and li == stress_split:
+                    stress_source = hcur
                 if li == shallow_depth:
                     h_shallow = hcur
+            if stress_split is not None and stress_source is None:
+                stress_source = hcur
             if h_shallow is None:
                 h_shallow = hcur
             h_deep = hcur
@@ -1120,6 +1278,9 @@ class DisplacementNet(tf.keras.Model):
             deep_head = self.mlp_out_deep or self.mlp_out
             u_shallow = shallow_head(h_shallow)
             u_deep = deep_head(h_deep)
+            stress_hfeat = None
+            if stress_split is not None and stress_source is not None:
+                stress_hfeat = _run_stress_branch_mlp(stress_source)
             return _apply_output_adaptive(
                 u_shallow,
                 u_deep,
@@ -1127,6 +1288,7 @@ class DisplacementNet(tf.keras.Model):
                 h_shallow,
                 h_deep,
                 use_mlp_head=True,
+                stress_hfeat=stress_hfeat,
             )
 
         def graph_forward():
@@ -1157,6 +1319,10 @@ class DisplacementNet(tf.keras.Model):
                 knn_idx, adj = tf.cond(use_cached, _use_cache, _build_dynamic)
 
             hcur = self.graph_proj(h)
+            stress_split = None
+            if return_stress and self.stress_branch_early_split and self.stress_branch_graph_layers:
+                stress_split = self.stress_branch_graph_split_index
+            stress_source = hcur if stress_split == 0 else None
             film_gamma = self.film_gamma if self.use_film else None
             film_beta = self.film_beta if self.use_film else None
             shallow_depth = min(
@@ -1172,16 +1338,23 @@ class DisplacementNet(tf.keras.Model):
                     gamma = tf.cast(gamma, hcur.dtype)
                     beta = tf.cast(beta, hcur.dtype)
                     hcur = gamma * hcur + beta
+                if stress_split is not None and li == stress_split:
+                    stress_source = hcur
                 if li == shallow_depth:
                     h_shallow = hcur
 
+            if stress_split is not None and stress_source is None:
+                stress_source = hcur
             if h_shallow is None:
                 h_shallow = hcur
 
             if not self.adaptive_depth_enabled:
                 hcur = self.graph_norm(hcur)
                 u_out = self.graph_out(hcur)
-                return _apply_output(u_out, coords, hcur)
+                stress_hfeat = None
+                if stress_split is not None and stress_source is not None:
+                    stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
+                return _apply_output(u_out, coords, hcur, stress_hfeat=stress_hfeat)
 
             h_shallow_norm = self.graph_norm(h_shallow)
             h_deep_norm = self.graph_norm(hcur)
@@ -1189,6 +1362,9 @@ class DisplacementNet(tf.keras.Model):
             deep_head = self.graph_out_deep or self.graph_out
             u_shallow = shallow_head(h_shallow_norm)
             u_deep = deep_head(h_deep_norm)
+            stress_hfeat = None
+            if stress_split is not None and stress_source is not None:
+                stress_hfeat = _run_stress_branch_graph(stress_source, coords, knn_idx, adj)
             return _apply_output_adaptive(
                 u_shallow,
                 u_deep,
@@ -1196,6 +1372,7 @@ class DisplacementNet(tf.keras.Model):
                 h_shallow_norm,
                 h_deep_norm,
                 use_mlp_head=False,
+                stress_hfeat=stress_hfeat,
             )
         # --- Decide graph vs MLP ---
         if force_pointwise:
@@ -1371,6 +1548,17 @@ class DisplacementModel:
     def _us_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         if self.field.stress_out is None:
             raise ValueError("stress head disabled (stress_out_dim<=0)")
+        if self.field.use_eps_guided_stress_head:
+            with tf.GradientTape(persistent=True) as tape:
+                tape.watch(X)
+                z = self.encoder(P_hat)
+                u, stress_feat = self.field(X, z, return_stress_features=True)
+                u = tf.cast(u, tf.float32)
+            eps_bridge = _engineering_strain_from_tape(tape, X, u)
+            del tape
+            sigma = self.field.predict_stress_from_features(stress_feat, eps_bridge=eps_bridge)
+            return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
         z = self.encoder(P_hat)          # (B, cond_dim)
         u, sigma = self.field(X, z, return_stress=True)
         return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
@@ -1386,6 +1574,22 @@ class DisplacementModel:
     def _us_fn_pointwise_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         if self.field.stress_out is None:
             raise ValueError("stress head disabled (stress_out_dim<=0)")
+        if self.field.use_eps_guided_stress_head:
+            with tf.GradientTape(persistent=True) as tape:
+                tape.watch(X)
+                z = self.encoder(P_hat)
+                u, stress_feat = self.field(
+                    X,
+                    z,
+                    return_stress_features=True,
+                    force_pointwise=True,
+                )
+                u = tf.cast(u, tf.float32)
+            eps_bridge = _engineering_strain_from_tape(tape, X, u)
+            del tape
+            sigma = self.field.predict_stress_from_features(stress_feat, eps_bridge=eps_bridge)
+            return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
         z = self.encoder(P_hat)
         u, sigma = self.field(X, z, return_stress=True, force_pointwise=True)
         return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)

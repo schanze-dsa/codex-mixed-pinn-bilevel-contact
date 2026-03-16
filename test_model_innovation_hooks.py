@@ -21,6 +21,7 @@ if SRC not in sys.path:
 from inp_io.inp_parser import AssemblyModel, BoundaryEntry, ElementBlock, PartMesh
 from model.pinn_model import ModelConfig, create_displacement_model
 from train.trainer import build_node_semantic_features
+from train.trainer_config import TrainerConfig
 from train.uncertainty_calibration import calibrate_sigma_by_residual
 
 
@@ -47,6 +48,14 @@ def _make_minimal_asm() -> AssemblyModel:
 
 
 class InnovationHookTests(unittest.TestCase):
+    def test_trainer_config_surfaces_p2_stress_branch_flags_default_off(self):
+        cfg = TrainerConfig()
+
+        self.assertTrue(hasattr(cfg.model_cfg.field, "stress_branch_early_split"))
+        self.assertTrue(hasattr(cfg.model_cfg.field, "use_eps_guided_stress_head"))
+        self.assertFalse(cfg.model_cfg.field.stress_branch_early_split)
+        self.assertFalse(cfg.model_cfg.field.use_eps_guided_stress_head)
+
     def test_displacement_model_supports_finite_spectral_semantic_and_uncertainty(self):
         cfg = ModelConfig()
         cfg.field.dfem_mode = True
