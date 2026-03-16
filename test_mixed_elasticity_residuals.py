@@ -93,6 +93,45 @@ class MixedElasticityResidualTests(unittest.TestCase):
         tf.debugging.assert_all_finite(constitutive, "constitutive residual must stay finite")
         tf.debugging.assert_all_finite(equilibrium, "equilibrium residual must stay finite")
 
+    def test_mixed_residual_terms_matches_existing_residual_helpers(self):
+        residual = self._make_residual()
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=False,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=True,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        params = {"P_hat": tf.zeros((1, 3), dtype=tf.float32)}
+
+        expected_constitutive = residual.constitutive_residual(model.u_fn, model.sigma_fn, params)
+        expected_equilibrium = residual.equilibrium_residual(model.sigma_fn, params)
+
+        terms = residual.mixed_residual_terms(
+            model.u_fn,
+            model.sigma_fn,
+            params,
+            return_cache=True,
+        )
+
+        self.assertIn("R_const", terms)
+        self.assertIn("R_eq", terms)
+        self.assertIn("cache", terms)
+        self.assertEqual(tuple(terms["R_const"].shape), (4, 6))
+        self.assertEqual(tuple(terms["R_eq"].shape), (4, 3))
+        self.assertIn("eps_vec", terms["cache"])
+        self.assertIn("sigma_pred", terms["cache"])
+        self.assertIn("sigma_phys", terms["cache"])
+        self.assertIn("div_sigma", terms["cache"])
+        tf.debugging.assert_near(terms["R_const"], expected_constitutive, atol=1.0e-6)
+        tf.debugging.assert_near(terms["R_eq"], expected_equilibrium, atol=1.0e-6)
+        tf.debugging.assert_all_finite(terms["R_const"], "R_const must stay finite")
+        tf.debugging.assert_all_finite(terms["R_eq"], "R_eq must stay finite")
+
 
 if __name__ == "__main__":
     unittest.main()

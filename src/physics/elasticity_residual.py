@@ -229,6 +229,13 @@ class ElasticityResidual:
         sigma = tf.stack([sigma_xx, sigma_yy, sigma_zz, sigma_yz, sigma_xz, sigma_xy], axis=1)
         return sigma
 
+    @staticmethod
+    def _eval_sigma_output(sigma_fn, X: tf.Tensor, params) -> tf.Tensor:
+        out = sigma_fn(X, params)
+        if isinstance(out, (tuple, list)) and len(out) >= 2:
+            out = out[1]
+        return tf.cast(out, tf.float32)
+
     def constitutive_residual(self, u_fn, sigma_fn, params):
         """Mixed constitutive residual: sigma_pred - C:epsilon(u)."""
 
@@ -237,7 +244,7 @@ class ElasticityResidual:
             X = X * tf.cast(self.cfg.coord_scale, X.dtype)
 
         _, eps_vec, _ = self._compute_strain(u_fn, params, X)
-        sigma_pred = tf.cast(sigma_fn(X, params), tf.float32)
+        sigma_pred = self._eval_sigma_output(sigma_fn, X, params)
         sigma_phys = self._sigma_from_eps(eps_vec, lam, mu)
         return sigma_pred - sigma_phys
 
@@ -250,7 +257,7 @@ class ElasticityResidual:
 
         with tf.GradientTape(persistent=True) as tape:
             tape.watch(X)
-            sigma = tf.cast(sigma_fn(X, params), tf.float32)
+            sigma = self._eval_sigma_output(sigma_fn, X, params)
 
         dsig_xx = tape.gradient(
             tf.reduce_sum(sigma[:, 0]),
@@ -288,6 +295,35 @@ class ElasticityResidual:
         div_y = dsig_xy[:, 0] + dsig_yy[:, 1] + dsig_yz[:, 2]
         div_z = dsig_xz[:, 0] + dsig_yz[:, 1] + dsig_zz[:, 2]
         return tf.stack([div_x, div_y, div_z], axis=1)
+
+    def mixed_residual_terms(self, u_fn, sigma_fn, params, *, return_cache: bool = False):
+        """Canonical mixed residual contract for strict mixed training."""
+
+        X, w, lam, mu, _ = self._select_points()
+        if self.cfg.coord_scale and self.cfg.coord_scale != 1.0:
+            X = X * tf.cast(self.cfg.coord_scale, X.dtype)
+
+        _, eps_vec, _ = self._compute_strain(u_fn, params, X)
+        sigma_phys = self._sigma_from_eps(eps_vec, lam, mu)
+        sigma_pred = self._eval_sigma_output(sigma_fn, X, params)
+        r_const = sigma_pred - sigma_phys
+        r_eq = self.equilibrium_residual(sigma_fn, params)
+
+        terms = {
+            "R_const": r_const,
+            "R_eq": r_eq,
+        }
+        if not return_cache:
+            return terms
+
+        terms["cache"] = {
+            "eps_vec": eps_vec,
+            "sigma_pred": sigma_pred,
+            "sigma_phys": sigma_phys,
+            "div_sigma": r_eq,
+            "w_sel": w,
+        }
+        return terms
 
     def energy(self, u_fn, params, tape=None, return_cache: bool = False, u_nodes=None):
         X, w, lam, mu, idx = self._select_points()
