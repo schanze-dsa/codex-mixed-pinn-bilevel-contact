@@ -115,6 +115,8 @@ class FieldConfig:
     adaptive_depth_route_source: str = "z_norm"  # z_norm | contact_residual
     stress_branch_early_split: bool = False
     use_eps_guided_stress_head: bool = False
+    strict_mixed_default_eps_bridge: bool = False
+    strict_mixed_contact_pointwise_stress: bool = False
     contact_stress_hybrid_enabled: bool = False
 
 @dataclass
@@ -1741,8 +1743,20 @@ class DisplacementModel:
             raise ValueError("stress head disabled (stress_out_dim<=0)")
 
         contact_surface_active = self._extract_contact_surface_frame(params) is not None
-        force_pointwise = bool(force_pointwise or contact_surface_active)
-        use_eps_bridge = bool(self.field.use_eps_guided_stress_head or contact_surface_active)
+        strict_mixed_default_eps_bridge = bool(
+            getattr(self.field.cfg, "strict_mixed_default_eps_bridge", False)
+        )
+        strict_mixed_contact_pointwise_stress = bool(
+            getattr(self.field.cfg, "strict_mixed_contact_pointwise_stress", False)
+        )
+        force_pointwise = bool(
+            force_pointwise
+            or (contact_surface_active and strict_mixed_contact_pointwise_stress)
+        )
+        use_eps_bridge = bool(
+            self.field.use_eps_guided_stress_head
+            or (contact_surface_active and strict_mixed_default_eps_bridge)
+        )
 
         with self._contact_surface_stress_context(params):
             if use_eps_bridge:
@@ -1874,6 +1888,8 @@ class DisplacementModel:
         sigma 鐨勭淮搴︾敱 cfg.field.stress_out_dim 鍐冲畾锛堥粯璁?6锛夈€?
         """
         X, P_hat = self._normalize_inputs(X, params)
+        if self._extract_contact_surface_frame(params) is not None:
+            return self._us_fn_runtime(X, P_hat, params=params, force_pointwise=False)
         return self._us_fn_compiled(X, P_hat)
 
     def sigma_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:

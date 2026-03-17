@@ -932,6 +932,17 @@ def _prepare_config_with_autoguess(config_path=None):
     if "semantic_feat_dim" in net_cfg_yaml:
         cfg.model_cfg.field.semantic_feat_dim = int(net_cfg_yaml["semantic_feat_dim"])
         print(f"[main] Semantic feature dim: {cfg.model_cfg.field.semantic_feat_dim}")
+    if "strict_mixed_default_eps_bridge" in net_cfg_yaml:
+        cfg.model_cfg.field.strict_mixed_default_eps_bridge = bool(net_cfg_yaml["strict_mixed_default_eps_bridge"])
+        print(f"[main] Strict mixed default eps bridge: {cfg.model_cfg.field.strict_mixed_default_eps_bridge}")
+    if "strict_mixed_contact_pointwise_stress" in net_cfg_yaml:
+        cfg.model_cfg.field.strict_mixed_contact_pointwise_stress = bool(
+            net_cfg_yaml["strict_mixed_contact_pointwise_stress"]
+        )
+        print(
+            "[main] Strict mixed contact pointwise stress: "
+            f"{cfg.model_cfg.field.strict_mixed_contact_pointwise_stress}"
+        )
     if (
         bool(getattr(cfg.model_cfg.field, "use_engineering_semantics", False))
         and int(getattr(cfg.model_cfg.field, "semantic_feat_dim", 0) or 0) <= 0

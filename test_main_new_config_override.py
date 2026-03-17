@@ -467,6 +467,16 @@ print(\"hello\")
         self.assertFalse(cfg.mixed_bilevel_phase.tangential_ift_enabled)
         self.assertFalse(cfg.mixed_bilevel_phase.detach_inner_solution)
 
+    def test_prepare_config_sets_strict_mixed_stress_defaults(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertTrue(cfg.model_cfg.field.strict_mixed_default_eps_bridge)
+        self.assertTrue(cfg.model_cfg.field.strict_mixed_contact_pointwise_stress)
+
 
 if __name__ == "__main__":
     unittest.main()
