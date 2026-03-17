@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -314,6 +317,44 @@ class MainNewConfigOverrideTests(unittest.TestCase):
         self.assertNotEqual(phase2_cfg.resume_ckpt_path, phase1_result.final_ckpt_path)
         self.assertIs(result["phase1"], phase1_result)
         self.assertIs(result["phase2"], phase2_result)
+
+    def test_default_saved_model_export_notice_is_safe_for_gbk_stdout(self):
+        main_new = _load_main_new_module()
+        cfg = SimpleNamespace(out_dir="./results/ansys_supervised/phase2")
+        expected_dir = os.path.abspath("./results/ansys_supervised/phase2/saved_model_test")
+        stdout_buffer = io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_buffer, encoding="gbk")
+
+        with patch.object(main_new, "_default_saved_model_dir", return_value=expected_dir), patch.object(
+            main_new.sys, "stdout", stdout
+        ):
+            export_dir = main_new._resolve_export_dir(cfg, export_saved_model="")
+            stdout.flush()
+
+        self.assertEqual(export_dir, expected_dir)
+        self.assertIn("SavedModel", stdout_buffer.getvalue().decode("gbk"))
+
+    def test_setup_run_logs_process_exits_cleanly(self):
+        script = f"""
+import importlib.util
+from pathlib import Path
+module_path = Path(r\"{MODULE_PATH}\")
+spec = importlib.util.spec_from_file_location(\"main_new_exit_test\", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._setup_run_logs()
+print(\"hello\")
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+        self.assertIn("hello", proc.stdout)
 
     def test_default_config_matches_supervised_defaults(self):
         main_new = _load_main_new_module()

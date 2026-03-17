@@ -40,6 +40,8 @@ CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
 _LOG_READY = False
 _LOG_FILES = []
+_LOG_STDOUT = None
+_LOG_STDERR = None
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -77,7 +79,7 @@ def _strip_ansi(text: str) -> str:
 
 def _setup_run_logs(log_dir: str = "", prefix: str = "train"):
     """Duplicate stdout/stderr to files while keeping console output."""
-    global _LOG_READY, _LOG_FILES
+    global _LOG_READY, _LOG_FILES, _LOG_STDOUT, _LOG_STDERR
     if _LOG_READY:
         return
     base = log_dir or ROOT
@@ -87,17 +89,28 @@ def _setup_run_logs(log_dir: str = "", prefix: str = "train"):
     stdout_f = open(stdout_path, "w", encoding="utf-8-sig", buffering=1)
     stderr_f = open(stderr_path, "w", encoding="utf-8-sig", buffering=1)
     _LOG_FILES = [stdout_f, stderr_f]
-    sys.stdout = _Tee(sys.stdout, stdout_f, filters=[None, _strip_ansi])
-    sys.stderr = _Tee(sys.stderr, stderr_f, filters=[None, _strip_ansi])
+    _LOG_STDOUT = sys.stdout
+    _LOG_STDERR = sys.stderr
+    sys.stdout = _Tee(_LOG_STDOUT, stdout_f, filters=[None, _strip_ansi])
+    sys.stderr = _Tee(_LOG_STDERR, stderr_f, filters=[None, _strip_ansi])
     _LOG_READY = True
 
     def _close_logs():
+        global _LOG_READY, _LOG_FILES, _LOG_STDOUT, _LOG_STDERR
+        if _LOG_STDOUT is not None:
+            sys.stdout = _LOG_STDOUT
+        if _LOG_STDERR is not None:
+            sys.stderr = _LOG_STDERR
         for handle in _LOG_FILES:
             try:
                 handle.flush()
                 handle.close()
             except Exception:
                 pass
+        _LOG_FILES = []
+        _LOG_STDOUT = None
+        _LOG_STDERR = None
+        _LOG_READY = False
 
     atexit.register(_close_logs)
 
@@ -201,6 +214,25 @@ def _resolve_export_dir(cfg: "TrainerConfig", export_saved_model):
     return export_dir
 
 # --- 项目内模块导入 ---
+def _resolve_export_dir(cfg: "TrainerConfig", export_saved_model):
+    """Resolve the SavedModel export directory for one training phase."""
+
+    if export_saved_model is None:
+        return ""
+
+    export_dir = str(export_saved_model or "").strip()
+    if export_dir:
+        export_dir = os.path.abspath(export_dir)
+        parent_dir = os.path.dirname(export_dir)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        return export_dir
+
+    export_dir = _default_saved_model_dir(cfg.out_dir)
+    print(f"[main] --export not provided; writing SavedModel to: {export_dir}")
+    return export_dir
+
+
 from train.trainer import TrainerConfig
 from inp_io.cdb_parser import load_cdb
 from mesh.contact_pairs import guess_surface_key
