@@ -170,6 +170,7 @@ class ContactInnerSolverTests(unittest.TestCase):
             "t1": np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
             "t2": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
             "w_area": np.asarray([1.0], dtype=np.float32),
+            "pair_id": np.asarray([17], dtype=np.int32),
         }
         op = ContactOperator()
         op.build_from_cat(cat, extra_weights=None, auto_orient=False)
@@ -183,6 +184,11 @@ class ContactInnerSolverTests(unittest.TestCase):
         inputs = op.strict_mixed_inputs(u_fn, params={})
 
         self.assertIsInstance(inputs, StrictMixedContactInputs)
+        self.assertIn("weights", inputs.batch_meta)
+        self.assertIn("xs", inputs.batch_meta)
+        self.assertIn("xm", inputs.batch_meta)
+        self.assertTrue(hasattr(inputs, "contact_ids"))
+        tf.debugging.assert_equal(inputs.contact_ids, tf.constant([17], dtype=tf.int32))
         self.assertIsNotNone(inputs.init_state)
         tf.debugging.assert_near(inputs.init_state.lambda_n, first.state.lambda_n)
         tf.debugging.assert_near(inputs.init_state.lambda_t, first.state.lambda_t)

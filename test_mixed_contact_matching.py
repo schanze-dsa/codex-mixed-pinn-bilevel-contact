@@ -156,6 +156,8 @@ class MixedContactMatchingTests(unittest.TestCase):
 
         inputs = contact.strict_mixed_inputs(u_fn, params={})
         self.assertIsInstance(inputs, StrictMixedContactInputs)
+        self.assertTrue(hasattr(inputs, "batch_meta"))
+        self.assertTrue(hasattr(inputs, "contact_ids"))
         warm_start = ContactInnerState(
             lambda_n=tf.constant([0.25], dtype=tf.float32),
             lambda_t=tf.constant([[0.05, 0.0]], dtype=tf.float32),

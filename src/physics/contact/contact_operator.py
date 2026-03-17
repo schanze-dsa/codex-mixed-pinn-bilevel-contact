@@ -41,7 +41,7 @@ from physics.traction_utils import traction_from_sigma_voigt
 
 
 # -----------------------------
-# Config for the unified operator
+# Config for the adapter/dispatcher
 # -----------------------------
 
 @dataclass
@@ -65,6 +65,8 @@ class ContactOperatorConfig:
 
 @dataclass
 class StrictMixedContactInputs:
+    """Typed strict-mixed adapter contract for one assembled contact batch."""
+
     g_n: tf.Tensor
     ds_t: tf.Tensor
     normals: tf.Tensor
@@ -77,6 +79,8 @@ class StrictMixedContactInputs:
     eps_n: tf.Tensor
     k_t: tf.Tensor
     init_state: Optional[ContactInnerState] = None
+    contact_ids: Optional[tf.Tensor] = None
+    batch_meta: Optional[Dict[str, tf.Tensor]] = None
 
     def __getitem__(self, key: str):
         return getattr(self, key)
@@ -105,7 +109,9 @@ class ContactOperator:
         - update_multipliers(u_fn, params=None)
         - multiply_weights(extra_w)  # runtime 再叠乘一层权重（比如 IRLS）
     """
-
+    # This is an adapter/dispatcher around one batch contact frame, not a
+    # second contact formulation. The strict-mixed route consumes the typed
+    # contract from `strict_mixed_inputs()` and reuses the same geometry/state.
     BACKEND_LEGACY_ALM = "legacy_alm"
     BACKEND_INNER_SOLVER = "inner_solver"
     DEFAULT_BACKEND = BACKEND_LEGACY_ALM
@@ -422,7 +428,7 @@ class ContactOperator:
         *,
         u_nodes: Optional[tf.Tensor] = None,
     ) -> StrictMixedContactInputs:
-        """Build geometry-driven strict-mixed inner-solver inputs from the current batch."""
+        """Assemble the typed strict-mixed adapter contract for the current batch."""
 
         if not self._built:
             raise RuntimeError("[ContactOperator] call build_from_cat() before strict_mixed_inputs().")
@@ -451,6 +457,15 @@ class ContactOperator:
                 res_norm=float(getattr(self._last_inner_state, "res_norm", 0.0) or 0.0),
                 fallback_used=bool(getattr(self._last_inner_state, "fallback_used", False)),
             )
+        meta = self._meta or {}
+        contact_ids = meta.get("pair_id")
+        if contact_ids is not None:
+            contact_ids = tf.cast(contact_ids, tf.int32)
+        batch_meta = {
+            "weights": frame["weights"],
+            "xs": frame["xs"],
+            "xm": frame["xm"],
+        }
 
         return StrictMixedContactInputs(
             g_n=g_n,
@@ -465,6 +480,8 @@ class ContactOperator:
             eps_n=tf.cast(getattr(self.normal.cfg, "fb_eps", 1.0e-8), tf.float32),
             k_t=k_t,
             init_state=init_state,
+            contact_ids=contact_ids,
+            batch_meta=batch_meta,
         )
 
     def solve_strict_inner(
