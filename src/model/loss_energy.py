@@ -409,7 +409,7 @@ class TotalEnergy:
         stats.update(
             {
                 key: tf.cast(value, dtype)
-                for key, value in policy.as_stats().items()
+                for key, value in policy.as_stats(include_text=False).items()
             }
         )
         self._strict_mixed_last_active = True

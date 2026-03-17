@@ -370,6 +370,30 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertTrue(trainer._strict_bilevel_freeze_requested)
         self.assertTrue(trainer._strict_bilevel_backoff_requested)
 
+    def test_strict_bilevel_stats_record_reason_and_instability_count(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = TrainerConfig(training_profile="strict_mixed_experimental")
+        trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+        trainer._contact_hardening_frozen = False
+        trainer._continuation_freeze_events = 0
+        trainer._strict_bilevel_freeze_requested = False
+        trainer._strict_bilevel_backoff_requested = False
+        trainer._inner_solver_not_stable_count = 0
+
+        out = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 0.0,
+                "inner_fallback_used": 1.0,
+                "inner_fb_residual_norm": 0.2,
+                "inner_max_penetration": 0.01,
+            },
+            route_mode="normal_ready",
+        )
+
+        self.assertEqual(out["continuation_backoff_applied"], 1.0)
+        self.assertIn("fallback", out["phase_hold_reason"])
+        self.assertEqual(out["inner_solver_not_stable_count"], 1.0)
+
     def test_strict_bilevel_stats_leave_stable_batches_unmodified(self):
         trainer = object.__new__(Trainer)
         trainer.cfg = TrainerConfig(training_profile="strict_mixed_experimental")

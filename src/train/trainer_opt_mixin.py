@@ -72,8 +72,11 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
         "grad_sigma_norm": "grad_sigma_norm",
         "strict_phase_hold": "strict_phase_hold",
         "strict_continuation_backoff": "strict_continuation_backoff",
+        "continuation_backoff_applied": "continuation_backoff_applied",
         "strict_force_detach": "strict_force_detach",
         "strict_traction_scale": "strict_traction_scale",
+        "phase_hold_reason": "phase_hold_reason",
+        "inner_solver_not_stable_count": "inner_solver_not_stable_count",
     }
     for out_key, in_key in key_map.items():
         if in_key not in diagnostics:
@@ -259,6 +262,11 @@ class TrainerOptMixin:
             out["strict_route_mode"] = route_mode
             out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
             out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
+            out["continuation_backoff_applied"] = 0.0
+            out["phase_hold_reason"] = ""
+            out["inner_solver_not_stable_count"] = float(
+                int(getattr(self, "_inner_solver_not_stable_count", 0) or 0)
+            )
             return out
 
         counters = getattr(self, "_strict_bilevel_stats", None)
@@ -303,11 +311,18 @@ class TrainerOptMixin:
         self._strict_bilevel_backoff_requested = bool(policy.continuation_backoff)
         self._strict_bilevel_force_detach = bool(policy.force_detach)
         self._strict_bilevel_traction_scale = float(policy.traction_scale)
+        if policy.phase_hold:
+            self._inner_solver_not_stable_count = int(
+                getattr(self, "_inner_solver_not_stable_count", 0) or 0
+            ) + 1
 
         out["inner_convergence_rate"] = float(counters["converged"]) / float(total_count)
         out["inner_fallback_rate"] = float(counters["fallback"]) / float(total_count)
         out["inner_skip_rate"] = float(counters["skipped"]) / float(total_count)
         out.update(policy.as_stats())
+        out["inner_solver_not_stable_count"] = float(
+            int(getattr(self, "_inner_solver_not_stable_count", 0) or 0)
+        )
         out["strict_route_mode"] = route_mode
         out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
         out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))

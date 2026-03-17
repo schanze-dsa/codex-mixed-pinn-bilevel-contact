@@ -30,13 +30,17 @@ class StrictMixedRuntimePolicy:
     traction_scale: float = 1.0
     reasons: Tuple[str, ...] = tuple()
 
-    def as_stats(self) -> Dict[str, float]:
-        return {
+    def as_stats(self, *, include_text: bool = True) -> Dict[str, object]:
+        stats: Dict[str, object] = {
             "strict_phase_hold": float(self.phase_hold),
             "strict_continuation_backoff": float(self.continuation_backoff),
+            "continuation_backoff_applied": float(self.continuation_backoff),
             "strict_force_detach": float(self.force_detach),
             "strict_traction_scale": float(self.traction_scale),
         }
+        if include_text:
+            stats["phase_hold_reason"] = ",".join(self.reasons)
+        return stats
 
 
 def resolve_strict_mixed_runtime_policy(

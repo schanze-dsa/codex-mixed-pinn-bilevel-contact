@@ -107,10 +107,10 @@ class TrainerMonitorMixin:
         return False
 
     @staticmethod
-    def extract_bilevel_diagnostics(stats: Optional[Mapping[str, Any]]) -> Dict[str, float]:
+    def extract_bilevel_diagnostics(stats: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         """Pick strict-bilevel diagnostics from stats for monitoring/logging."""
 
-        out: Dict[str, float] = {}
+        out: Dict[str, Any] = {}
         if not isinstance(stats, Mapping):
             return out
         for key in (
@@ -134,17 +134,23 @@ class TrainerMonitorMixin:
             "grad_sigma_norm",
             "strict_phase_hold",
             "strict_continuation_backoff",
+            "continuation_backoff_applied",
             "strict_force_detach",
             "strict_traction_scale",
+            "phase_hold_reason",
+            "inner_solver_not_stable_count",
         ):
             if key not in stats:
                 continue
             value = stats.get(key)
             try:
                 if isinstance(value, tf.Tensor):
-                    out[key] = float(tf.cast(value, tf.float32).numpy())
+                    if value.dtype == tf.string:
+                        out[key] = value.numpy().decode("utf-8")
+                    else:
+                        out[key] = float(tf.cast(value, tf.float32).numpy())
                 else:
-                    out[key] = float(value)
+                    out[key] = str(value) if key == "phase_hold_reason" else float(value)
             except Exception:
                 continue
         return out
