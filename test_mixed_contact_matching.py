@@ -28,6 +28,11 @@ class MixedContactMatchingTests(unittest.TestCase):
         self.assertEqual(op.resolve_backend("legacy_alm"), "legacy_alm")
         self.assertFalse(op.uses_inner_solver_backend("legacy_alm"))
 
+    def test_total_energy_exposes_explicit_strict_outer_loss_assembler(self):
+        total = TotalEnergy(TotalConfig(loss_mode="residual"))
+
+        self.assertTrue(callable(total.assemble_strict_mixed_outer_loss))
+
     def test_outer_mixed_loss_consumes_inner_traction_result(self):
         sigma_s = tf.constant([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], dtype=tf.float32)
         sigma_m = tf.constant([[3.0, 2.0, 1.0, 0.0, 0.0, 0.0]], dtype=tf.float32)

@@ -533,6 +533,11 @@ class TotalEnergy:
         Pi = self._combine_parts(parts)
         return Pi, parts, stats
 
+    def assemble_strict_mixed_outer_loss(self, u_fn, params=None, tape=None, stress_fn=None):
+        """Explicit strict-mixed outer-loss assembly entrypoint for trainer dispatch."""
+
+        return self.strict_mixed_objective(u_fn, params=params, tape=tape, stress_fn=stress_fn)
+
     def strict_mixed_objective(self, u_fn, params=None, tape=None, stress_fn=None):
         self._ensure_weight_vars()
         if not self._built:

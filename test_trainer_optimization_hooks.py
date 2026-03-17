@@ -763,7 +763,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
                 calls["energy"] += 1
                 raise AssertionError("legacy total.energy() should not be used in strict mixed route")
 
-            def strict_mixed_objective(self, *args, **kwargs):
+            def assemble_strict_mixed_outer_loss(self, *args, **kwargs):
                 del args, kwargs
                 calls["strict"] += 1
                 return (
@@ -771,6 +771,10 @@ class TrainerOptimizationHookTests(unittest.TestCase):
                     {"E_cn": tf.constant(1.0, dtype=tf.float32)},
                     {},
                 )
+
+            def strict_mixed_objective(self, *args, **kwargs):
+                del args, kwargs
+                raise AssertionError("trainer should use assemble_strict_mixed_outer_loss()")
 
         _, parts, stats = trainer._evaluate_total_objective(_FakeTotal(), params={}, stress_fn=None, tape=None)
 

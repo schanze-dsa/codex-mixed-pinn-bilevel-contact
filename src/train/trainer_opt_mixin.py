@@ -231,9 +231,11 @@ class TrainerOptMixin:
         if route_mode == "legacy":
             Pi, parts, stats = total.energy(self.model.u_fn, params=params, tape=tape, stress_fn=stress_fn)
         else:
-            if not hasattr(total, "strict_mixed_objective"):
-                raise RuntimeError("TotalEnergy.strict_mixed_objective() is required for strict mixed bilevel mode.")
-            Pi, parts, stats = total.strict_mixed_objective(
+            if not hasattr(total, "assemble_strict_mixed_outer_loss"):
+                raise RuntimeError(
+                    "TotalEnergy.assemble_strict_mixed_outer_loss() is required for strict mixed bilevel mode."
+                )
+            Pi, parts, stats = total.assemble_strict_mixed_outer_loss(
                 self.model.u_fn,
                 params=params,
                 tape=tape,
