@@ -132,6 +132,10 @@ class TrainerMonitorMixin:
             "ift_linear_residual",
             "grad_u_norm",
             "grad_sigma_norm",
+            "strict_phase_hold",
+            "strict_continuation_backoff",
+            "strict_force_detach",
+            "strict_traction_scale",
         ):
             if key not in stats:
                 continue

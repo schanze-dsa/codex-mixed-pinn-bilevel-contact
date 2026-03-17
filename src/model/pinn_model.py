@@ -1740,8 +1740,12 @@ class DisplacementModel:
         if self.field.stress_out is None:
             raise ValueError("stress head disabled (stress_out_dim<=0)")
 
+        contact_surface_active = self._extract_contact_surface_frame(params) is not None
+        force_pointwise = bool(force_pointwise or contact_surface_active)
+        use_eps_bridge = bool(self.field.use_eps_guided_stress_head or contact_surface_active)
+
         with self._contact_surface_stress_context(params):
-            if self.field.use_eps_guided_stress_head:
+            if use_eps_bridge:
                 with tf.GradientTape(persistent=True) as tape:
                     tape.watch(X)
                     z = self.encoder(P_hat)

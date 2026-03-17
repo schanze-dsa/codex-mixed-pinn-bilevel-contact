@@ -15,6 +15,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from physics.contact import contact_friction_alm, contact_normal_alm
 from physics.contact.contact_inner_kernel_primitives import (
     check_contact_feasibility,
     compose_contact_traction,
@@ -82,6 +83,10 @@ class ContactInnerKernelPrimitiveTests(unittest.TestCase):
         self.assertIn("cone_violation", info)
         self.assertIn("max_penetration", info)
         self.assertGreaterEqual(float(info["max_penetration"]), 0.2)
+
+    def test_legacy_contact_modules_reuse_shared_kernel_primitives(self):
+        self.assertIs(contact_normal_alm.normal_fb_residual, fb_normal_residual)
+        self.assertIs(contact_friction_alm.project_to_coulomb_disk, project_to_coulomb_disk)
 
 
 if __name__ == "__main__":

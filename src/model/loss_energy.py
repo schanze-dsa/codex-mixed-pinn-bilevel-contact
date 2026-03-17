@@ -20,6 +20,7 @@ from physics.contact.contact_operator import (
     ContactOperatorConfig,
     traction_matching_terms,
 )
+from physics.contact.strict_mixed_policy import resolve_strict_mixed_runtime_policy
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig, traction_bc_residual
 from physics.tightening_model import NutTighteningPenalty, TighteningConfig
 from physics.traction_utils import normal_tangential_components
@@ -95,10 +96,11 @@ class TotalConfig:
 
 class TotalEnergy:
     STRICT_MIXED_ACTIVE_KEYS = (
-        "E_cn",
-        "E_ct",
-        "E_eq",
-        "E_bc",
+        "R_const",
+        "R_eq",
+        "R_u",
+        "R_t",
+        "R_tr",
         "E_tight",
         "E_data",
         "E_smooth",
@@ -107,11 +109,17 @@ class TotalEnergy:
     )
     STRICT_MIXED_ZERO_KEYS = (
         "E_int",
+        "E_cn",
+        "E_ct",
         "E_sigma",
+        "E_eq",
+        "E_bc",
         "E_bi",
         "E_ed",
         "path_penalty_total",
         "fric_path_penalty_total",
+        "R_contact_comp",
+        "R_fric_comp",
     )
 
     def __init__(self, cfg: Optional[TotalConfig] = None):
@@ -197,6 +205,16 @@ class TotalEnergy:
         phase_name = str(self.mixed_bilevel_flags.get("phase_name", "phase0") or "phase0").strip().lower()
         return phase_name not in {"", "phase0"}
 
+    def _strict_mixed_route_mode(self) -> str:
+        phase_name = str(self.mixed_bilevel_flags.get("phase_name", "phase0") or "phase0").strip().lower()
+        if phase_name in {"", "phase0"}:
+            return "legacy"
+        if bool(self.mixed_bilevel_flags.get("tangential_ift_enabled", False)):
+            return "full_ift"
+        if bool(self.mixed_bilevel_flags.get("normal_ift_enabled", False)):
+            return "normal_ready"
+        return "forward_only"
+
     def _strict_mixed_skip_stats(self, reason: str) -> Dict[str, tf.Tensor]:
         return {
             "mixed_strict_active": tf.cast(0.0, self.dtype),
@@ -248,14 +266,32 @@ class TotalEnergy:
             self._strict_mixed_last_active = False
             return False, {}, self._strict_mixed_skip_stats("strict_contact_adapter_missing")
 
+        route_mode = self._strict_mixed_route_mode()
         strict_inputs = self.contact.strict_mixed_inputs(u_fn, params, u_nodes=u_nodes)
-        inner_result = self.contact.solve_strict_inner(
-            u_fn,
-            params,
-            u_nodes=u_nodes,
-            strict_inputs=strict_inputs,
-        )
-        detach_inner = bool(self.mixed_bilevel_flags.get("detach_inner_solution", True))
+        solve_kwargs = {
+            "u_nodes": u_nodes,
+            "strict_inputs": strict_inputs,
+        }
+        if route_mode in {"normal_ready", "full_ift"}:
+            solve_kwargs["return_linearization"] = True
+        try:
+            inner_result = self.contact.solve_strict_inner(
+                u_fn,
+                params,
+                **solve_kwargs,
+            )
+        except TypeError as exc:
+            if "return_linearization" not in str(exc):
+                raise
+            solve_kwargs.pop("return_linearization", None)
+            inner_result = self.contact.solve_strict_inner(
+                u_fn,
+                params,
+                **solve_kwargs,
+            )
+        diagnostics = dict(inner_result.diagnostics)
+        policy = resolve_strict_mixed_runtime_policy(diagnostics, route_mode=route_mode)
+        detach_inner = bool(self.mixed_bilevel_flags.get("detach_inner_solution", True)) or bool(policy.force_detach)
 
         lambda_n = tf.cast(inner_result.state.lambda_n, dtype)
         lambda_t = tf.cast(inner_result.state.lambda_t, dtype)
@@ -297,13 +333,16 @@ class TotalEnergy:
         denom = tf.reduce_sum(weights) + tf.cast(1.0e-12, dtype)
         rn_sq = tf.square(rs_n) + tf.square(rm_n)
         rt_sq = tf.reduce_sum(tf.square(rs_t), axis=1) + tf.reduce_sum(tf.square(rm_t), axis=1)
-        e_cn = tf.reduce_sum(weights * rn_sq) / (2.0 * denom)
-        e_ct = tf.reduce_sum(weights * rt_sq) / (2.0 * denom)
+        traction_scale = tf.cast(policy.traction_scale, dtype)
+        e_cn_raw = tf.reduce_sum(weights * rn_sq) / (2.0 * denom)
+        e_ct_raw = tf.reduce_sum(weights * rt_sq) / (2.0 * denom)
+        e_cn = traction_scale * e_cn_raw
+        e_ct = traction_scale * e_ct_raw
 
         rt_norm = tf.sqrt(tf.reduce_sum(tf.square(rs_t), axis=1) + tf.cast(1.0e-12, dtype))
         rm_t_norm = tf.sqrt(tf.reduce_sum(tf.square(rm_t), axis=1) + tf.cast(1.0e-12, dtype))
-        r_contact = tf.reduce_sum(weights * 0.5 * (tf.abs(rs_n) + tf.abs(rm_n)))
-        r_fric = tf.reduce_sum(weights * 0.5 * (rt_norm + rm_t_norm))
+        r_contact = traction_scale * tf.reduce_sum(weights * 0.5 * (tf.abs(rs_n) + tf.abs(rm_n)))
+        r_fric = traction_scale * tf.reduce_sum(weights * 0.5 * (rt_norm + rm_t_norm))
 
         mu = tf.cast(strict_inputs["mu"], dtype)
         eps_bi = tf.cast(1.0e-8, dtype)
@@ -312,7 +351,6 @@ class TotalEnergy:
         bi_pos = tf.nn.relu(bi_raw)
         e_bi = tf.reduce_sum(weights * bi_pos * bi_pos) / denom
 
-        diagnostics = dict(inner_result.diagnostics)
         fn_norm = tf.cast(diagnostics.get("fn_norm", zero), dtype)
         ft_norm = tf.cast(diagnostics.get("ft_norm", zero), dtype)
         cone_violation = tf.cast(diagnostics.get("cone_violation", zero), dtype)
@@ -334,6 +372,8 @@ class TotalEnergy:
             ift_linear_residual = zero
 
         parts = {
+            "R_t": e_cn,
+            "R_tr": e_ct,
             "E_cn": e_cn,
             "E_ct": e_ct,
             "E_bi": e_bi,
@@ -366,6 +406,12 @@ class TotalEnergy:
             "traction_match_n_rms": tf.sqrt(e_cn + tf.cast(1.0e-20, dtype)),
             "traction_match_t_rms": tf.sqrt(e_ct + tf.cast(1.0e-20, dtype)),
         }
+        stats.update(
+            {
+                key: tf.cast(value, dtype)
+                for key, value in policy.as_stats().items()
+            }
+        )
         self._strict_mixed_last_active = True
         return True, parts, stats
 
@@ -525,6 +571,13 @@ class TotalEnergy:
             "E_unc": zero,
             "E_data": zero,
             "E_smooth": zero,
+            "R_const": zero,
+            "R_eq": zero,
+            "R_u": zero,
+            "R_t": zero,
+            "R_tr": zero,
+            "R_contact_comp": zero,
+            "R_fric_comp": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
 
@@ -558,7 +611,7 @@ class TotalEnergy:
             )
             stats.update(strict_stats)
             if strict_active:
-                for key in ("E_cn", "E_ct", "E_bi", "R_fric_comp", "R_contact_comp"):
+                for key in ("E_cn", "E_ct", "E_bi", "R_t", "R_tr", "R_fric_comp", "R_contact_comp"):
                     if key in strict_parts:
                         parts[key] = tf.cast(strict_parts[key], dtype)
             elif (not strict_requested) or allow_legacy_contact_fallback:
@@ -571,6 +624,8 @@ class TotalEnergy:
                     parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
                 elif "E_t" in cparts:
                     parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
+                parts["R_t"] = tf.cast(parts["E_cn"], dtype)
+                parts["R_tr"] = tf.cast(parts["E_ct"], dtype)
                 stats.update(stats_cn)
                 stats.update(stats_ct)
                 if "R_fric_comp" in stats_ct:
@@ -588,6 +643,7 @@ class TotalEnergy:
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
+                parts["R_u"] = tf.cast(parts["E_bc"], dtype)
 
         if self.tightening is not None:
             E_tight, tstats = self.tightening.energy(u_fn, params, u_nodes=u_nodes)
@@ -705,6 +761,13 @@ class TotalEnergy:
             "E_unc": zero,
             "E_data": zero,
             "E_smooth": zero,
+            "R_const": zero,
+            "R_eq": zero,
+            "R_u": zero,
+            "R_t": zero,
+            "R_tr": zero,
+            "R_contact_comp": zero,
+            "R_fric_comp": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
 
@@ -712,6 +775,7 @@ class TotalEnergy:
         w_eq = float(getattr(self.cfg, "w_eq", 0.0))
         w_reg = float(getattr(self.cfg, "w_reg", 0.0))
         stress_weight = float(getattr(getattr(self.elasticity, "cfg", None), "stress_loss_weight", 0.0))
+        strict_requested = self._strict_mixed_requested()
         u_fn_elastic = self._resolve_bound_variant(u_fn, "u_fn_pointwise")
         stress_fn_elastic = self._resolve_bound_variant(stress_fn, "us_fn_pointwise")
         need_sigma = stress_fn_elastic is not None and w_sigma > 1e-15 and stress_weight > 0.0
@@ -747,7 +811,6 @@ class TotalEnergy:
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
         if self.contact is not None:
-            strict_requested = self._strict_mixed_requested()
             strict_active, strict_parts, strict_stats = self._strict_mixed_contact_terms(
                 u_fn,
                 params,
@@ -756,7 +819,7 @@ class TotalEnergy:
             )
             stats.update(strict_stats)
             if strict_active:
-                for key in ("E_cn", "E_ct", "E_bi", "R_fric_comp", "R_contact_comp"):
+                for key in ("E_cn", "E_ct", "E_bi", "R_t", "R_tr", "R_fric_comp", "R_contact_comp"):
                     if key in strict_parts:
                         parts[key] = tf.cast(strict_parts[key], dtype)
             elif (not strict_requested) or allow_legacy_contact_fallback:
@@ -769,6 +832,8 @@ class TotalEnergy:
                     parts["E_ct"] = tf.cast(cparts["E_ct"], dtype)
                 elif "E_t" in cparts:
                     parts["E_ct"] = tf.cast(cparts["E_t"], dtype)
+                parts["R_t"] = tf.cast(parts["E_cn"], dtype)
+                parts["R_tr"] = tf.cast(parts["E_ct"], dtype)
                 stats.update(stats_cn)
                 stats.update(stats_ct)
                 if "R_fric_comp" in stats_ct:
@@ -786,6 +851,7 @@ class TotalEnergy:
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
             if bc_terms:
                 parts["E_bc"] = tf.add_n(bc_terms)
+                parts["R_u"] = tf.cast(parts["E_bc"], dtype)
 
         if self.tightening is not None:
             E_tight, tstats = self.tightening.residual(u_fn, params, u_nodes=u_nodes)
@@ -801,8 +867,10 @@ class TotalEnergy:
         use_sigma = use_stress and w_sigma > 1e-15 and stress_weight > 0.0
         use_eq = elastic_cache is not None and w_eq > 1e-15
         use_reg = elastic_cache is not None and w_reg > 1e-15
+        need_const = use_stress and (strict_requested or use_sigma)
+        need_eq_term = elastic_cache is not None and (strict_requested or use_eq)
 
-        if use_sigma or use_eq or use_reg:
+        if need_const or need_eq_term or use_reg:
             eps_vec = elastic_cache.get("eps_vec") if isinstance(elastic_cache, dict) else None
             sigma_phys_head = elastic_cache.get("sigma_phys") if isinstance(elastic_cache, dict) else None
             sigma_pred = elastic_cache.get("sigma_pred") if isinstance(elastic_cache, dict) else None
@@ -812,7 +880,7 @@ class TotalEnergy:
             sigma_ref = tf.cast(getattr(self.cfg, "sigma_ref", 1.0), dtype)
             sigma_ref = tf.maximum(sigma_ref, tf.cast(1e-12, dtype))
 
-            if use_sigma and sigma_pred is not None and sigma_phys_head is not None:
+            if need_const and sigma_pred is not None and sigma_phys_head is not None:
                 sigma_pred = tf.cast(sigma_pred, dtype)
                 sigma_phys_head = tf.cast(sigma_phys_head, dtype)
                 # Align residual-path physics stress ordering to stress-head convention:
@@ -865,10 +933,12 @@ class TotalEnergy:
                     loss_sigma = tf.reduce_sum(res) / denom
                 else:
                     loss_sigma = tf.reduce_mean(res)
-                parts["E_sigma"] = loss_sigma * tf.cast(stress_weight, dtype)
+                parts["R_const"] = loss_sigma
+                if use_sigma:
+                    parts["E_sigma"] = loss_sigma * tf.cast(stress_weight, dtype)
                 stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_pred * sigma_pred) + tf.cast(1e-20, dtype))
 
-            if use_eq and div_sigma is not None:
+            if need_eq_term and div_sigma is not None:
                 div_sigma = tf.cast(div_sigma, dtype) / sigma_ref
                 res = tf.reduce_sum(div_sigma * div_sigma, axis=1)
                 if w_sel is not None:
@@ -877,7 +947,8 @@ class TotalEnergy:
                     denom = tf.reduce_sum(w_sel) + tf.cast(1e-12, dtype)
                 else:
                     denom = tf.cast(tf.shape(res)[0], dtype) + tf.cast(1e-12, dtype)
-                parts["E_eq"] = tf.reduce_sum(res) / denom
+                parts["R_eq"] = tf.reduce_sum(res) / denom
+                parts["E_eq"] = tf.cast(parts["R_eq"], dtype)
                 stats["eq_rms"] = tf.sqrt(tf.reduce_mean(res) + tf.cast(1e-20, dtype))
 
             if use_reg and eps_vec is not None:
@@ -928,6 +999,11 @@ class TotalEnergy:
             ("E_unc", self.w_unc),
             ("E_data", self.w_data),
             ("E_smooth", self.w_smooth),
+            ("R_const", self.w_sigma),
+            ("R_eq", self.w_eq),
+            ("R_u", self.w_bc),
+            ("R_t", self.w_cn),
+            ("R_tr", self.w_ct),
         ):
             if key not in active:
                 continue
@@ -936,7 +1012,28 @@ class TotalEnergy:
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc", "E_data", "E_smooth"]
+        keys = [
+            "E_int",
+            "E_cn",
+            "E_ct",
+            "E_bc",
+            "E_tight",
+            "E_sigma",
+            "E_eq",
+            "E_reg",
+            "E_bi",
+            "E_ed",
+            "E_unc",
+            "E_data",
+            "E_smooth",
+            "R_const",
+            "R_eq",
+            "R_u",
+            "R_t",
+            "R_tr",
+            "R_contact_comp",
+            "R_fric_comp",
+        ]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -1061,7 +1158,10 @@ class TotalEnergy:
                 stats_all[f"s{idx+1}_path_penalty"] = stage_path
                 stats_all[f"s{idx+1}_path_penalty_w"] = w_path
 
-            stage_mech = self._combine_parts(stage_parts)
+            if self._strict_mixed_requested():
+                stage_mech = self._combine_parts_with_keys(stage_parts, self.STRICT_MIXED_ACTIVE_KEYS)
+            else:
+                stage_mech = self._combine_parts(stage_parts)
             stage_pi_step = stage_mech + stage_path_penalty
             stats_all[f"s{idx+1}_Pi_step"] = stage_pi_step
             stats_all[f"s{idx+1}_Pi_mech"] = stage_mech
@@ -1104,7 +1204,28 @@ class TotalEnergy:
 
     def _residual_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_bc", "E_tight", "E_sigma", "E_eq", "E_reg", "E_bi", "E_ed", "E_unc", "E_data", "E_smooth"]
+        keys = [
+            "E_int",
+            "E_cn",
+            "E_ct",
+            "E_bc",
+            "E_tight",
+            "E_sigma",
+            "E_eq",
+            "E_reg",
+            "E_bi",
+            "E_ed",
+            "E_unc",
+            "E_data",
+            "E_smooth",
+            "R_const",
+            "R_eq",
+            "R_u",
+            "R_t",
+            "R_tr",
+            "R_contact_comp",
+            "R_fric_comp",
+        ]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty_total = tf.cast(0.0, dtype)
@@ -1229,8 +1350,13 @@ class TotalEnergy:
                 stats_all[f"s{idx+1}_path_penalty"] = stage_path
                 stats_all[f"s{idx+1}_path_penalty_w"] = w_path
 
-            stage_pi_step = self._combine_parts(stage_parts) + stage_path_penalty
+            if self._strict_mixed_requested():
+                stage_mech = self._combine_parts_with_keys(stage_parts, self.STRICT_MIXED_ACTIVE_KEYS)
+            else:
+                stage_mech = self._combine_parts(stage_parts)
+            stage_pi_step = stage_mech + stage_path_penalty
             stats_all[f"s{idx+1}_Pi_step"] = stage_pi_step
+            stats_all[f"s{idx+1}_Pi_mech"] = stage_mech
 
             Pi_accum = Pi_accum + stage_pi_step
 

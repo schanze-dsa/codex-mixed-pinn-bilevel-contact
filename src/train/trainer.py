@@ -475,7 +475,33 @@ class Trainer(
     def _maybe_update_contact_hardening(self, step: int):
         """Update contact penalty/ALM parameters according to training progress."""
 
-        if self._contact_hardening_targets is None or self.contact is None:
+        if self.contact is None:
+            return
+
+        if bool(getattr(self, "_strict_bilevel_backoff_requested", False)):
+            try:
+                current_fb_eps = float(getattr(self.contact.normal.cfg, "fb_eps", 1.0e-8) or 1.0e-8)
+            except Exception:
+                current_fb_eps = 1.0e-8
+            softened_fb_eps = min(max(current_fb_eps * 2.0, 1.0e-8), 1.0e-3)
+            try:
+                self.contact.normal.cfg.fb_eps = softened_fb_eps
+            except Exception:
+                pass
+
+            try:
+                current_k_t = float(tf.cast(self.contact.friction.k_t, tf.float32).numpy())
+            except Exception:
+                current_k_t = None
+            if current_k_t is not None:
+                try:
+                    self.contact.friction.set_k_t(max(current_k_t * 0.7, 1.0e-6))
+                except Exception:
+                    pass
+
+            self._strict_bilevel_backoff_requested = False
+
+        if self._contact_hardening_targets is None:
             return
         if bool(getattr(self, "_contact_hardening_frozen", False)):
             return

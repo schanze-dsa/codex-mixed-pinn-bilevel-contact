@@ -2,13 +2,19 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add a PDF-target strict mixed experimental route alongside the existing locked route, covering P0 inner-solver diagnostics, P1 backend/contract cleanup, and P2 stress-head contact semantics without changing the default `config.yaml` behavior.
+**Goal:** Add a PDF-target strict mixed experimental route alongside the existing locked route, closing PDF items 1 through 9 on the experimental path without changing the default `config.yaml` behavior.
 
-**Architecture:** Keep one trainer/model/contact implementation tree with explicit profile gating. The default profile remains canonicalized to the current locked route. A new `strict_mixed_experimental.yaml` profile enables strict mixed backend dispatch, typed strict contact inputs, richer inner diagnostics, and the P2 pointwise stress path with contact-surface semantics.
+**Architecture:** Keep one trainer/model/contact implementation tree with explicit profile gating. The default profile remains canonicalized to the current locked route. A new `strict_mixed_experimental.yaml` profile enables strict mixed backend dispatch, typed strict contact inputs, real inner linearization, diagnostics-driven trainer control, kernel-primitive reuse, the P2 pointwise stress path with contact-surface semantics, and an explicit strict-mixed outer-loss entry point.
 
 **Tech Stack:** Python, TensorFlow, YAML config parsing, `unittest`, trainer mixins, contact operator / strict mixed loss assembly.
 
 ---
+
+### Scope Notes
+
+- `option 1` is approved: keep the locked route intact and land the PDF closure work in `strict_mixed_experimental`
+- implementation still follows TDD even when an existing partial scaffold is present
+- the experimental route, not the locked route, is where PDF items 1 through 9 must become the coherent default behavior
 
 ### Task 1: Add Failing Tests For Profile-Gated Config Parsing
 

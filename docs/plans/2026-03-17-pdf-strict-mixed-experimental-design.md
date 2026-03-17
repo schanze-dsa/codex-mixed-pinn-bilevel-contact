@@ -11,6 +11,16 @@ The repository should support two parallel routes:
 
 The experimental route is the PDF target route. The default route remains the stable baseline.
 
+## Approved Execution Route
+
+The user approved `option 1`: keep the default locked route intact and drive the full PDF checklist through the `strict_mixed_experimental` route.
+
+This means:
+
+- `config.yaml` remains the stable locked baseline
+- `strict_mixed_experimental.yaml` becomes the closure route for the PDF's item 1 through item 9
+- legacy contact code may remain as a compatibility path, but the experimental route should treat it as an adapter boundary rather than the main implementation target
+
 ## Constraints
 
 - Do not change the effective default behavior of [config.yaml].
@@ -186,6 +196,39 @@ These features are used only for the contact-point stress path in the experiment
 ### Pointwise Stress Route
 
 Strict mixed contact matching should prefer the pointwise stress path rather than the graph stress branch when evaluating contact samples. This avoids graph-specific coupling during contact-point traction matching and aligns with the PDF requirement for a pointwise stress path.
+
+### Explicit Strict Outer Loss Route
+
+The experimental route should assemble strict mixed training losses through an explicit strict-mixed entry point rather than through the legacy total-energy contact semantics.
+
+That entry point should make the active route legible in code by assembling only the strict mixed outer terms:
+
+- `R_eq`
+- `R_const`
+- `R_u`
+- `R_t`
+- `R_tr`
+- `E_data`
+- `E_smooth`
+- `E_unc`
+- `E_reg`
+- `E_tight`
+
+Legacy `E_int`, `E_cn`, and `E_ct` semantics may remain available for the locked route, but the experimental route should no longer depend on them as its primary outer objective language.
+
+## PDF Checklist Mapping
+
+The implementation should close all nine PDF items on the experimental route:
+
+1. make `return_linearization` in the inner solver real and IFT-ready for the normal-ready route
+2. let inner diagnostics actively alter trainer behavior instead of only being logged
+3. reduce `ContactOperator` to a thin adapter / dispatcher for strict mixed execution
+4. reuse the same contact kernel primitives across legacy and strict mixed contact math where practical
+5. fix the strict mixed input contract with a stable typed container
+6. make `eps_bridge` the default strict mixed stress path
+7. inject `n`, `t1`, `t2`, and contact-surface flags into the strict mixed contact stress data flow
+8. prefer the pointwise / high-frequency stress path for contact-surface stress evaluation
+9. assemble strict mixed outer loss through an explicit route that is independent from the legacy total-energy contact semantics
 
 ## Files
 

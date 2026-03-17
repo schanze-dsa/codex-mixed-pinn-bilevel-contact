@@ -52,6 +52,9 @@ class TrainerInitMixin:
             "skipped": 0,
         }
         self._strict_bilevel_freeze_requested: bool = False
+        self._strict_bilevel_backoff_requested: bool = False
+        self._strict_bilevel_force_detach: bool = False
+        self._strict_bilevel_traction_scale: float = 1.0
         self._continuation_freeze_events: int = 0
         self._supervision_dataset = None
         self._tqdm_enabled: bool = self._resolve_tqdm_enabled()

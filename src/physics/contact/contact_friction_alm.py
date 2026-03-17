@@ -55,6 +55,7 @@ import numpy as np
 import tensorflow as tf
 
 from mesh.interp_utils import interp_bary_tf
+from .contact_inner_kernel_primitives import project_to_coulomb_disk
 
 # Optional import for type hints (no runtime cyclic dep)
 try:
@@ -502,8 +503,7 @@ class FrictionContactALM:
             norm_trial = tf.sqrt(
                 tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps
             )                                                        # (N,)
-            scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
-            tau = tau_trial * scale[:, None]                         # (N,2)
+            tau = tf.cast(project_to_coulomb_disk(tau_trial, tau_c, eps=eps), self.dtype)
 
             r_t = tau_trial - tau                                    # (N,2)
             r_norm = tf.sqrt(tf.reduce_sum(r_t * r_t, axis=1) + 1e-12)
@@ -623,8 +623,7 @@ class FrictionContactALM:
 
         eps = tf.cast(self.eps, self.dtype)
         norm_trial = tf.sqrt(tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps)
-        scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
-        tau = tau_trial * scale[:, None]
+        tau = tf.cast(project_to_coulomb_disk(tau_trial, tau_c, eps=eps), self.dtype)
         r_t = tau_trial - tau
 
         r_norm = tf.sqrt(tf.reduce_sum(r_t * r_t, axis=1) + 1e-12)
@@ -693,8 +692,7 @@ class FrictionContactALM:
         norm_trial = tf.sqrt(
             tf.reduce_sum(tau_trial * tau_trial, axis=1) + eps * eps
         )
-        scale = tf.minimum(tf.cast(1.0, self.dtype), tau_c / (norm_trial + 1e-12))
-        tau = tau_trial * scale[:, None]
+        tau = tf.cast(project_to_coulomb_disk(tau_trial, tau_c, eps=eps), self.dtype)
 
         eta = tf.cast(step_scale, self.dtype)
         new_lambda_t = self.lmbda_t + eta * (self.k_t * st - tau)

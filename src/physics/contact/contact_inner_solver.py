@@ -60,6 +60,34 @@ def _python_scalar(value, cast_fn):
     return value
 
 
+def flatten_contact_state(lambda_n: tf.Tensor, lambda_t: tf.Tensor) -> tf.Tensor:
+    """Flatten `[lambda_n, lambda_t]` using a fixed `[N, N*2]` ordering."""
+
+    return tf.concat(
+        [
+            tf.reshape(tf.cast(lambda_n, tf.float32), (-1,)),
+            tf.reshape(tf.cast(lambda_t, tf.float32), (-1,)),
+        ],
+        axis=0,
+    )
+
+
+def flatten_contact_inputs(g_n: tf.Tensor, ds_t: tf.Tensor) -> tf.Tensor:
+    """Flatten `[g_n, ds_t]` using a fixed `[N, N*2]` ordering."""
+
+    return tf.concat(
+        [
+            tf.reshape(tf.cast(g_n, tf.float32), (-1,)),
+            tf.reshape(tf.cast(ds_t, tf.float32), (-1,)),
+        ],
+        axis=0,
+    )
+
+
+def _flatten_jacobian_block(jacobian: tf.Tensor, output_size: tf.Tensor) -> tf.Tensor:
+    return tf.reshape(tf.cast(jacobian, tf.float32), (output_size, -1))
+
+
 def solve_contact_inner(
     g_n: tf.Tensor,
     ds_t: tf.Tensor,
@@ -229,35 +257,47 @@ def solve_contact_inner(
     }
     linearization = None
     if return_linearization:
-        flat_state = tf.concat(
-            [
-                tf.reshape(tf.cast(state.lambda_n, tf.float32), (-1,)),
-                tf.reshape(tf.cast(state.lambda_t, tf.float32), (-1,)),
-            ],
-            axis=0,
-        )
-        flat_residual = tf.concat(
-            [
-                tf.reshape(tf.cast(fb_normal_residual(g_n, state.lambda_n, eps_n), tf.float32), (-1,)),
-                tf.reshape(
-                    tf.cast(
+        lambda_n_lin = tf.identity(tf.cast(state.lambda_n, tf.float32))
+        lambda_t_lin = tf.identity(tf.cast(state.lambda_t, tf.float32))
+        g_n_lin = tf.identity(tf.cast(g_n, tf.float32))
+        ds_t_lin = tf.identity(tf.cast(ds_t, tf.float32))
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(lambda_n_lin)
+            tape.watch(lambda_t_lin)
+            tape.watch(g_n_lin)
+            tape.watch(ds_t_lin)
+            flat_residual = tf.concat(
+                [
+                    tf.reshape(fb_normal_residual(g_n_lin, lambda_n_lin, eps_n), (-1,)),
+                    tf.reshape(
                         friction_fixed_point_residual(
-                            state.lambda_t,
-                            ds_t,
-                            state.lambda_n,
+                            lambda_t_lin,
+                            ds_t_lin,
+                            lambda_n_lin,
                             mu,
                             k_t,
                             eps=eps_n,
                         ),
-                        tf.float32,
+                        (-1,),
                     ),
-                    (-1,),
-                ),
-            ],
-            axis=0,
-        )
+                ],
+                axis=0,
+            )
+        output_size = tf.shape(flat_residual)[0]
+        jac_lambda_n = _flatten_jacobian_block(tape.jacobian(flat_residual, lambda_n_lin), output_size)
+        jac_lambda_t = _flatten_jacobian_block(tape.jacobian(flat_residual, lambda_t_lin), output_size)
+        jac_g_n = _flatten_jacobian_block(tape.jacobian(flat_residual, g_n_lin), output_size)
+        jac_ds_t = _flatten_jacobian_block(tape.jacobian(flat_residual, ds_t_lin), output_size)
+        del tape
+        flat_state = flatten_contact_state(lambda_n_lin, lambda_t_lin)
+        flat_inputs = flatten_contact_inputs(g_n_lin, ds_t_lin)
         linearization = {
-            "jac_z": tf.eye(tf.shape(flat_state)[0], dtype=tf.float32),
+            "jac_z": tf.concat([jac_lambda_n, jac_lambda_t], axis=1),
+            "jac_inputs": tf.concat([jac_g_n, jac_ds_t], axis=1),
+            "flat_z": flat_state,
+            "flat_inputs": flat_inputs,
+            "z_splits": {"lambda_n": 1, "lambda_t": 2},
+            "input_splits": {"g_n": 1, "ds_t": 2},
             "residual": flat_residual,
             "normal_step": tf.reshape(tf.cast(normal_step, tf.float32), (-1,)),
             "tangential_step": tf.reshape(tf.cast(tangential_step, tf.float32), (-1,)),

@@ -10,6 +10,7 @@ import numpy as np
 import tensorflow as tf
 
 from model.loss_energy import TotalEnergy
+from physics.contact.strict_mixed_policy import resolve_strict_mixed_runtime_policy
 from train.loss_weights import combine_loss, update_loss_weights
 
 
@@ -69,6 +70,10 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
         "ift_linear_residual": "ift_linear_residual",
         "grad_u_norm": "grad_u_norm",
         "grad_sigma_norm": "grad_sigma_norm",
+        "strict_phase_hold": "strict_phase_hold",
+        "strict_continuation_backoff": "strict_continuation_backoff",
+        "strict_force_detach": "strict_force_detach",
+        "strict_traction_scale": "strict_traction_scale",
     }
     for out_key, in_key in key_map.items():
         if in_key not in diagnostics:
@@ -90,10 +95,11 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
 class TrainerOptMixin:
     _STRICT_MIXED_ALLOWED_KEYS = frozenset(
         {
-            "E_cn",
-            "E_ct",
-            "E_eq",
-            "E_bc",
+            "R_const",
+            "R_eq",
+            "R_u",
+            "R_t",
+            "R_tr",
             "E_tight",
             "E_data",
             "E_smooth",
@@ -104,7 +110,11 @@ class TrainerOptMixin:
     _STRICT_MIXED_DISABLED_KEYS = frozenset(
         {
             "E_int",
+            "E_cn",
+            "E_ct",
             "E_sigma",
+            "E_eq",
+            "E_bc",
             "E_bi",
             "E_ed",
             "path_penalty_total",
@@ -275,12 +285,29 @@ class TrainerOptMixin:
         counters["skipped"] = int(counters.get("skipped", 0)) + int(skipped)
         total_count = max(1, int(counters["total"]))
 
-        if skipped or fallback or (not converged):
-            self._strict_bilevel_freeze_requested = True
+        policy = resolve_strict_mixed_runtime_policy(out, route_mode=route_mode)
+        if (not converged) and (not policy.phase_hold):
+            policy = resolve_strict_mixed_runtime_policy(
+                {
+                    **out,
+                    "skip_batch": 1.0 if skipped else out.get("skip_batch", 0.0),
+                    "fallback_used": 1.0 if fallback else out.get("fallback_used", 0.0),
+                    "inner_skip_batch": 1.0 if skipped else out.get("inner_skip_batch", 0.0),
+                    "inner_fallback_used": 1.0 if fallback else out.get("inner_fallback_used", 0.0),
+                    "not_converged": 1.0,
+                },
+                route_mode=route_mode,
+            )
+
+        self._strict_bilevel_freeze_requested = bool(policy.phase_hold)
+        self._strict_bilevel_backoff_requested = bool(policy.continuation_backoff)
+        self._strict_bilevel_force_detach = bool(policy.force_detach)
+        self._strict_bilevel_traction_scale = float(policy.traction_scale)
 
         out["inner_convergence_rate"] = float(counters["converged"]) / float(total_count)
         out["inner_fallback_rate"] = float(counters["fallback"]) / float(total_count)
         out["inner_skip_rate"] = float(counters["skipped"]) / float(total_count)
+        out.update(policy.as_stats())
         out["strict_route_mode"] = route_mode
         out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
         out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
@@ -584,7 +611,11 @@ class TrainerOptMixin:
             return weights, diag
 
         phys_contrib = zero
-        for key in ("E_sigma", "E_ct"):
+        if any(key in parts for key in ("R_const", "R_t", "R_tr")):
+            phys_keys = ("R_const", "R_t", "R_tr")
+        else:
+            phys_keys = ("E_sigma", "E_ct")
+        for key in phys_keys:
             idx = self._loss_key_index(key)
             if idx is None:
                 continue

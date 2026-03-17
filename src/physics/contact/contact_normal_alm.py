@@ -48,6 +48,7 @@ import numpy as np
 import tensorflow as tf
 
 from mesh.interp_utils import interp_bary_tf
+from .contact_inner_kernel_primitives import fb_normal_residual
 
 
 # --------------------------------------------------------------------------- #
@@ -83,10 +84,7 @@ def fb_residual(a: tf.Tensor, b: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
     return tf.sqrt(a * a + b * b + eps * eps) - a - b
 
 
-def normal_fb_residual(g: tf.Tensor, lambda_n: tf.Tensor, eps_n: tf.Tensor) -> tf.Tensor:
-    """Stateless FB kernel for the normal complementarity equation."""
-
-    return fb_residual(g, lambda_n, eps_n)
+normal_fb_residual = fb_normal_residual
 
 
 @dataclass

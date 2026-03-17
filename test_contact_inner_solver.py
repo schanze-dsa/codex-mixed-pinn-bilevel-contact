@@ -19,6 +19,10 @@ import numpy as np
 
 from physics.contact.contact_operator import ContactOperator, StrictMixedContactInputs
 from physics.contact.contact_inner_solver import ContactInnerState, solve_contact_inner
+from physics.contact.contact_inner_kernel_primitives import (
+    fb_normal_residual,
+    friction_fixed_point_residual,
+)
 
 
 class ContactInnerSolverTests(unittest.TestCase):
@@ -82,21 +86,81 @@ class ContactInnerSolverTests(unittest.TestCase):
         self.assertIn("max_penetration", result.diagnostics)
 
     def test_inner_solver_can_return_linearization_payload(self):
+        g_n = tf.constant([-0.1], dtype=tf.float32)
+        ds_t = tf.constant([[0.05, 0.0]], dtype=tf.float32)
+        mu = tf.constant(0.3, dtype=tf.float32)
+        eps_n = tf.constant(1.0e-6, dtype=tf.float32)
+        k_t = tf.constant(10.0, dtype=tf.float32)
         result = solve_contact_inner(
-            g_n=tf.constant([-0.1], dtype=tf.float32),
-            ds_t=tf.constant([[0.05, 0.0]], dtype=tf.float32),
+            g_n=g_n,
+            ds_t=ds_t,
             normals=tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32),
             t1=tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32),
             t2=tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32),
-            mu=0.3,
-            eps_n=1.0e-6,
-            k_t=10.0,
+            mu=mu,
+            eps_n=eps_n,
+            k_t=k_t,
             init_state=None,
             return_linearization=True,
         )
 
         self.assertIsNotNone(result.linearization)
         self.assertIn("jac_z", result.linearization)
+        self.assertIn("jac_inputs", result.linearization)
+        self.assertIn("z_splits", result.linearization)
+        self.assertIn("input_splits", result.linearization)
+
+        lambda_n = tf.identity(result.state.lambda_n)
+        lambda_t = tf.identity(result.state.lambda_t)
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(lambda_n)
+            tape.watch(lambda_t)
+            tape.watch(g_n)
+            tape.watch(ds_t)
+            flat_residual = tf.concat(
+                [
+                    tf.reshape(fb_normal_residual(g_n, lambda_n, eps_n), (-1,)),
+                    tf.reshape(
+                        friction_fixed_point_residual(
+                            lambda_t,
+                            ds_t,
+                            lambda_n,
+                            mu,
+                            k_t,
+                            eps=eps_n,
+                        ),
+                        (-1,),
+                    ),
+                ],
+                axis=0,
+            )
+
+        jac_lambda_n = tape.jacobian(flat_residual, lambda_n)
+        jac_lambda_t = tape.jacobian(flat_residual, lambda_t)
+        jac_g_n = tape.jacobian(flat_residual, g_n)
+        jac_ds_t = tape.jacobian(flat_residual, ds_t)
+        del tape
+
+        expected_jac_z = tf.concat(
+            [
+                tf.reshape(jac_lambda_n, (tf.shape(flat_residual)[0], -1)),
+                tf.reshape(jac_lambda_t, (tf.shape(flat_residual)[0], -1)),
+            ],
+            axis=1,
+        )
+        expected_jac_inputs = tf.concat(
+            [
+                tf.reshape(jac_g_n, (tf.shape(flat_residual)[0], -1)),
+                tf.reshape(jac_ds_t, (tf.shape(flat_residual)[0], -1)),
+            ],
+            axis=1,
+        )
+
+        tf.debugging.assert_near(result.linearization["residual"], flat_residual, atol=1.0e-6)
+        tf.debugging.assert_near(result.linearization["jac_z"], expected_jac_z, atol=1.0e-5)
+        tf.debugging.assert_near(result.linearization["jac_inputs"], expected_jac_inputs, atol=1.0e-5)
+        self.assertEqual(result.linearization["z_splits"], {"lambda_n": 1, "lambda_t": 2})
+        self.assertEqual(result.linearization["input_splits"], {"g_n": 1, "ds_t": 2})
 
     def test_contact_operator_strict_mixed_inputs_round_trip_warm_start(self):
         cat = {
