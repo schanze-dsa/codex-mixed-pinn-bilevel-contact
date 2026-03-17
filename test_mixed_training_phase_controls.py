@@ -22,6 +22,7 @@ from train.trainer_opt_mixin import capped_continuation_update
 class MixedTrainingPhaseControlTests(unittest.TestCase):
     def test_phase_2a_enables_normal_ift_only(self):
         cfg = TrainerConfig(
+            training_profile="strict_mixed_experimental",
             mixed_bilevel_phase=MixedBilevelPhaseConfig(
                 phase_name="phase2a",
                 normal_ift_enabled=True,
@@ -35,6 +36,23 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
         self.assertFalse(flags["tangential_ift_enabled"])
         self.assertFalse(flags["detach_inner_solution"])
 
+    def test_locked_profile_forces_phase0_runtime_flags(self):
+        cfg = TrainerConfig(
+            training_profile="locked",
+            mixed_bilevel_phase=MixedBilevelPhaseConfig(
+                phase_name="phase2a",
+                normal_ift_enabled=True,
+                tangential_ift_enabled=False,
+                detach_inner_solution=False,
+            ),
+        )
+        flags = resolve_mixed_phase_flags(cfg)
+
+        self.assertEqual(flags["phase_name"], "phase0")
+        self.assertFalse(flags["normal_ift_enabled"])
+        self.assertFalse(flags["tangential_ift_enabled"])
+        self.assertTrue(flags["detach_inner_solution"])
+
     def test_resolve_contact_backend_auto_uses_legacy_for_phase0(self):
         cfg = TrainerConfig(contact_backend="auto")
         trainer = object.__new__(Trainer)
@@ -45,6 +63,7 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
 
     def test_resolve_contact_backend_auto_uses_inner_solver_for_phase2a(self):
         cfg = TrainerConfig(
+            training_profile="strict_mixed_experimental",
             contact_backend="auto",
             mixed_bilevel_phase=MixedBilevelPhaseConfig(
                 phase_name="phase2a",
@@ -59,6 +78,28 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
 
         self.assertEqual(trainer._resolve_contact_backend(), "inner_solver")
 
+    def test_locked_profile_keeps_legacy_backend_even_with_strict_flags(self):
+        cfg = TrainerConfig(
+            training_profile="locked",
+            contact_backend="auto",
+            mixed_bilevel_phase=MixedBilevelPhaseConfig(
+                phase_name="phase2a",
+                normal_ift_enabled=True,
+                tangential_ift_enabled=False,
+                detach_inner_solution=False,
+            ),
+        )
+        trainer = object.__new__(Trainer)
+        trainer.cfg = cfg
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2a",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": False,
+        }
+
+        self.assertEqual(trainer._resolve_contact_backend(), "legacy_alm")
+
     def test_continuation_does_not_shrink_eps_and_expand_kt_too_aggressively(self):
         eps_new, kt_new = capped_continuation_update(1.0, 1.0, eps_factor=0.1, k_t_factor=2.0)
         self.assertAlmostEqual(eps_new, 0.7)
@@ -67,6 +108,7 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
     def test_assemble_total_propagates_mixed_bilevel_phase_flags(self):
         trainer = object.__new__(Trainer)
         trainer.cfg = TrainerConfig(
+            training_profile="strict_mixed_experimental",
             mixed_bilevel_phase=MixedBilevelPhaseConfig(
                 phase_name="phase2a",
                 normal_ift_enabled=True,
@@ -90,6 +132,7 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
     def test_assemble_total_propagates_resolved_contact_backend(self):
         trainer = object.__new__(Trainer)
         trainer.cfg = TrainerConfig(
+            training_profile="strict_mixed_experimental",
             contact_backend="auto",
             mixed_bilevel_phase=MixedBilevelPhaseConfig(
                 phase_name="phase2a",

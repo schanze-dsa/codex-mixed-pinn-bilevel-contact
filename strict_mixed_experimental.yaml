@@ -1,5 +1,6 @@
-# Locked training route: force_then_lock + incremental + ANSYS mirror supervision
-# Experimental strict mixed route lives in strict_mixed_experimental.yaml.
+# Experimental strict mixed route for the PDF target path.
+
+training_profile: strict_mixed_experimental
 
 inp_path: mir111.cdb
 mirror_surface_name: MIRROR UP
@@ -81,10 +82,12 @@ reset_contact_state_per_case: true
 stage_schedule_steps: [400, 400, 400]
 
 mixed_bilevel_phase:
-  phase_name: phase0
-  normal_ift_enabled: false
+  phase_name: phase1
+  normal_ift_enabled: true
   tangential_ift_enabled: false
   detach_inner_solution: true
+
+contact_backend: inner_solver
 
 continuation_caps:
   eps_shrink: 0.7
@@ -248,6 +251,3 @@ tightening_config:
   clockwise: true
 
 contact_route_update_every: 25
-
-early_exit:
-  check_every: 25

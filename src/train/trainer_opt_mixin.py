@@ -55,6 +55,9 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
         "inner_ft_norm": "ft_norm",
         "inner_cone_violation": "cone_violation",
         "inner_max_penetration": "max_penetration",
+        "inner_fb_residual_norm": "fb_residual_norm",
+        "inner_normal_step_norm": "normal_step_norm",
+        "inner_tangential_step_norm": "tangential_step_norm",
         "inner_fallback_used": "fallback_used",
         "inner_converged": "converged",
         "inner_skip_batch": "skip_batch",
@@ -149,7 +152,15 @@ class TrainerOptMixin:
         except Exception:
             return default
 
+    def _is_experimental_training_profile(self) -> bool:
+        cfg = getattr(self, "cfg", None)
+        raw = getattr(cfg, "training_profile", "locked") if cfg is not None else "locked"
+        profile = str(raw or "locked").strip().lower().replace("-", "_")
+        return profile == "strict_mixed_experimental"
+
     def _resolve_bilevel_objective_route(self) -> str:
+        if not self._is_experimental_training_profile():
+            return "legacy"
         flags = getattr(self, "_mixed_phase_flags", {}) or {}
         phase_name = str(flags.get("phase_name", "phase0") or "phase0").strip().lower()
         normal_ift = bool(flags.get("normal_ift_enabled", False))

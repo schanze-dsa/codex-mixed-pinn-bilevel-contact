@@ -16,10 +16,33 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from model.loss_energy import TotalConfig, TotalEnergy
 from model.pinn_model import ModelConfig, EncoderConfig, FieldConfig, create_displacement_model
+from physics.contact.contact_inner_solver import ContactInnerResult, ContactInnerState
+from physics.contact.contact_operator import StrictMixedContactInputs
+
+
+CONTACT_SURFACE_NORMALS_KEY = "__contact_surface_normals__"
+CONTACT_SURFACE_T1_KEY = "__contact_surface_t1__"
+CONTACT_SURFACE_T2_KEY = "__contact_surface_t2__"
 
 
 class MixedModelOutputsTests(unittest.TestCase):
+    def _contact_surface_params(
+        self,
+        *,
+        P_hat: tf.Tensor,
+        normals: tf.Tensor,
+        t1: tf.Tensor,
+        t2: tf.Tensor,
+    ):
+        return {
+            "P_hat": P_hat,
+            CONTACT_SURFACE_NORMALS_KEY: normals,
+            CONTACT_SURFACE_T1_KEY: t1,
+            CONTACT_SURFACE_T2_KEY: t2,
+        }
+
     def test_eps_guided_stress_head_exposes_bridge_head_and_preserves_sigma_shape(self):
         cfg = ModelConfig(
             encoder=EncoderConfig(out_dim=8),
@@ -286,6 +309,205 @@ class MixedModelOutputsTests(unittest.TestCase):
 
         self.assertEqual(tuple(u.shape), (4, 3))
         self.assertEqual(tuple(sigma.shape), (4, 6))
+
+    def test_contact_surface_semantics_shift_pointwise_stress_without_moving_displacement(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=True,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        P_hat = tf.zeros((1, 3), dtype=tf.float32)
+        normals_a = tf.tile(tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32), [4, 1])
+        t1_a = tf.tile(tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32), [4, 1])
+        t2_a = tf.tile(tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32), [4, 1])
+        normals_b = tf.tile(tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32), [4, 1])
+        t1_b = tf.tile(tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32), [4, 1])
+        t2_b = tf.tile(tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32), [4, 1])
+        model.field.set_node_semantic_features(tf.ones((4, 8), dtype=tf.float32))
+
+        params_a = self._contact_surface_params(
+            P_hat=P_hat,
+            normals=normals_a,
+            t1=t1_a,
+            t2=t2_a,
+        )
+        params_b = self._contact_surface_params(
+            P_hat=P_hat,
+            normals=normals_b,
+            t1=t1_b,
+            t2=t2_b,
+        )
+        captured_eps = []
+        original_predict = model.field.predict_stress_from_features
+
+        def _capture_eps(stress_feat, eps_bridge=None):
+            captured_eps.append(None if eps_bridge is None else tuple(eps_bridge.shape.as_list()))
+            return original_predict(stress_feat, eps_bridge=eps_bridge)
+
+        with patch.object(
+            model.field.graph_layers[0],
+            "call",
+            side_effect=RuntimeError("graph path should stay bypassed on pointwise contact stress"),
+        ):
+            with patch.object(model.field, "predict_stress_from_features", side_effect=_capture_eps):
+                u_a, sigma_a = model.us_fn_pointwise(X, params_a)
+                u_b, sigma_b = model.us_fn_pointwise(X, params_b)
+
+        self.assertEqual(tuple(u_a.shape), (4, 3))
+        self.assertEqual(tuple(sigma_a.shape), (4, 6))
+        self.assertEqual(tuple(u_b.shape), (4, 3))
+        self.assertEqual(tuple(sigma_b.shape), (4, 6))
+        tf.debugging.assert_near(u_a, u_b, atol=1.0e-6)
+        tf.debugging.assert_all_finite(sigma_a, "contact-surface stress output must stay finite")
+        tf.debugging.assert_all_finite(sigma_b, "contact-surface stress output must stay finite")
+        self.assertEqual(len(captured_eps), 2)
+        self.assertIsNotNone(captured_eps[0])
+        self.assertIsNotNone(captured_eps[1])
+        self.assertEqual(captured_eps[0][-1], 6)
+        self.assertEqual(captured_eps[1][-1], 6)
+        self.assertGreater(
+            float(tf.reduce_max(tf.abs(sigma_a - sigma_b)).numpy()),
+            1.0e-6,
+            "contact-surface semantics should change the pointwise stress output",
+        )
+
+    def test_strict_mixed_contact_route_passes_contact_surface_frame_to_pointwise_stress(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=True,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        params = {"P_hat": tf.zeros((1, 3), dtype=tf.float32)}
+        normals = tf.tile(tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32), [4, 1])
+        t1 = tf.tile(tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32), [4, 1])
+        t2 = tf.tile(tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32), [4, 1])
+        model.field.set_node_semantic_features(tf.zeros((4, 8), dtype=tf.float32))
+
+        strict_inputs = StrictMixedContactInputs(
+            g_n=tf.zeros((4,), dtype=tf.float32),
+            ds_t=tf.zeros((4, 2), dtype=tf.float32),
+            normals=normals,
+            t1=t1,
+            t2=t2,
+            weights=tf.ones((4,), dtype=tf.float32),
+            xs=X,
+            xm=X + 0.1,
+            mu=tf.constant(0.0, dtype=tf.float32),
+            eps_n=tf.constant(1.0e-8, dtype=tf.float32),
+            k_t=tf.constant(0.0, dtype=tf.float32),
+        )
+
+        class _FakeContact:
+            def strict_mixed_inputs(self, u_fn, params=None, u_nodes=None):
+                del u_fn, params, u_nodes
+                return strict_inputs
+
+            def solve_strict_inner(self, u_fn, params=None, u_nodes=None, strict_inputs=None):
+                del u_fn, params, u_nodes, strict_inputs
+                state = ContactInnerState(
+                    lambda_n=tf.zeros((4,), dtype=tf.float32),
+                    lambda_t=tf.zeros((4, 2), dtype=tf.float32),
+                    converged=True,
+                    iters=1,
+                    res_norm=0.0,
+                    fallback_used=False,
+                )
+                return ContactInnerResult(
+                    state=state,
+                    traction_vec=tf.zeros((4, 3), dtype=tf.float32),
+                    traction_tangent=tf.zeros((4, 2), dtype=tf.float32),
+                    diagnostics={
+                        "fn_norm": tf.constant(0.0, dtype=tf.float32),
+                        "ft_norm": tf.constant(0.0, dtype=tf.float32),
+                        "cone_violation": tf.constant(0.0, dtype=tf.float32),
+                        "max_penetration": tf.constant(0.0, dtype=tf.float32),
+                        "fb_residual_norm": tf.constant(0.0, dtype=tf.float32),
+                        "normal_step_norm": tf.constant(0.0, dtype=tf.float32),
+                        "tangential_step_norm": tf.constant(0.0, dtype=tf.float32),
+                        "fallback_used": tf.constant(0.0, dtype=tf.float32),
+                        "converged": tf.constant(1.0, dtype=tf.float32),
+                    },
+                )
+
+        total = TotalEnergy(TotalConfig(loss_mode="energy", w_cn=1.0, w_ct=1.0))
+        total.attach(contact=_FakeContact())
+        total.set_mixed_bilevel_flags(
+            {
+                "phase_name": "phase2a",
+                "normal_ift_enabled": True,
+                "tangential_ift_enabled": False,
+                "detach_inner_solution": True,
+            }
+        )
+
+        pointwise_params = []
+        original_pointwise = model.us_fn_pointwise
+
+        def _capture_pointwise(X_arg, params_arg=None):
+            pointwise_params.append(dict(params_arg or {}))
+            return original_pointwise(X_arg, params_arg)
+
+        with patch.object(model, "us_fn_pointwise", side_effect=_capture_pointwise):
+            active, parts, stats = total._strict_mixed_contact_terms(
+                model.u_fn,
+                params,
+                stress_fn=model.us_fn,
+            )
+
+        self.assertTrue(active)
+        self.assertIn("E_cn", parts)
+        self.assertEqual(float(stats["mixed_strict_active"].numpy()), 1.0)
+        self.assertEqual(len(pointwise_params), 2)
+        self.assertNotIn(CONTACT_SURFACE_NORMALS_KEY, params)
+        self.assertNotIn(CONTACT_SURFACE_T1_KEY, params)
+        self.assertNotIn(CONTACT_SURFACE_T2_KEY, params)
+        for captured in pointwise_params:
+            self.assertIn(CONTACT_SURFACE_NORMALS_KEY, captured)
+            self.assertIn(CONTACT_SURFACE_T1_KEY, captured)
+            self.assertIn(CONTACT_SURFACE_T2_KEY, captured)
+            self.assertEqual(tuple(captured[CONTACT_SURFACE_NORMALS_KEY].shape), (4, 3))
+            self.assertEqual(tuple(captured[CONTACT_SURFACE_T1_KEY].shape), (4, 3))
+            self.assertEqual(tuple(captured[CONTACT_SURFACE_T2_KEY].shape), (4, 3))
 
 
 if __name__ == "__main__":

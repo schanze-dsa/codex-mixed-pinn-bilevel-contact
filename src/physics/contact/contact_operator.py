@@ -63,6 +63,28 @@ class ContactOperatorConfig:
     dtype: str = "float32"
 
 
+@dataclass
+class StrictMixedContactInputs:
+    g_n: tf.Tensor
+    ds_t: tf.Tensor
+    normals: tf.Tensor
+    t1: tf.Tensor
+    t2: tf.Tensor
+    weights: tf.Tensor
+    xs: tf.Tensor
+    xm: tf.Tensor
+    mu: tf.Tensor
+    eps_n: tf.Tensor
+    k_t: tf.Tensor
+    init_state: Optional[ContactInnerState] = None
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+
 def traction_matching_terms(sigma_s, sigma_m, normals, t1, t2, inner_result):
     """Residual matching terms based on solved inner-contact traction."""
 
@@ -393,7 +415,13 @@ class ContactOperator:
             "weights": tf.cast(weights, tf.float32),
         }
 
-    def strict_mixed_inputs(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> Dict[str, tf.Tensor]:
+    def strict_mixed_inputs(
+        self,
+        u_fn,
+        params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> StrictMixedContactInputs:
         """Build geometry-driven strict-mixed inner-solver inputs from the current batch."""
 
         if not self._built:
@@ -413,19 +441,31 @@ class ContactOperator:
             mu = tf.cast(0.0, tf.float32)
             k_t = tf.cast(0.0, tf.float32)
 
-        return {
-            "g_n": g_n,
-            "ds_t": ds_t,
-            "normals": frame["normals"],
-            "t1": frame["t1"],
-            "t2": frame["t2"],
-            "weights": frame["weights"],
-            "xs": frame["xs"],
-            "xm": frame["xm"],
-            "mu": mu,
-            "eps_n": tf.cast(getattr(self.normal.cfg, "fb_eps", 1.0e-8), tf.float32),
-            "k_t": k_t,
-        }
+        init_state = None
+        if self._last_inner_state is not None:
+            init_state = ContactInnerState(
+                lambda_n=tf.identity(self._last_inner_state.lambda_n),
+                lambda_t=tf.identity(self._last_inner_state.lambda_t),
+                converged=bool(getattr(self._last_inner_state, "converged", False)),
+                iters=int(getattr(self._last_inner_state, "iters", 0) or 0),
+                res_norm=float(getattr(self._last_inner_state, "res_norm", 0.0) or 0.0),
+                fallback_used=bool(getattr(self._last_inner_state, "fallback_used", False)),
+            )
+
+        return StrictMixedContactInputs(
+            g_n=g_n,
+            ds_t=ds_t,
+            normals=frame["normals"],
+            t1=frame["t1"],
+            t2=frame["t2"],
+            weights=frame["weights"],
+            xs=frame["xs"],
+            xm=frame["xm"],
+            mu=mu,
+            eps_n=tf.cast(getattr(self.normal.cfg, "fb_eps", 1.0e-8), tf.float32),
+            k_t=k_t,
+            init_state=init_state,
+        )
 
     def solve_strict_inner(
         self,
@@ -433,7 +473,8 @@ class ContactOperator:
         params=None,
         *,
         u_nodes: Optional[tf.Tensor] = None,
-        strict_inputs: Optional[Dict[str, tf.Tensor]] = None,
+        strict_inputs: Optional[StrictMixedContactInputs] = None,
+        return_linearization: bool = False,
         tol_n: float = 1.0e-5,
         tol_t: float = 1.0e-5,
         max_inner_iters: int = 8,
@@ -443,16 +484,22 @@ class ContactOperator:
 
         if strict_inputs is None:
             strict_inputs = self.strict_mixed_inputs(u_fn, params, u_nodes=u_nodes)
+        elif not isinstance(strict_inputs, StrictMixedContactInputs):
+            strict_inputs = StrictMixedContactInputs(**strict_inputs)
+        init_state = strict_inputs.init_state
+        if init_state is None:
+            init_state = self._last_inner_state
         result = solve_contact_inner(
-            strict_inputs["g_n"],
-            strict_inputs["ds_t"],
-            strict_inputs["normals"],
-            strict_inputs["t1"],
-            strict_inputs["t2"],
-            mu=strict_inputs["mu"],
-            eps_n=strict_inputs["eps_n"],
-            k_t=strict_inputs["k_t"],
-            init_state=self._last_inner_state,
+            strict_inputs.g_n,
+            strict_inputs.ds_t,
+            strict_inputs.normals,
+            strict_inputs.t1,
+            strict_inputs.t2,
+            mu=strict_inputs.mu,
+            eps_n=strict_inputs.eps_n,
+            k_t=strict_inputs.k_t,
+            init_state=init_state,
+            return_linearization=return_linearization,
             tol_n=tol_n,
             tol_t=tol_t,
             max_inner_iters=max_inner_iters,
@@ -461,10 +508,10 @@ class ContactOperator:
         self._last_inner_state = ContactInnerState(
             lambda_n=tf.identity(result.state.lambda_n),
             lambda_t=tf.identity(result.state.lambda_t),
-            converged=False,
-            iters=0,
-            res_norm=0.0,
-            fallback_used=False,
+            converged=bool(getattr(result.state, "converged", False)),
+            iters=int(getattr(result.state, "iters", 0) or 0),
+            res_norm=float(getattr(result.state, "res_norm", 0.0) or 0.0),
+            fallback_used=bool(getattr(result.state, "fallback_used", False)),
         )
         return result
 

@@ -28,11 +28,18 @@ Author: you
 """
 
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Dict
 
 import numpy as np
 import tensorflow as tf
+
+
+CONTACT_SURFACE_NORMALS_KEY = "__contact_surface_normals__"
+CONTACT_SURFACE_T1_KEY = "__contact_surface_t1__"
+CONTACT_SURFACE_T2_KEY = "__contact_surface_t2__"
+CONTACT_SURFACE_SEMANTIC_DIM = 10
 
 
 # -----------------------------
@@ -701,6 +708,7 @@ class DisplacementNet(tf.keras.Model):
             with_distance=bool(getattr(cfg, "finite_spectral_with_distance", True)),
         )
         self._node_semantic_features: Optional[tf.Tensor] = None
+        self._contact_surface_semantic_features: Optional[tf.Tensor] = None
 
         # DFEM mode: learnable node embeddings instead of positional encoding
         self.dfem_mode = cfg.dfem_mode
@@ -844,6 +852,8 @@ class DisplacementNet(tf.keras.Model):
         self.stress_out_eps_mlp = None
         self.stress_semantic_proj_mlp = None
         self.stress_semantic_proj_graph = None
+        self.stress_contact_surface_proj_mlp = None
+        self.stress_contact_surface_proj_graph = None
         if cfg.stress_out_dim > 0:
             self.stress_out = tf.keras.layers.Dense(
                 cfg.stress_out_dim,
@@ -898,6 +908,16 @@ class DisplacementNet(tf.keras.Model):
                     kernel_initializer="glorot_uniform",
                     name="stress_semantic_proj_graph",
                 )
+            self.stress_contact_surface_proj_mlp = tf.keras.layers.Dense(
+                cfg.width,
+                kernel_initializer="glorot_uniform",
+                name="stress_contact_surface_proj_mlp",
+            )
+            self.stress_contact_surface_proj_graph = tf.keras.layers.Dense(
+                cfg.graph_width,
+                kernel_initializer="glorot_uniform",
+                name="stress_contact_surface_proj_graph",
+            )
         self.uncertainty_out = None
         self.uncertainty_out_mlp = None
         self.uncertainty_out_shallow = None
@@ -998,6 +1018,47 @@ class DisplacementNet(tf.keras.Model):
                 )
         self._node_semantic_features = feats
 
+    @staticmethod
+    def assemble_contact_surface_semantic_features(
+        normals: np.ndarray | tf.Tensor,
+        t1: np.ndarray | tf.Tensor,
+        t2: np.ndarray | tf.Tensor,
+    ) -> tf.Tensor:
+        normals = tf.ensure_shape(tf.convert_to_tensor(normals, dtype=tf.float32), (None, 3))
+        t1 = tf.ensure_shape(tf.convert_to_tensor(t1, dtype=tf.float32), (None, 3))
+        t2 = tf.ensure_shape(tf.convert_to_tensor(t2, dtype=tf.float32), (None, 3))
+        n_rows = tf.shape(normals)[0]
+        contact_flag = tf.ones((n_rows, 1), dtype=tf.float32)
+        return tf.concat([contact_flag, normals, t1, t2], axis=-1)
+
+    def set_contact_surface_semantic_features(self, features: np.ndarray | tf.Tensor):
+        """Attach per-sample contact-surface semantics for pointwise stress evaluation."""
+
+        feats = tf.convert_to_tensor(features, dtype=tf.float32)
+        feats = tf.ensure_shape(feats, (None, None))
+        if feats.shape.rank is not None and feats.shape[-1] is not None:
+            if int(feats.shape[-1]) != CONTACT_SURFACE_SEMANTIC_DIM:
+                raise ValueError(
+                    "contact-surface semantic feature columns must match "
+                    f"{CONTACT_SURFACE_SEMANTIC_DIM}, got {int(feats.shape[-1])}"
+                )
+        self._contact_surface_semantic_features = feats
+
+    def set_contact_surface_frame(
+        self,
+        normals: np.ndarray | tf.Tensor,
+        t1: np.ndarray | tf.Tensor,
+        t2: np.ndarray | tf.Tensor,
+    ):
+        """Assemble and attach contact-surface semantics from a local surface frame."""
+
+        self.set_contact_surface_semantic_features(
+            self.assemble_contact_surface_semantic_features(normals, t1, t2)
+        )
+
+    def clear_contact_surface_semantic_features(self):
+        self._contact_surface_semantic_features = None
+
     def _resolve_semantic_features(self, n_rows: tf.Tensor, *, dtype: tf.dtypes.DType) -> Optional[tf.Tensor]:
         if not self.use_engineering_semantics:
             return None
@@ -1015,25 +1076,60 @@ class DisplacementNet(tf.keras.Model):
             sem = tf.zeros((n_rows, sem_dim), dtype=tf.float32)
         return tf.cast(sem, dtype)
 
+    def _resolve_contact_surface_semantic_features(
+        self,
+        n_rows: tf.Tensor,
+        *,
+        dtype: tf.dtypes.DType,
+    ) -> Optional[tf.Tensor]:
+        if self._contact_surface_semantic_features is None:
+            return None
+        n_sem = tf.shape(self._contact_surface_semantic_features)[0]
+        sem = tf.cond(
+            tf.equal(n_sem, n_rows),
+            lambda: self._contact_surface_semantic_features,
+            lambda: tf.zeros((n_rows, CONTACT_SURFACE_SEMANTIC_DIM), dtype=tf.float32),
+        )
+        return tf.cast(sem, dtype)
+
     def _fuse_stress_semantics(
         self,
         stress_feat: tf.Tensor,
         semantic_feat: Optional[tf.Tensor],
     ) -> tf.Tensor:
-        if semantic_feat is None:
-            return stress_feat
-
         stress_feat = tf.convert_to_tensor(stress_feat)
-        semantic_feat = tf.cast(semantic_feat, stress_feat.dtype)
-        use_graph_proj = (
-            self.stress_semantic_proj_graph is not None
-            and stress_feat.shape.rank is not None
-            and stress_feat.shape[-1] == self.cfg.graph_width
+        fused = stress_feat
+
+        if semantic_feat is not None:
+            semantic_feat = tf.cast(semantic_feat, stress_feat.dtype)
+            use_graph_proj = (
+                self.stress_semantic_proj_graph is not None
+                and stress_feat.shape.rank is not None
+                and stress_feat.shape[-1] == self.cfg.graph_width
+            )
+            proj_layer = self.stress_semantic_proj_graph if use_graph_proj else self.stress_semantic_proj_mlp
+            if proj_layer is not None:
+                fused = fused + tf.cast(proj_layer(semantic_feat), stress_feat.dtype)
+
+        contact_surface_feat = self._resolve_contact_surface_semantic_features(
+            tf.shape(stress_feat)[0],
+            dtype=stress_feat.dtype,
         )
-        proj_layer = self.stress_semantic_proj_graph if use_graph_proj else self.stress_semantic_proj_mlp
-        if proj_layer is None:
-            return stress_feat
-        return stress_feat + tf.cast(proj_layer(semantic_feat), stress_feat.dtype)
+        if contact_surface_feat is not None:
+            use_graph_proj = (
+                self.stress_contact_surface_proj_graph is not None
+                and stress_feat.shape.rank is not None
+                and stress_feat.shape[-1] == self.cfg.graph_width
+            )
+            proj_layer = (
+                self.stress_contact_surface_proj_graph
+                if use_graph_proj
+                else self.stress_contact_surface_proj_mlp
+            )
+            if proj_layer is not None:
+                fused = fused + tf.cast(proj_layer(contact_surface_feat), stress_feat.dtype)
+
+        return fused
 
     def _contact_mask_from_semantics(
         self,
@@ -1605,6 +1701,66 @@ class DisplacementModel:
 
         return X, P_hat
 
+    @staticmethod
+    def _extract_contact_surface_frame(params: Optional[Dict]):
+        if not isinstance(params, dict):
+            return None
+        normals = params.get(CONTACT_SURFACE_NORMALS_KEY)
+        t1 = params.get(CONTACT_SURFACE_T1_KEY)
+        t2 = params.get(CONTACT_SURFACE_T2_KEY)
+        if normals is None or t1 is None or t2 is None:
+            return None
+        return normals, t1, t2
+
+    @contextmanager
+    def _contact_surface_stress_context(self, params: Optional[Dict]):
+        frame = self._extract_contact_surface_frame(params)
+        if frame is None:
+            yield
+            return
+
+        previous = self.field._contact_surface_semantic_features
+        self.field.set_contact_surface_frame(*frame)
+        try:
+            yield
+        finally:
+            if previous is None:
+                self.field.clear_contact_surface_semantic_features()
+            else:
+                self.field.set_contact_surface_semantic_features(previous)
+
+    def _us_fn_runtime(
+        self,
+        X: tf.Tensor,
+        P_hat: tf.Tensor,
+        *,
+        params: Optional[Dict] = None,
+        force_pointwise: bool = False,
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        if self.field.stress_out is None:
+            raise ValueError("stress head disabled (stress_out_dim<=0)")
+
+        with self._contact_surface_stress_context(params):
+            if self.field.use_eps_guided_stress_head:
+                with tf.GradientTape(persistent=True) as tape:
+                    tape.watch(X)
+                    z = self.encoder(P_hat)
+                    u, stress_feat = self.field(
+                        X,
+                        z,
+                        return_stress_features=True,
+                        force_pointwise=force_pointwise,
+                    )
+                    u = tf.cast(u, tf.float32)
+                eps_bridge = _engineering_strain_from_tape(tape, X, u)
+                del tape
+                sigma = self.field.predict_stress_from_features(stress_feat, eps_bridge=eps_bridge)
+                return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
+            z = self.encoder(P_hat)
+            u, sigma = self.field(X, z, return_stress=True, force_pointwise=force_pointwise)
+            return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
     @tf.function(
         jit_compile=False,
         reduce_retracing=True,
@@ -1749,6 +1905,8 @@ class DisplacementModel:
         """Stress forward that always uses the pointwise MLP path."""
 
         X, P_hat = self._normalize_inputs(X, params)
+        if self._extract_contact_surface_frame(params) is not None:
+            return self._us_fn_runtime(X, P_hat, params=params, force_pointwise=True)
         return self._us_fn_pointwise_compiled(X, P_hat)
 
     @tf.function(

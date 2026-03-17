@@ -16,6 +16,11 @@ from train.loss_weights import LossWeightState
 
 
 class TrainerRunMixin:
+    def _strict_mixed_runtime_enabled(self) -> bool:
+        flags = getattr(self, "_mixed_phase_flags", {}) or {}
+        phase_name = str(flags.get("phase_name", "phase0") or "phase0").strip().lower()
+        return phase_name not in {"", "phase0"}
+
     def _restore_resume_checkpoint_if_needed(self) -> None:
         ckpt = getattr(self, "ckpt", None)
         ckpt_path = str(getattr(getattr(self, "cfg", None), "resume_ckpt_path", "") or "").strip()

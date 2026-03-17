@@ -25,6 +25,9 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
             "ft_norm": 2.2,
             "cone_violation": 2.5,
             "max_penetration": 2.6,
+            "fb_residual_norm": 1.2,
+            "normal_step_norm": 0.7,
+            "tangential_step_norm": 0.8,
             "fallback_used": 1.0,
             "ift_linear_residual": 3.3,
             "grad_u_norm": 4.4,
@@ -38,6 +41,9 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
         self.assertEqual(picked["inner_ft_norm"], 2.2)
         self.assertEqual(picked["inner_cone_violation"], 2.5)
         self.assertEqual(picked["inner_max_penetration"], 2.6)
+        self.assertEqual(picked["inner_fb_residual_norm"], 1.2)
+        self.assertEqual(picked["inner_normal_step_norm"], 0.7)
+        self.assertEqual(picked["inner_tangential_step_norm"], 0.8)
         self.assertEqual(picked["inner_fallback_used"], 1.0)
         self.assertEqual(picked["ift_linear_residual"], 3.3)
         self.assertEqual(picked["grad_u_norm"], 4.4)

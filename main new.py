@@ -239,6 +239,14 @@ from mesh.contact_pairs import guess_surface_key
 from physics.physical_scales import PhysicalScaleConfig
 
 _LOCKED_ROUTE_NAME = "force_then_lock+incremental"
+_LOCKED_TRAINING_PROFILE = "locked"
+_STRICT_MIXED_EXPERIMENTAL_PROFILE = "strict_mixed_experimental"
+_VALID_TRAINING_PROFILES = frozenset(
+    {
+        _LOCKED_TRAINING_PROFILE,
+        _STRICT_MIXED_EXPERIMENTAL_PROFILE,
+    }
+)
 
 
 def _enforce_locked_route(cfg: TrainerConfig) -> None:
@@ -290,6 +298,41 @@ def _canonicalize_locked_route(cfg: TrainerConfig) -> None:
     cfg.alm_update_every = 0
     cfg.contact_cfg.update_every_steps = 1
     cfg.elas_cfg.cache_sample_metrics = False
+
+
+def _normalize_training_profile(raw_profile) -> str:
+    profile = str(raw_profile or _LOCKED_TRAINING_PROFILE).strip().lower().replace("-", "_")
+    if not profile:
+        profile = _LOCKED_TRAINING_PROFILE
+    if profile not in _VALID_TRAINING_PROFILES:
+        valid = ", ".join(sorted(_VALID_TRAINING_PROFILES))
+        raise ValueError(f"Unsupported training_profile '{profile}'. Expected one of: {valid}.")
+    return profile
+
+
+def _resolve_training_profile(cfg_yaml, config_path: str) -> str:
+    raw_profile = None
+    if isinstance(cfg_yaml, dict):
+        raw_profile = cfg_yaml.get("training_profile", None)
+    profile = _normalize_training_profile(raw_profile)
+    if raw_profile is None:
+        base_name = os.path.splitext(os.path.basename(str(config_path or "")))[0].strip().lower().replace("-", "_")
+        if base_name == _STRICT_MIXED_EXPERIMENTAL_PROFILE:
+            profile = _STRICT_MIXED_EXPERIMENTAL_PROFILE
+    return profile
+
+
+def _validate_experimental_profile(cfg: TrainerConfig) -> None:
+    phase_name = str(getattr(getattr(cfg, "mixed_bilevel_phase", None), "phase_name", "") or "").strip().lower()
+    if phase_name in {"", "phase0"}:
+        raise ValueError(
+            "training_profile='strict_mixed_experimental' requires mixed_bilevel_phase.phase_name to be non-phase0."
+        )
+    backend = str(getattr(cfg, "contact_backend", "auto") or "auto").strip().lower()
+    if backend not in {"auto", "inner_solver"}:
+        raise ValueError(
+            "training_profile='strict_mixed_experimental' only supports contact_backend 'auto' or 'inner_solver'."
+        )
 
 
 # ---------- 工具：读取 config.yaml（容错） ----------
@@ -512,6 +555,7 @@ def _prepare_config_with_autoguess(config_path=None):
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含螺母拧紧角度
     )
+    cfg.training_profile = _resolve_training_profile(cfg_yaml, config_path)
     scale_cfg_yaml = cfg_yaml.get("physical_scales", {}) or {}
     cfg.physical_scales = PhysicalScaleConfig(
         L_ref=float(scale_cfg_yaml.get("L_ref", cfg_yaml.get("L_ref", cfg.physical_scales.L_ref))),
@@ -796,6 +840,27 @@ def _prepare_config_with_autoguess(config_path=None):
             cfg.stage_schedule_steps = [int(x) for x in schedule]
 
     # ===== 损失加权配置（含自适应） =====
+    mixed_phase_cfg = cfg_yaml.get("mixed_bilevel_phase", {}) or {}
+    if isinstance(mixed_phase_cfg, dict) and mixed_phase_cfg:
+        if "phase_name" in mixed_phase_cfg:
+            cfg.mixed_bilevel_phase.phase_name = str(mixed_phase_cfg["phase_name"])
+        if "normal_ift_enabled" in mixed_phase_cfg:
+            cfg.mixed_bilevel_phase.normal_ift_enabled = bool(mixed_phase_cfg["normal_ift_enabled"])
+        if "tangential_ift_enabled" in mixed_phase_cfg:
+            cfg.mixed_bilevel_phase.tangential_ift_enabled = bool(mixed_phase_cfg["tangential_ift_enabled"])
+        if "detach_inner_solution" in mixed_phase_cfg:
+            cfg.mixed_bilevel_phase.detach_inner_solution = bool(mixed_phase_cfg["detach_inner_solution"])
+
+    if "contact_backend" in cfg_yaml:
+        cfg.contact_backend = str(cfg_yaml["contact_backend"])
+
+    continuation_caps_cfg = cfg_yaml.get("continuation_caps", {}) or {}
+    if isinstance(continuation_caps_cfg, dict) and continuation_caps_cfg:
+        if "eps_shrink" in continuation_caps_cfg:
+            cfg.continuation_eps_shrink_cap = float(continuation_caps_cfg["eps_shrink"])
+        if "kt_growth" in continuation_caps_cfg:
+            cfg.continuation_kt_growth_cap = float(continuation_caps_cfg["kt_growth"])
+
     loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
     loss_mode = loss_cfg_yaml.get("mode", None)
     if loss_mode is None:
@@ -1061,7 +1126,8 @@ def _prepare_config_with_autoguess(config_path=None):
         cfg.elas_cfg.cache_sample_metrics = False
 
     # Canonicalize route-dependent switches before any stage-dependent heuristics.
-    _canonicalize_locked_route(cfg)
+    if cfg.training_profile == _LOCKED_TRAINING_PROFILE:
+        _canonicalize_locked_route(cfg)
 
     # 3) 接触/拧紧采样：根据阶段数做显存友好的调整
     stage_multiplier = 1
@@ -1184,8 +1250,12 @@ def _prepare_config_with_autoguess(config_path=None):
     preload_half_span = 0.5 * (preload_hi - preload_lo)
     cfg.model_cfg.preload_shift = preload_mid
     cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
-    _enforce_locked_route(cfg)
-    print("[main] Locked route:", _LOCKED_ROUTE_NAME)
+    if cfg.training_profile == _LOCKED_TRAINING_PROFILE:
+        _enforce_locked_route(cfg)
+        print("[main] Locked route:", _LOCKED_ROUTE_NAME)
+    else:
+        _validate_experimental_profile(cfg)
+        print("[main] Experimental route:", cfg.training_profile)
     # =================================================
     return cfg, asm
 

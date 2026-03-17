@@ -17,8 +17,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from model.loss_energy import TotalConfig, TotalEnergy, traction_matching_residual
-from physics.contact.contact_inner_solver import solve_contact_inner
-from physics.contact.contact_operator import ContactOperator, traction_matching_terms
+from physics.contact.contact_inner_solver import ContactInnerState, solve_contact_inner
+from physics.contact.contact_operator import ContactOperator, StrictMixedContactInputs, traction_matching_terms
 
 
 class MixedContactMatchingTests(unittest.TestCase):
@@ -136,6 +136,47 @@ class MixedContactMatchingTests(unittest.TestCase):
         self.assertAlmostEqual(float(parts["E_ct"].numpy()), 4.0)
         self.assertAlmostEqual(float(stats["mixed_strict_active"].numpy()), 0.0)
         self.assertAlmostEqual(float(stats["mixed_strict_skipped"].numpy()), 1.0)
+
+    def test_contact_operator_solve_strict_inner_accepts_typed_inputs(self):
+        cat = {
+            "xs": np.asarray([[0.05, 0.0, 0.0]], dtype=np.float32),
+            "xm": np.asarray([[0.0, 0.1, 0.0]], dtype=np.float32),
+            "n": np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32),
+            "t1": np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+            "t2": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+            "w_area": np.asarray([1.0], dtype=np.float32),
+        }
+        contact = ContactOperator()
+        contact.build_from_cat(cat, extra_weights=None, auto_orient=False)
+
+        def u_fn(X, params=None):
+            del params
+            X = tf.convert_to_tensor(X, dtype=tf.float32)
+            return tf.zeros_like(X)
+
+        inputs = contact.strict_mixed_inputs(u_fn, params={})
+        self.assertIsInstance(inputs, StrictMixedContactInputs)
+        warm_start = ContactInnerState(
+            lambda_n=tf.constant([0.25], dtype=tf.float32),
+            lambda_t=tf.constant([[0.05, 0.0]], dtype=tf.float32),
+            converged=True,
+            iters=2,
+            res_norm=0.0,
+            fallback_used=False,
+        )
+        inputs.init_state = warm_start
+
+        result = contact.solve_strict_inner(
+            u_fn,
+            params={},
+            strict_inputs=inputs,
+            max_inner_iters=0,
+            return_linearization=True,
+        )
+
+        tf.debugging.assert_near(inputs.init_state.lambda_n, warm_start.lambda_n)
+        tf.debugging.assert_near(inputs.init_state.lambda_t, warm_start.lambda_t)
+        self.assertIn("jac_z", result.linearization)
 
     def test_strict_mixed_objective_skips_instead_of_falling_back_to_legacy_contact(self):
         class LegacyContact:

@@ -8,6 +8,11 @@ from typing import Dict, Optional, Tuple, List
 import numpy as np
 import tensorflow as tf
 
+from model.pinn_model import (
+    CONTACT_SURFACE_NORMALS_KEY,
+    CONTACT_SURFACE_T1_KEY,
+    CONTACT_SURFACE_T2_KEY,
+)
 from physics.elasticity_residual import ElasticityResidual
 from physics.elasticity_config import ElasticityConfig
 from physics.contact.contact_operator import (
@@ -200,8 +205,25 @@ class TotalEnergy:
             "inner_skip_batch": tf.cast(1.0, self.dtype),
             "skip_batch": tf.cast(1.0, self.dtype),
             "inner_fallback_used": tf.cast(0.0, self.dtype),
+            "inner_fb_residual_norm": tf.cast(0.0, self.dtype),
+            "inner_normal_step_norm": tf.cast(0.0, self.dtype),
+            "inner_tangential_step_norm": tf.cast(0.0, self.dtype),
+            "ift_linear_residual": tf.cast(0.0, self.dtype),
             "mixed_strict_skip_reason": tf.constant(str(reason), dtype=tf.string),
         }
+
+    @staticmethod
+    def _strict_mixed_contact_stress_params(params, strict_inputs):
+        if isinstance(params, dict):
+            stress_params = dict(params)
+        elif params is None:
+            stress_params = {}
+        else:
+            return params
+        stress_params[CONTACT_SURFACE_NORMALS_KEY] = strict_inputs["normals"]
+        stress_params[CONTACT_SURFACE_T1_KEY] = strict_inputs["t1"]
+        stress_params[CONTACT_SURFACE_T2_KEY] = strict_inputs["t2"]
+        return stress_params
 
     def _strict_mixed_contact_terms(
         self,
@@ -245,8 +267,9 @@ class TotalEnergy:
             traction_vec = tf.stop_gradient(traction_vec)
             ds_t = tf.stop_gradient(ds_t)
 
-        _, sigma_s = stress_fn_contact(strict_inputs["xs"], params)
-        _, sigma_m = stress_fn_contact(strict_inputs["xm"], params)
+        stress_params = self._strict_mixed_contact_stress_params(params, strict_inputs)
+        _, sigma_s = stress_fn_contact(strict_inputs["xs"], stress_params)
+        _, sigma_m = stress_fn_contact(strict_inputs["xm"], stress_params)
         sigma_s = tf.cast(sigma_s, dtype)
         sigma_m = tf.cast(sigma_m, dtype)
 
@@ -294,8 +317,21 @@ class TotalEnergy:
         ft_norm = tf.cast(diagnostics.get("ft_norm", zero), dtype)
         cone_violation = tf.cast(diagnostics.get("cone_violation", zero), dtype)
         max_penetration = tf.cast(diagnostics.get("max_penetration", zero), dtype)
+        fb_residual_norm = tf.cast(diagnostics.get("fb_residual_norm", zero), dtype)
+        normal_step_norm = tf.cast(diagnostics.get("normal_step_norm", zero), dtype)
+        tangential_step_norm = tf.cast(diagnostics.get("tangential_step_norm", zero), dtype)
         fallback_used = tf.cast(diagnostics.get("fallback_used", zero), dtype)
         converged = tf.cast(diagnostics.get("converged", tf.cast(1.0, dtype) - fallback_used), dtype)
+        linearization = getattr(inner_result, "linearization", None)
+        if isinstance(linearization, dict) and "residual" in linearization:
+            ift_linear_residual = tf.sqrt(
+                tf.reduce_sum(
+                    tf.square(tf.cast(linearization["residual"], dtype))
+                )
+                + tf.cast(1.0e-20, dtype)
+            )
+        else:
+            ift_linear_residual = zero
 
         parts = {
             "E_cn": e_cn,
@@ -320,7 +356,11 @@ class TotalEnergy:
             "inner_ft_norm": ft_norm,
             "inner_cone_violation": cone_violation,
             "inner_max_penetration": max_penetration,
+            "inner_fb_residual_norm": fb_residual_norm,
+            "inner_normal_step_norm": normal_step_norm,
+            "inner_tangential_step_norm": tangential_step_norm,
             "inner_fallback_used": fallback_used,
+            "ift_linear_residual": ift_linear_residual,
             "R_contact_comp": r_contact,
             "R_fric_comp": r_fric,
             "traction_match_n_rms": tf.sqrt(e_cn + tf.cast(1.0e-20, dtype)),

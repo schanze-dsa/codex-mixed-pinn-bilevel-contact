@@ -231,6 +231,15 @@ def compute_uncertainty_proxy_sigma(
 def resolve_mixed_phase_flags(cfg: TrainerConfig) -> Dict[str, Any]:
     """Resolve mixed-bilevel phase switches from trainer config."""
 
+    training_profile = str(getattr(cfg, "training_profile", "locked") or "locked").strip().lower().replace("-", "_")
+    if training_profile != "strict_mixed_experimental":
+        return {
+            "phase_name": "phase0",
+            "normal_ift_enabled": False,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+
     phase = getattr(cfg, "mixed_bilevel_phase", None)
     if phase is None:
         return {
@@ -286,6 +295,9 @@ class Trainer(
         """Validate the only supported training route for this project."""
 
         cfg = self.cfg
+        training_profile = str(getattr(cfg, "training_profile", "locked") or "locked").strip().lower().replace("-", "_")
+        if training_profile == "strict_mixed_experimental":
+            return
         stage_mode = str(getattr(getattr(cfg, "total_cfg", None), "preload_stage_mode", "") or "")
         stage_mode = stage_mode.strip().lower().replace("-", "_")
         violations: List[str] = []

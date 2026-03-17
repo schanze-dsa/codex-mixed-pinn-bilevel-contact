@@ -34,6 +34,7 @@ class ContactInnerResult:
     traction_vec: tf.Tensor
     traction_tangent: tf.Tensor
     diagnostics: Dict[str, tf.Tensor]
+    linearization: Optional[Dict[str, tf.Tensor]] = None
 
 
 def _to_float_tensor(x) -> tf.Tensor:
@@ -70,6 +71,7 @@ def solve_contact_inner(
     eps_n,
     k_t,
     init_state: Optional[ContactInnerState] = None,
+    return_linearization: bool = False,
     tol_n: float = 1.0e-5,
     tol_t: float = 1.0e-5,
     max_inner_iters: int = 8,
@@ -97,6 +99,8 @@ def solve_contact_inner(
 
     lambda_n = init_lambda_n
     lambda_t = init_lambda_t
+    normal_step = tf.zeros_like(lambda_n)
+    tangential_step = tf.zeros_like(lambda_t)
     converged = tf.constant(False)
     iters = tf.constant(0, dtype=tf.int32)
     res_norm = tf.constant(float("inf"), dtype=tf.float32)
@@ -218,12 +222,50 @@ def solve_contact_inner(
             tf.reduce_mean(tf.square(fb_normal_residual(g_n, state.lambda_n, eps_n)))
             + 1.0e-20
         ),
+        "normal_step_norm": _max_abs(normal_step),
+        "tangential_step_norm": _max_abs(tangential_step),
         "fallback_used": tf.cast(fallback_used, tf.float32),
         "iters": tf.cast(iters, tf.float32),
     }
+    linearization = None
+    if return_linearization:
+        flat_state = tf.concat(
+            [
+                tf.reshape(tf.cast(state.lambda_n, tf.float32), (-1,)),
+                tf.reshape(tf.cast(state.lambda_t, tf.float32), (-1,)),
+            ],
+            axis=0,
+        )
+        flat_residual = tf.concat(
+            [
+                tf.reshape(tf.cast(fb_normal_residual(g_n, state.lambda_n, eps_n), tf.float32), (-1,)),
+                tf.reshape(
+                    tf.cast(
+                        friction_fixed_point_residual(
+                            state.lambda_t,
+                            ds_t,
+                            state.lambda_n,
+                            mu,
+                            k_t,
+                            eps=eps_n,
+                        ),
+                        tf.float32,
+                    ),
+                    (-1,),
+                ),
+            ],
+            axis=0,
+        )
+        linearization = {
+            "jac_z": tf.eye(tf.shape(flat_state)[0], dtype=tf.float32),
+            "residual": flat_residual,
+            "normal_step": tf.reshape(tf.cast(normal_step, tf.float32), (-1,)),
+            "tangential_step": tf.reshape(tf.cast(tangential_step, tf.float32), (-1,)),
+        }
     return ContactInnerResult(
         state=state,
         traction_vec=traction_vec,
         traction_tangent=state.lambda_t,
         diagnostics=diagnostics,
+        linearization=linearization,
     )

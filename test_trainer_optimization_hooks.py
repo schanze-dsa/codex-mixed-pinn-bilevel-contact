@@ -588,6 +588,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
     def test_strict_mixed_weight_profile_zeros_legacy_outer_terms(self):
         trainer = object.__new__(Trainer)
         trainer.loss_state = None
+        trainer.cfg = SimpleNamespace(training_profile="strict_mixed_experimental")
         trainer._loss_keys = ["E_int", "E_cn", "E_ct", "E_sigma", "E_eq", "E_bi", "E_data", "E_ed"]
         trainer._base_weights = {
             "E_int": 2.0,
@@ -621,6 +622,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
 
     def test_strict_mixed_route_rejects_tangential_ift_in_p0(self):
         trainer = object.__new__(Trainer)
+        trainer.cfg = SimpleNamespace(training_profile="strict_mixed_experimental")
         trainer._mixed_phase_flags = {
             "phase_name": "phase2b",
             "normal_ift_enabled": True,
@@ -635,6 +637,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         trainer = object.__new__(Trainer)
         trainer.model = SimpleNamespace(u_fn=lambda X, params=None: X)
         trainer.loss_state = None
+        trainer.cfg = SimpleNamespace(training_profile="strict_mixed_experimental")
         trainer._base_weights = {}
         trainer._loss_keys = []
         trainer._static_weight_vector = None
@@ -669,6 +672,46 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertEqual(calls["strict"], 1)
         self.assertAlmostEqual(float(parts["E_cn"].numpy()), 1.0)
         self.assertEqual(stats["strict_route_mode"], "normal_ready")
+
+    def test_evaluate_total_objective_keeps_locked_profile_on_legacy_path(self):
+        trainer = object.__new__(Trainer)
+        trainer.model = SimpleNamespace(u_fn=lambda X, params=None: X)
+        trainer.loss_state = None
+        trainer.cfg = SimpleNamespace(training_profile="locked")
+        trainer._base_weights = {}
+        trainer._loss_keys = []
+        trainer._static_weight_vector = None
+        trainer._active_weight_overrides = {}
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase2a",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": True,
+        }
+
+        calls = {"energy": 0, "strict": 0}
+
+        class _FakeTotal:
+            def energy(self, *args, **kwargs):
+                del args, kwargs
+                calls["energy"] += 1
+                return (
+                    tf.constant(0.0, dtype=tf.float32),
+                    {"E_data": tf.constant(1.0, dtype=tf.float32)},
+                    {},
+                )
+
+            def strict_mixed_objective(self, *args, **kwargs):
+                del args, kwargs
+                calls["strict"] += 1
+                raise AssertionError("strict_mixed_objective should stay disabled on locked profile")
+
+        _, parts, stats = trainer._evaluate_total_objective(_FakeTotal(), params={}, stress_fn=None, tape=None)
+
+        self.assertEqual(calls["energy"], 1)
+        self.assertEqual(calls["strict"], 0)
+        self.assertAlmostEqual(float(parts["E_data"].numpy()), 1.0)
+        self.assertEqual(stats["strict_route_mode"], "legacy")
 
     def test_strict_mixed_objective_consumes_unified_mixed_residual_terms(self):
         cfg = SimpleNamespace(
@@ -748,6 +791,100 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertAlmostEqual(float(parts["E_eq"].numpy()), 3.0, places=6)
         self.assertAlmostEqual(float(Pi.numpy()), 3.0, places=6)
 
+    def test_total_energy_strict_mixed_mode_surfaces_inner_step_diagnostics(self):
+        cfg = SimpleNamespace(
+            w_int=0.0,
+            w_cn=1.0,
+            w_ct=1.0,
+            w_bc=0.0,
+            w_tight=0.0,
+            w_sigma=0.0,
+            w_eq=0.0,
+            w_reg=0.0,
+            w_bi=0.0,
+            w_ed=0.0,
+            w_unc=0.0,
+            w_data=0.0,
+            w_smooth=0.0,
+            sigma_ref=1.0,
+            path_penalty_weight=0.0,
+            fric_path_penalty_weight=0.0,
+            ed_enabled=False,
+            ed_external_scale=1.0,
+            ed_margin=0.0,
+            ed_use_relu=True,
+            ed_square=True,
+            adaptive_scheme="contact_only",
+            update_every_steps=1,
+            dtype="float32",
+        )
+        total = TotalEnergy(cfg)
+
+        class _FakeContact:
+            def strict_mixed_inputs(self, u_fn, params=None, *, u_nodes=None):
+                del u_fn, params, u_nodes
+                return {
+                    "ds_t": tf.zeros((1, 2), dtype=tf.float32),
+                    "xs": tf.zeros((1, 3), dtype=tf.float32),
+                    "xm": tf.zeros((1, 3), dtype=tf.float32),
+                    "t1": tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32),
+                    "t2": tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32),
+                    "normals": tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32),
+                    "weights": tf.ones((1,), dtype=tf.float32),
+                    "mu": tf.constant(0.3, dtype=tf.float32),
+                }
+
+            def solve_strict_inner(self, u_fn, params=None, *, u_nodes=None, strict_inputs=None):
+                del u_fn, params, u_nodes, strict_inputs
+                state = SimpleNamespace(
+                    lambda_n=tf.constant([0.1], dtype=tf.float32),
+                    lambda_t=tf.constant([[0.0, 0.0]], dtype=tf.float32),
+                )
+                return SimpleNamespace(
+                    state=state,
+                    traction_vec=tf.constant([[0.0, 0.1, 0.0]], dtype=tf.float32),
+                    diagnostics={
+                        "fn_norm": tf.constant(1.0, dtype=tf.float32),
+                        "ft_norm": tf.constant(2.0, dtype=tf.float32),
+                        "cone_violation": tf.constant(3.0, dtype=tf.float32),
+                        "max_penetration": tf.constant(4.0, dtype=tf.float32),
+                        "fb_residual_norm": tf.constant(1.2, dtype=tf.float32),
+                        "normal_step_norm": tf.constant(0.7, dtype=tf.float32),
+                        "tangential_step_norm": tf.constant(0.8, dtype=tf.float32),
+                        "fallback_used": tf.constant(1.0, dtype=tf.float32),
+                        "converged": tf.constant(0.0, dtype=tf.float32),
+                    },
+                    linearization={"residual": tf.constant([3.0, 4.0], dtype=tf.float32)},
+                )
+
+        total.attach(contact=_FakeContact())
+        total.set_mixed_bilevel_flags(
+            {
+                "phase_name": "phase1",
+                "normal_ift_enabled": True,
+                "tangential_ift_enabled": False,
+                "detach_inner_solution": True,
+            }
+        )
+
+        def zero_u(X, params=None):
+            del X, params
+            return tf.zeros((1, 3), dtype=tf.float32)
+
+        def zero_us(X, params=None):
+            del X, params
+            return (
+                tf.zeros((1, 3), dtype=tf.float32),
+                tf.zeros((1, 6), dtype=tf.float32),
+            )
+
+        _, _, stats = total.energy(zero_u, params={}, stress_fn=zero_us)
+
+        self.assertAlmostEqual(float(stats["inner_fb_residual_norm"].numpy()), 1.2, places=6)
+        self.assertAlmostEqual(float(stats["inner_normal_step_norm"].numpy()), 0.7, places=6)
+        self.assertAlmostEqual(float(stats["inner_tangential_step_norm"].numpy()), 0.8, places=6)
+        self.assertAlmostEqual(float(stats["ift_linear_residual"].numpy()), 5.0, places=6)
+
     def test_accumulate_strict_bilevel_rates_and_freeze_request(self):
         trainer = object.__new__(Trainer)
         trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
@@ -795,6 +932,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         cases = [
             (
                 "phase0",
+                "locked",
                 "inner_solver",
                 {
                     "phase_name": "phase0",
@@ -805,6 +943,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
             ),
             (
                 "phase2a",
+                "strict_mixed_experimental",
                 "legacy_alm",
                 {
                     "phase_name": "phase2a",
@@ -815,9 +954,9 @@ class TrainerOptimizationHookTests(unittest.TestCase):
             ),
         ]
 
-        for phase_name, backend, flags in cases:
+        for phase_name, training_profile, backend, flags in cases:
             trainer = object.__new__(Trainer)
-            trainer.cfg = SimpleNamespace(contact_backend=backend)
+            trainer.cfg = SimpleNamespace(contact_backend=backend, training_profile=training_profile)
             trainer._mixed_phase_flags = flags
             with self.subTest(phase_name=phase_name, backend=backend):
                 with self.assertRaises(ValueError):
@@ -1010,6 +1149,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
             "detach_inner_solution": True,
         }
         trainer.cfg = SimpleNamespace(
+            training_profile="strict_mixed_experimental",
             contact_backend="auto",
             total_cfg=SimpleNamespace(
                 w_int=0.0,

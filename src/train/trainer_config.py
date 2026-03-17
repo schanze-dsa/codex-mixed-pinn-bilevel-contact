@@ -126,6 +126,7 @@ class TrainerConfig:
     stage_alm_every: int = 1
     reset_contact_state_per_case: bool = True
     stage_schedule_steps: List[int] = field(default_factory=list)
+    training_profile: str = "locked"
     mixed_bilevel_phase: MixedBilevelPhaseConfig = field(default_factory=MixedBilevelPhaseConfig)
     contact_backend: str = "auto"
     continuation_eps_shrink_cap: float = 0.7

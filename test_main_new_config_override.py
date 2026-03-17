@@ -27,6 +27,27 @@ def _load_main_new_module():
     return module
 
 
+def _minimal_training_yaml(**overrides):
+    cfg = {
+        "inp_path": "dummy.cdb",
+        "mirror_surface_name": "MIRROR UP",
+        "material_properties": {"mat": {"E": 1.0e5, "nu": 0.3}},
+        "part2mat": {"P1": "mat"},
+        "tighten_angle_min": 0.0,
+        "tighten_angle_max": 1.0,
+        "preload_use_stages": True,
+        "incremental_mode": True,
+        "preload_staging": {"mode": "force_then_lock", "enabled": True},
+        "optimizer_config": {},
+        "friction_config": {},
+        "output_config": {},
+        "contact_pairs": [],
+        "nuts": [],
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 class MainNewConfigOverrideTests(unittest.TestCase):
     def test_prepare_config_accepts_explicit_config_path(self):
         main_new = _load_main_new_module()
@@ -59,22 +80,8 @@ class MainNewConfigOverrideTests(unittest.TestCase):
 
     def test_prepare_config_parses_grouped_cv_supervision_controls(self):
         main_new = _load_main_new_module()
-        fake_yaml = {
-            "inp_path": "dummy.cdb",
-            "mirror_surface_name": "MIRROR UP",
-            "material_properties": {"mat": {"E": 1.0e5, "nu": 0.3}},
-            "part2mat": {"P1": "mat"},
-            "tighten_angle_min": 0.0,
-            "tighten_angle_max": 1.0,
-            "preload_use_stages": True,
-            "incremental_mode": True,
-            "preload_staging": {"mode": "force_then_lock", "enabled": True},
-            "optimizer_config": {},
-            "friction_config": {},
-            "output_config": {},
-            "contact_pairs": [],
-            "nuts": [],
-            "supervision": {
+        fake_yaml = _minimal_training_yaml(
+            supervision={
                 "enabled": True,
                 "case_table_path": "cases.csv",
                 "stage_dir": "stages",
@@ -86,7 +93,7 @@ class MainNewConfigOverrideTests(unittest.TestCase):
                 "train_splits": ["train"],
                 "eval_splits": ["val"],
             },
-        }
+        )
         fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
         with patch.object(main_new, "_load_yaml_config", return_value=fake_yaml), patch.object(
             main_new, "load_cdb", return_value=fake_asm
@@ -104,26 +111,13 @@ class MainNewConfigOverrideTests(unittest.TestCase):
 
     def test_prepare_config_parses_supervision_comparison_controls(self):
         main_new = _load_main_new_module()
-        fake_yaml = {
-            "inp_path": "dummy.cdb",
-            "mirror_surface_name": "MIRROR UP",
-            "material_properties": {"mat": {"E": 1.0e5, "nu": 0.3}},
-            "part2mat": {"P1": "mat"},
-            "tighten_angle_min": 0.0,
-            "tighten_angle_max": 1.0,
-            "preload_use_stages": True,
-            "incremental_mode": True,
-            "preload_staging": {"mode": "force_then_lock", "enabled": True},
-            "optimizer_config": {},
-            "friction_config": {},
-            "contact_pairs": [],
-            "nuts": [],
-            "output_config": {
+        fake_yaml = _minimal_training_yaml(
+            output_config={
                 "viz_supervision_compare_enabled": True,
                 "viz_supervision_compare_split": "test",
                 "viz_supervision_compare_sources": ["boundary", "corner", "interior"],
             },
-        }
+        )
         fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
         with patch.object(main_new, "_load_yaml_config", return_value=fake_yaml), patch.object(
             main_new, "load_cdb", return_value=fake_asm
@@ -136,22 +130,13 @@ class MainNewConfigOverrideTests(unittest.TestCase):
 
     def test_prepare_config_parses_two_stage_training_controls(self):
         main_new = _load_main_new_module()
-        fake_yaml = {
-            "inp_path": "dummy.cdb",
-            "mirror_surface_name": "MIRROR UP",
-            "material_properties": {"mat": {"E": 1.0e5, "nu": 0.3}},
-            "part2mat": {"P1": "mat"},
-            "tighten_angle_min": 0.0,
-            "tighten_angle_max": 1.0,
-            "preload_use_stages": True,
-            "incremental_mode": True,
-            "preload_staging": {"mode": "force_then_lock", "enabled": True},
-            "optimizer_config": {
+        fake_yaml = _minimal_training_yaml(
+            optimizer_config={
                 "epochs": 1200,
                 "learning_rate": 1.0e-5,
                 "validation_eval_every": 100,
             },
-            "loss_config": {
+            loss_config={
                 "supervision_contribution_floor_enabled": True,
                 "supervision_contribution_floor_ratio": 1.0e-1,
                 "base_weights": {
@@ -159,13 +144,13 @@ class MainNewConfigOverrideTests(unittest.TestCase):
                     "w_smooth": 1.0e-2,
                 },
             },
-            "output_config": {
+            output_config={
                 "save_best_on": "val_drrms",
             },
-            "friction_config": {},
-            "contact_pairs": [],
-            "nuts": [],
-            "two_stage_training": {
+            friction_config={},
+            contact_pairs=[],
+            nuts=[],
+            two_stage_training={
                 "enabled": True,
                 "phase1": {
                     "max_steps": 300,
@@ -180,7 +165,7 @@ class MainNewConfigOverrideTests(unittest.TestCase):
                     "supervision_contribution_floor_ratio": 0.1,
                 },
             },
-        }
+        )
         fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
         with patch.object(main_new, "_load_yaml_config", return_value=fake_yaml), patch.object(
             main_new, "load_cdb", return_value=fake_asm
@@ -203,22 +188,13 @@ class MainNewConfigOverrideTests(unittest.TestCase):
 
     def test_two_stage_phase_override_keeps_non_phase_fields_stable(self):
         main_new = _load_main_new_module()
-        fake_yaml = {
-            "inp_path": "dummy.cdb",
-            "mirror_surface_name": "MIRROR UP",
-            "material_properties": {"mat": {"E": 1.0e5, "nu": 0.3}},
-            "part2mat": {"P1": "mat"},
-            "tighten_angle_min": 0.0,
-            "tighten_angle_max": 1.0,
-            "preload_use_stages": True,
-            "incremental_mode": True,
-            "preload_staging": {"mode": "force_then_lock", "enabled": True},
-            "optimizer_config": {
+        fake_yaml = _minimal_training_yaml(
+            optimizer_config={
                 "epochs": 1200,
                 "learning_rate": 1.0e-5,
                 "validation_eval_every": 100,
             },
-            "loss_config": {
+            loss_config={
                 "supervision_contribution_floor_enabled": True,
                 "supervision_contribution_floor_ratio": 1.0e-1,
                 "data_smoothing_k": 8,
@@ -232,19 +208,19 @@ class MainNewConfigOverrideTests(unittest.TestCase):
                     "focus_terms": ["w_eq", "w_cn", "w_ct"],
                 },
             },
-            "output_config": {
+            output_config={
                 "save_path": "./results/ansys_supervised",
                 "save_best_on": "val_drrms",
             },
-            "friction_config": {},
-            "contact_pairs": [],
-            "nuts": [],
-            "supervision": {
+            friction_config={},
+            contact_pairs=[],
+            nuts=[],
+            supervision={
                 "enabled": True,
                 "case_table_path": "cases.csv",
                 "stage_dir": "stages",
             },
-            "two_stage_training": {
+            two_stage_training={
                 "enabled": True,
                 "phase1": {
                     "max_steps": 300,
@@ -259,7 +235,7 @@ class MainNewConfigOverrideTests(unittest.TestCase):
                     "supervision_contribution_floor_ratio": 0.1,
                 },
             },
-        }
+        )
         fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
         with patch.object(main_new, "_load_yaml_config", return_value=fake_yaml), patch.object(
             main_new, "load_cdb", return_value=fake_asm
@@ -422,6 +398,62 @@ print(\"hello\")
                 "w_eq": 0.5,
             },
         )
+
+    def test_prepare_config_keeps_default_locked_profile(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="config.yaml")
+
+        self.assertEqual(cfg.training_profile, "locked")
+        self.assertTrue(cfg.preload_use_stages)
+        self.assertTrue(cfg.incremental_mode)
+        self.assertEqual(cfg.contact_backend, "auto")
+        self.assertEqual(cfg.mixed_bilevel_phase.phase_name, "phase0")
+
+    def test_prepare_config_accepts_strict_mixed_experimental_profile(self):
+        main_new = _load_main_new_module()
+        fake_yaml = _minimal_training_yaml(
+            training_profile="strict_mixed_experimental",
+            contact_backend="inner_solver",
+            mixed_bilevel_phase={
+                "phase_name": "phase1",
+                "normal_ift_enabled": True,
+                "tangential_ift_enabled": False,
+                "detach_inner_solution": True,
+            },
+            continuation_caps={
+                "eps_shrink": 0.65,
+                "kt_growth": 1.25,
+            },
+        )
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+        with patch.object(main_new, "_load_yaml_config", return_value=fake_yaml), patch.object(
+            main_new, "load_cdb", return_value=fake_asm
+        ), patch.object(main_new.os.path, "exists", return_value=True):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertEqual(cfg.training_profile, "strict_mixed_experimental")
+        self.assertEqual(cfg.contact_backend, "inner_solver")
+        self.assertEqual(cfg.mixed_bilevel_phase.phase_name, "phase1")
+        self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
+        self.assertFalse(cfg.mixed_bilevel_phase.tangential_ift_enabled)
+        self.assertTrue(cfg.mixed_bilevel_phase.detach_inner_solution)
+        self.assertEqual(cfg.continuation_eps_shrink_cap, 0.65)
+        self.assertEqual(cfg.continuation_kt_growth_cap, 1.25)
+
+    def test_prepare_config_loads_repository_strict_mixed_profile(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertEqual(cfg.training_profile, "strict_mixed_experimental")
+        self.assertEqual(cfg.contact_backend, "inner_solver")
+        self.assertEqual(cfg.mixed_bilevel_phase.phase_name, "phase1")
+        self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
 
 
 if __name__ == "__main__":
