@@ -34,7 +34,7 @@ class ContactInnerResult:
     traction_vec: tf.Tensor
     traction_tangent: tf.Tensor
     diagnostics: Dict[str, tf.Tensor]
-    linearization: Optional[Dict[str, tf.Tensor]] = None
+    linearization: Optional[Dict[str, object]] = None
 
 
 def _to_float_tensor(x) -> tf.Tensor:
@@ -291,14 +291,33 @@ def solve_contact_inner(
         del tape
         flat_state = flatten_contact_state(lambda_n_lin, lambda_t_lin)
         flat_inputs = flatten_contact_inputs(g_n_lin, ds_t_lin)
+        lambda_n_shape = list(lambda_n_lin.shape.as_list() or [])
+        lambda_t_shape = list(lambda_t_lin.shape.as_list() or [])
+        g_n_shape = list(g_n_lin.shape.as_list() or [])
+        ds_t_shape = list(ds_t_lin.shape.as_list() or [])
         linearization = {
+            "schema_version": "strict_mixed_v2",
+            "route_mode": "normal_ready",
+            "is_exact": False,
+            "tangential_mode": "smooth_not_enabled",
             "jac_z": tf.concat([jac_lambda_n, jac_lambda_t], axis=1),
             "jac_inputs": tf.concat([jac_g_n, jac_ds_t], axis=1),
+            "state_layout": {
+                "order": ["lambda_n", "lambda_t"],
+                "lambda_n_shape": lambda_n_shape,
+                "lambda_t_shape": lambda_t_shape,
+            },
+            "input_layout": {
+                "order": ["g_n", "ds_t"],
+                "g_n_shape": g_n_shape,
+                "ds_t_shape": ds_t_shape,
+            },
             "flat_z": flat_state,
             "flat_inputs": flat_inputs,
             "z_splits": {"lambda_n": 1, "lambda_t": 2},
             "input_splits": {"g_n": 1, "ds_t": 2},
             "residual": flat_residual,
+            "residual_at_solution": flat_residual,
             "normal_step": tf.reshape(tf.cast(normal_step, tf.float32), (-1,)),
             "tangential_step": tf.reshape(tf.cast(tangential_step, tf.float32), (-1,)),
         }

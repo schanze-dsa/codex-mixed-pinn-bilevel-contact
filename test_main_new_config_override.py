@@ -455,6 +455,18 @@ print(\"hello\")
         self.assertEqual(cfg.mixed_bilevel_phase.phase_name, "phase1")
         self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
 
+    def test_prepare_config_sets_v2_normal_only_ift_defaults(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertEqual(cfg.training_profile, "strict_mixed_experimental")
+        self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
+        self.assertFalse(cfg.mixed_bilevel_phase.tangential_ift_enabled)
+        self.assertFalse(cfg.mixed_bilevel_phase.detach_inner_solution)
+
 
 if __name__ == "__main__":
     unittest.main()

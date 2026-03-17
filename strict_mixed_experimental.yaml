@@ -85,7 +85,7 @@ mixed_bilevel_phase:
   phase_name: phase1
   normal_ift_enabled: true
   tangential_ift_enabled: false
-  detach_inner_solution: true
+  detach_inner_solution: false
 
 contact_backend: inner_solver
 
