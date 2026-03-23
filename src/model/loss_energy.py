@@ -227,6 +227,10 @@ class TotalEnergy:
             "inner_normal_step_norm": tf.cast(0.0, self.dtype),
             "inner_tangential_step_norm": tf.cast(0.0, self.dtype),
             "ift_linear_residual": tf.cast(0.0, self.dtype),
+            "normal_ift_ready": tf.cast(0.0, self.dtype),
+            "normal_ift_consumed": tf.cast(0.0, self.dtype),
+            "normal_ift_condition_metric": tf.cast(0.0, self.dtype),
+            "normal_ift_valid_ratio": tf.cast(0.0, self.dtype),
             "mixed_strict_skip_reason": tf.constant(str(reason), dtype=tf.string),
         }
 
@@ -242,6 +246,64 @@ class TotalEnergy:
         stress_params[CONTACT_SURFACE_T1_KEY] = strict_inputs["t1"]
         stress_params[CONTACT_SURFACE_T2_KEY] = strict_inputs["t2"]
         return stress_params
+
+    def _strict_mixed_normal_ift_stats(
+        self,
+        linearization,
+        *,
+        route_mode: str,
+    ) -> Dict[str, tf.Tensor]:
+        zero = tf.cast(0.0, self.dtype)
+        one = tf.cast(1.0, self.dtype)
+        stats = {
+            "normal_ift_ready": zero,
+            "normal_ift_consumed": zero,
+            "normal_ift_condition_metric": zero,
+            "normal_ift_valid_ratio": zero,
+        }
+        if route_mode != "normal_ready" or not isinstance(linearization, dict):
+            return stats
+
+        required = ("residual", "jac_z", "jac_inputs")
+        if any(key not in linearization for key in required):
+            return stats
+
+        residual = tf.cast(linearization["residual"], self.dtype)
+        jac_z = tf.cast(linearization["jac_z"], self.dtype)
+        jac_inputs = tf.cast(linearization["jac_inputs"], self.dtype)
+        finite_bits = tf.concat(
+            [
+                tf.reshape(tf.cast(tf.math.is_finite(residual), self.dtype), (-1,)),
+                tf.reshape(tf.cast(tf.math.is_finite(jac_z), self.dtype), (-1,)),
+                tf.reshape(tf.cast(tf.math.is_finite(jac_inputs), self.dtype), (-1,)),
+            ],
+            axis=0,
+        )
+        valid_ratio = tf.reduce_mean(finite_bits)
+
+        clean_jac_z = tf.where(tf.math.is_finite(jac_z), jac_z, tf.zeros_like(jac_z))
+        abs_jac_z = tf.abs(clean_jac_z)
+        max_abs = tf.reduce_max(abs_jac_z)
+        sentinel = tf.cast(1.0e12, self.dtype)
+        positive_abs = tf.where(abs_jac_z > tf.cast(0.0, self.dtype), abs_jac_z, tf.fill(tf.shape(abs_jac_z), sentinel))
+        min_abs = tf.reduce_min(positive_abs)
+        min_abs = tf.where(min_abs >= sentinel, tf.cast(1.0e-12, self.dtype), min_abs)
+        condition_metric = tf.where(
+            max_abs > tf.cast(0.0, self.dtype),
+            max_abs / tf.maximum(min_abs, tf.cast(1.0e-12, self.dtype)),
+            zero,
+        )
+        consumed = tf.cast(valid_ratio > tf.cast(0.0, self.dtype), self.dtype)
+
+        stats.update(
+            {
+                "normal_ift_ready": one,
+                "normal_ift_consumed": consumed,
+                "normal_ift_condition_metric": condition_metric,
+                "normal_ift_valid_ratio": valid_ratio,
+            }
+        )
+        return stats
 
     def _strict_mixed_contact_terms(
         self,
@@ -272,23 +334,31 @@ class TotalEnergy:
             "u_nodes": u_nodes,
             "strict_inputs": strict_inputs,
         }
+        max_tail_qn_iters = int(self.mixed_bilevel_flags.get("max_tail_qn_iters", 0) or 0)
+        if max_tail_qn_iters > 0:
+            solve_kwargs["max_tail_qn_iters"] = max_tail_qn_iters
+        normal_ready_max_inner_iters = int(self.mixed_bilevel_flags.get("normal_ready_max_inner_iters", 0) or 0)
+        if route_mode == "normal_ready" and normal_ready_max_inner_iters > 0:
+            solve_kwargs["max_inner_iters"] = normal_ready_max_inner_iters
         if route_mode in {"normal_ready", "full_ift"}:
             solve_kwargs["return_linearization"] = True
-        try:
-            inner_result = self.contact.solve_strict_inner(
-                u_fn,
-                params,
-                **solve_kwargs,
-            )
-        except TypeError as exc:
-            if "return_linearization" not in str(exc):
-                raise
-            solve_kwargs.pop("return_linearization", None)
-            inner_result = self.contact.solve_strict_inner(
-                u_fn,
-                params,
-                **solve_kwargs,
-            )
+        while True:
+            try:
+                inner_result = self.contact.solve_strict_inner(
+                    u_fn,
+                    params,
+                    **solve_kwargs,
+                )
+                break
+            except TypeError as exc:
+                message = str(exc)
+                removed = False
+                for key in ("return_linearization", "max_tail_qn_iters", "max_inner_iters"):
+                    if key in message and key in solve_kwargs:
+                        solve_kwargs.pop(key, None)
+                        removed = True
+                if not removed:
+                    raise
         diagnostics = dict(inner_result.diagnostics)
         policy = resolve_strict_mixed_runtime_policy(diagnostics, route_mode=route_mode)
         detach_inner = bool(self.mixed_bilevel_flags.get("detach_inner_solution", True)) or bool(policy.force_detach)
@@ -360,6 +430,27 @@ class TotalEnergy:
         tangential_step_norm = tf.cast(diagnostics.get("tangential_step_norm", zero), dtype)
         fallback_used = tf.cast(diagnostics.get("fallback_used", zero), dtype)
         converged = tf.cast(diagnostics.get("converged", tf.cast(1.0, dtype) - fallback_used), dtype)
+        ft_residual_norm = ft_norm
+        effective_alpha_scale = zero
+        tail_has_effective_step = zero
+        tangential_step_mode = ""
+        fallback_trigger_reason = ""
+        trace = diagnostics.get("iteration_trace")
+        if isinstance(trace, dict):
+            fallback_trigger_reason = str(trace.get("fallback_trigger_reason", "") or "")
+            iterations = trace.get("iterations")
+            if isinstance(iterations, (list, tuple)) and len(iterations) > 0 and isinstance(iterations[-1], dict):
+                last_iter = iterations[-1]
+                tangential_step_mode = str(last_iter.get("tangential_step_mode", "") or "")
+                if "effective_alpha_scale" in last_iter:
+                    effective_alpha_scale = tf.cast(last_iter["effective_alpha_scale"], dtype)
+                if "tail_has_effective_step" in last_iter:
+                    tail_has_effective_step = tf.cast(
+                        1.0 if bool(last_iter["tail_has_effective_step"]) else 0.0,
+                        dtype,
+                    )
+                if "ft_residual_after" in last_iter:
+                    ft_residual_norm = tf.cast(last_iter["ft_residual_after"], dtype)
         linearization = getattr(inner_result, "linearization", None)
         if isinstance(linearization, dict) and "residual" in linearization:
             ift_linear_residual = tf.sqrt(
@@ -370,6 +461,7 @@ class TotalEnergy:
             )
         else:
             ift_linear_residual = zero
+        normal_ift_stats = self._strict_mixed_normal_ift_stats(linearization, route_mode=route_mode)
 
         parts = {
             "R_t": e_cn,
@@ -400,12 +492,20 @@ class TotalEnergy:
             "inner_normal_step_norm": normal_step_norm,
             "inner_tangential_step_norm": tangential_step_norm,
             "inner_fallback_used": fallback_used,
+            "ft_residual_norm": ft_residual_norm,
+            "effective_alpha_scale": effective_alpha_scale,
+            "tail_has_effective_step": tail_has_effective_step,
             "ift_linear_residual": ift_linear_residual,
             "R_contact_comp": r_contact,
             "R_fric_comp": r_fric,
             "traction_match_n_rms": tf.sqrt(e_cn + tf.cast(1.0e-20, dtype)),
             "traction_match_t_rms": tf.sqrt(e_ct + tf.cast(1.0e-20, dtype)),
         }
+        if tangential_step_mode:
+            stats["tangential_step_mode"] = tf.constant(tangential_step_mode, dtype=tf.string)
+        if fallback_trigger_reason:
+            stats["fallback_trigger_reason"] = tf.constant(fallback_trigger_reason, dtype=tf.string)
+        stats.update(normal_ift_stats)
         stats.update(
             {
                 key: tf.cast(value, dtype)

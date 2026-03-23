@@ -89,6 +89,19 @@ class StrictMixedContactInputs:
         return getattr(self, key, default)
 
 
+def _clone_inner_state(state: Optional[ContactInnerState]) -> Optional[ContactInnerState]:
+    if state is None:
+        return None
+    return ContactInnerState(
+        lambda_n=tf.identity(tf.cast(state.lambda_n, tf.float32)),
+        lambda_t=tf.identity(tf.cast(state.lambda_t, tf.float32)),
+        converged=getattr(state, "converged", False),
+        iters=getattr(state, "iters", 0),
+        res_norm=getattr(state, "res_norm", 0.0),
+        fallback_used=getattr(state, "fallback_used", False),
+    )
+
+
 def traction_matching_terms(sigma_s, sigma_m, normals, t1, t2, inner_result):
     """Residual matching terms based on solved inner-contact traction."""
 
@@ -447,16 +460,7 @@ class ContactOperator:
             mu = tf.cast(0.0, tf.float32)
             k_t = tf.cast(0.0, tf.float32)
 
-        init_state = None
-        if self._last_inner_state is not None:
-            init_state = ContactInnerState(
-                lambda_n=tf.identity(self._last_inner_state.lambda_n),
-                lambda_t=tf.identity(self._last_inner_state.lambda_t),
-                converged=bool(getattr(self._last_inner_state, "converged", False)),
-                iters=int(getattr(self._last_inner_state, "iters", 0) or 0),
-                res_norm=float(getattr(self._last_inner_state, "res_norm", 0.0) or 0.0),
-                fallback_used=bool(getattr(self._last_inner_state, "fallback_used", False)),
-            )
+        init_state = _clone_inner_state(self._last_inner_state) if tf.executing_eagerly() else None
         meta = self._meta or {}
         contact_ids = meta.get("pair_id")
         if contact_ids is not None:
@@ -492,10 +496,14 @@ class ContactOperator:
         u_nodes: Optional[tf.Tensor] = None,
         strict_inputs: Optional[StrictMixedContactInputs] = None,
         return_linearization: bool = False,
+        return_iteration_trace: bool = False,
         tol_n: float = 1.0e-5,
         tol_t: float = 1.0e-5,
+        tol_fb: Optional[float] = None,
         max_inner_iters: int = 8,
+        max_tail_qn_iters: int = 0,
         damping: float = 1.0,
+        normal_correction_cap_scale: float = 1.0,
     ) -> ContactInnerResult:
         """Solve strict mixed inner state from the current contact batch and cache warm start."""
 
@@ -517,19 +525,20 @@ class ContactOperator:
             k_t=strict_inputs.k_t,
             init_state=init_state,
             return_linearization=return_linearization,
+            return_iteration_trace=return_iteration_trace,
             tol_n=tol_n,
             tol_t=tol_t,
+            tol_fb=tol_fb,
             max_inner_iters=max_inner_iters,
+            max_tail_qn_iters=max_tail_qn_iters,
             damping=damping,
+            normal_correction_cap_scale=normal_correction_cap_scale,
         )
-        self._last_inner_state = ContactInnerState(
-            lambda_n=tf.identity(result.state.lambda_n),
-            lambda_t=tf.identity(result.state.lambda_t),
-            converged=bool(getattr(result.state, "converged", False)),
-            iters=int(getattr(result.state, "iters", 0) or 0),
-            res_norm=float(getattr(result.state, "res_norm", 0.0) or 0.0),
-            fallback_used=bool(getattr(result.state, "fallback_used", False)),
-        )
+        if tf.executing_eagerly():
+            self._last_inner_state = _clone_inner_state(result.state)
+        else:
+            # Symbolic tensors cannot be kept in Python cache across tf.function traces.
+            self._last_inner_state = None
         return result
 
     def solve_inner_state(
@@ -556,7 +565,7 @@ class ContactOperator:
                 lambda_t=tf.cast(self._last_inner_state.lambda_t, tf.float32),
                 converged=False,
                 iters=0,
-                res_norm=float(getattr(self._last_inner_state, "res_norm", 0.0) or 0.0),
+                res_norm=getattr(self._last_inner_state, "res_norm", 0.0),
                 fallback_used=True,
             )
         else:
@@ -580,15 +589,8 @@ class ContactOperator:
                 "fallback_used": tf.cast(1.0 if state.fallback_used else 0.0, tf.float32),
             },
         )
-        if result.state.converged and not result.state.fallback_used:
-            self._last_inner_state = ContactInnerState(
-                lambda_n=tf.identity(result.state.lambda_n),
-                lambda_t=tf.identity(result.state.lambda_t),
-                converged=True,
-                iters=int(result.state.iters),
-                res_norm=float(result.state.res_norm),
-                fallback_used=False,
-            )
+        if result.state.converged and not result.state.fallback_used and tf.executing_eagerly():
+            self._last_inner_state = _clone_inner_state(result.state)
         return result
 
     # ---------- schedules / setters ----------

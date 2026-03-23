@@ -19,6 +19,7 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from train.trainer import Trainer, TrainerConfig, _SavedModelModule
+from train.trainer_opt_mixin import inject_bilevel_diagnostics
 from model.pinn_model import ModelConfig, FieldConfig, EncoderConfig, create_displacement_model
 from model.loss_energy import TotalEnergy
 from physics.contact.contact_normal_alm import NormalContactALM
@@ -1314,6 +1315,97 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertIn("cback=inner_solver", postfix)
         self.assertIn("cfrz=1", postfix)
         self.assertIn("cfrze=2", postfix)
+
+    def test_inject_bilevel_diagnostics_lifts_inner_trace_fields(self):
+        stats = inject_bilevel_diagnostics(
+            {},
+            {
+                "normal_ift_ready": tf.constant(1.0, dtype=tf.float32),
+                "normal_ift_consumed": tf.constant(1.0, dtype=tf.float32),
+                "ft_norm": tf.constant(2.5e-3, dtype=tf.float32),
+                "iteration_trace": {
+                    "fallback_trigger_reason": "iteration_budget_exhausted",
+                    "iterations": [
+                        {
+                            "tangential_step_mode": "residual_driven_tail_qn",
+                            "effective_alpha_scale": 0.25,
+                            "tail_has_effective_step": True,
+                        }
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(stats["normal_ift_ready"], 1.0)
+        self.assertEqual(stats["normal_ift_consumed"], 1.0)
+        self.assertAlmostEqual(stats["ft_residual_norm"], 2.5e-3, places=7)
+        self.assertEqual(stats["fallback_trigger_reason"], "iteration_budget_exhausted")
+        self.assertEqual(stats["tangential_step_mode"], "residual_driven_tail_qn")
+        self.assertEqual(stats["effective_alpha_scale"], 0.25)
+        self.assertEqual(stats["tail_has_effective_step"], 1.0)
+
+    def test_format_train_log_postfix_includes_formal_route_debug_fields(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase1",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": False,
+        }
+        trainer.cfg = SimpleNamespace(
+            training_profile="strict_mixed_experimental",
+            contact_backend="inner_solver",
+            max_tail_qn_iters=4,
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+                w_smooth=0.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={
+                "strict_route_mode": "normal_ready",
+                "normal_ift_ready": 1.0,
+                "normal_ift_consumed": 1.0,
+                "ft_residual_norm": 2.5e-3,
+                "tangential_step_mode": "residual_driven_tail_qn",
+                "effective_alpha_scale": 0.25,
+                "tail_has_effective_step": 1.0,
+                "fallback_trigger_reason": "iteration_budget_exhausted",
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("normal_ift_ready=1", postfix)
+        self.assertIn("normal_ift_consumed=1", postfix)
+        self.assertIn("max_tail_qn_iters=4", postfix)
+        self.assertIn("tangential_step_mode=residual_driven_tail_qn", postfix)
+        self.assertIn("effective_alpha_scale=2.5000e-01", postfix)
+        self.assertIn("fallback_trigger_reason=iteration_budget_exhausted", postfix)
+        self.assertIn("ft_residual_norm=2.5000e-03", postfix)
+        self.assertIn("tail_has_effective_step=1", postfix)
 
     def test_format_train_log_postfix_includes_legacy_contact_backend_token(self):
         trainer = object.__new__(Trainer)

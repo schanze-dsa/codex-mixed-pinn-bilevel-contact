@@ -17,3 +17,8 @@ results/
 # Archives
 *.zip
 mir.cdb
+
+.worktrees/
+tmp/
+temp_ckpt_test/
+/[0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_]

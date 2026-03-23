@@ -151,6 +151,28 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
 
         self.assertEqual(total.mixed_bilevel_flags["contact_backend"], "inner_solver")
 
+    def test_assemble_total_propagates_normal_ready_route_local_inner_budget(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = TrainerConfig(
+            training_profile="strict_mixed_experimental",
+            normal_ready_max_inner_iters=16,
+            mixed_bilevel_phase=MixedBilevelPhaseConfig(
+                phase_name="phase2a",
+                normal_ift_enabled=True,
+                tangential_ift_enabled=False,
+                detach_inner_solution=False,
+            ),
+        )
+        trainer.elasticity = None
+        trainer.contact = None
+        trainer.tightening = None
+        trainer.bcs_ops = []
+        trainer._mixed_phase_flags = resolve_mixed_phase_flags(trainer.cfg)
+
+        total = trainer._assemble_total()
+
+        self.assertEqual(total.mixed_bilevel_flags["normal_ready_max_inner_iters"], 16)
+
 
 if __name__ == "__main__":
     unittest.main()

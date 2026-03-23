@@ -68,6 +68,10 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
         "continuation_frozen": "continuation_frozen",
         "continuation_freeze_events": "continuation_freeze_events",
         "ift_linear_residual": "ift_linear_residual",
+        "normal_ift_ready": "normal_ift_ready",
+        "normal_ift_consumed": "normal_ift_consumed",
+        "normal_ift_condition_metric": "normal_ift_condition_metric",
+        "normal_ift_valid_ratio": "normal_ift_valid_ratio",
         "grad_u_norm": "grad_u_norm",
         "grad_sigma_norm": "grad_sigma_norm",
         "strict_phase_hold": "strict_phase_hold",
@@ -92,6 +96,40 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
                 stats[out_key] = float(value)
         except Exception:
             stats[out_key] = value
+    if "ft_residual_norm" not in stats and "inner_ft_norm" in stats:
+        stats["ft_residual_norm"] = stats["inner_ft_norm"]
+    trace = diagnostics.get("iteration_trace")
+    if isinstance(trace, Mapping):
+        fallback_reason = trace.get("fallback_trigger_reason")
+        if fallback_reason is not None:
+            stats["fallback_trigger_reason"] = str(fallback_reason)
+        iterations = trace.get("iterations")
+        if isinstance(iterations, Sequence) and len(iterations) > 0 and isinstance(iterations[-1], Mapping):
+            last_iter = iterations[-1]
+            trace_key_map = {
+                "tangential_step_mode": "tangential_step_mode",
+                "effective_alpha_scale": "effective_alpha_scale",
+                "tail_has_effective_step": "tail_has_effective_step",
+                "ft_residual_norm": "ft_residual_after",
+            }
+            for out_key, in_key in trace_key_map.items():
+                if in_key not in last_iter:
+                    continue
+                value = last_iter[in_key]
+                try:
+                    if isinstance(value, tf.Tensor):
+                        if value.dtype == tf.string:
+                            stats[out_key] = value.numpy().decode("utf-8")
+                        elif value.shape.rank == 0:
+                            stats[out_key] = float(tf.cast(value, tf.float32).numpy())
+                        else:
+                            stats[out_key] = value
+                    elif isinstance(value, str):
+                        stats[out_key] = value
+                    else:
+                        stats[out_key] = float(value)
+                except Exception:
+                    stats[out_key] = value
     return stats
 
 
@@ -666,6 +704,30 @@ class TrainerOptMixin:
         }
         return weights, diag
 
+    @staticmethod
+    def _is_stress_trainable_variable(var: tf.Variable) -> bool:
+        name = str(getattr(var, "name", "") or "").strip().lower()
+        return ("stress" in name) or ("sigma" in name)
+
+    def _split_gradient_norm_stats(
+        self,
+        grads: Sequence[Optional[tf.Tensor]],
+        train_vars: Sequence[tf.Variable],
+    ) -> Dict[str, tf.Tensor]:
+        u_grads: List[tf.Tensor] = []
+        sigma_grads: List[tf.Tensor] = []
+        for grad, var in zip(grads, train_vars):
+            if grad is None:
+                continue
+            if self._is_stress_trainable_variable(var):
+                sigma_grads.append(grad)
+            else:
+                u_grads.append(grad)
+        return {
+            "grad_u_norm": self._safe_global_norm(u_grads),
+            "grad_sigma_norm": self._safe_global_norm(sigma_grads),
+        }
+
     @tf.function(reduce_retracing=True)
     def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
         """Compiled forward+backward for the standard (non-incremental) path."""
@@ -702,6 +764,7 @@ class TrainerOptMixin:
             grads = opt.get_unscaled_gradients(scaled_grads)
         else:
             grads = tape.gradient(loss_total, train_vars)
+        stats.update(self._split_gradient_norm_stats(grads, train_vars))
 
         return loss_total, loss_no_reg, parts, stats, grads
 
@@ -746,6 +809,7 @@ class TrainerOptMixin:
             grads = opt.get_unscaled_gradients(scaled_grads)
         else:
             grads = tape.gradient(loss_total, train_vars)
+        stats.update(self._split_gradient_norm_stats(grads, train_vars))
 
         return loss_total, loss_no_reg, parts, stats, grads
 

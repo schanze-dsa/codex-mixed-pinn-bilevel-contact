@@ -130,6 +130,15 @@ class TrainerMonitorMixin:
             "continuation_frozen",
             "continuation_freeze_events",
             "ift_linear_residual",
+            "normal_ift_ready",
+            "normal_ift_consumed",
+            "normal_ift_condition_metric",
+            "normal_ift_valid_ratio",
+            "ft_residual_norm",
+            "tangential_step_mode",
+            "effective_alpha_scale",
+            "tail_has_effective_step",
+            "fallback_trigger_reason",
             "grad_u_norm",
             "grad_sigma_norm",
             "strict_phase_hold",
@@ -593,6 +602,13 @@ class TrainerMonitorMixin:
                 contact_backend = self._resolve_contact_backend()
             except Exception:
                 contact_backend = _get_stat_text("contact_backend")
+            normal_ift_ready = _get_stat_float("normal_ift_ready")
+            normal_ift_consumed = _get_stat_float("normal_ift_consumed")
+            ft_residual_norm = _get_stat_float("ft_residual_norm", "inner_ft_norm")
+            effective_alpha_scale = _get_stat_float("effective_alpha_scale")
+            tail_has_effective_step = _get_stat_float("tail_has_effective_step")
+            tangential_step_mode = _get_stat_text("tangential_step_mode")
+            fallback_trigger_reason = _get_stat_text("fallback_trigger_reason")
             inner_convergence_rate = _get_stat_float("inner_convergence_rate")
             inner_fallback_rate = _get_stat_float("inner_fallback_rate")
             inner_skip_rate = _get_stat_float("inner_skip_rate")
@@ -612,6 +628,23 @@ class TrainerMonitorMixin:
                 strict_terms.append(f"cfrz={int(continuation_frozen > 0.5)}")
             if continuation_freeze_events is not None:
                 strict_terms.append(f"cfrze={int(round(continuation_freeze_events))}")
+            if normal_ift_ready is not None:
+                strict_terms.append(f"normal_ift_ready={int(normal_ift_ready > 0.5)}")
+            if normal_ift_consumed is not None:
+                strict_terms.append(f"normal_ift_consumed={int(normal_ift_consumed > 0.5)}")
+            strict_terms.append(
+                f"max_tail_qn_iters={max(0, int(getattr(self.cfg, 'max_tail_qn_iters', 0) or 0))}"
+            )
+            if tangential_step_mode:
+                strict_terms.append(f"tangential_step_mode={tangential_step_mode}")
+            if effective_alpha_scale is not None:
+                strict_terms.append(f"effective_alpha_scale={effective_alpha_scale:.4e}")
+            if fallback_trigger_reason:
+                strict_terms.append(f"fallback_trigger_reason={fallback_trigger_reason}")
+            if ft_residual_norm is not None:
+                strict_terms.append(f"ft_residual_norm={ft_residual_norm:.4e}")
+            if tail_has_effective_step is not None:
+                strict_terms.append(f"tail_has_effective_step={int(tail_has_effective_step > 0.5)}")
             strict_disp = " ".join(strict_terms)
 
             # Von Mises 应力及屈服比（若提供 yield_strength）

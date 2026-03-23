@@ -1,4 +1,4 @@
-# Experimental strict mixed route for the PDF target path.
+# Short smoke config derived from strict_mixed_experimental.yaml.
 
 training_profile: strict_mixed_experimental
 
@@ -70,16 +70,16 @@ supervision:
   cv_fold_index: 0
   train_splits: [train]
   eval_splits: [val, test]
-  export_eval_reports: true
-  export_eval_plots: true
+  export_eval_reports: false
+  export_eval_plots: false
   shuffle: true
   seed: 42
 
 incremental_mode: true
-stage_inner_steps: 5
+stage_inner_steps: 1
 stage_alm_every: 1
 reset_contact_state_per_case: true
-stage_schedule_steps: [400, 400, 400]
+stage_schedule_steps: [5, 5, 5]
 
 mixed_bilevel_phase:
   phase_name: phase1
@@ -89,6 +89,7 @@ mixed_bilevel_phase:
 
 contact_backend: inner_solver
 max_tail_qn_iters: 4
+normal_ready_max_inner_iters: 16
 
 continuation_caps:
   eps_shrink: 0.7
@@ -99,10 +100,10 @@ alm_update_every: 0
 contact_pairs: []
 contact_mode: mortar
 contact_mortar_gauss: 3
-contact_mortar_max_points: 5000
+contact_mortar_max_points: 256
 contact_two_pass: false
-n_contact_points_per_pair: 2000
-tightening_n_points_each: 800
+n_contact_points_per_pair: 64
+tightening_n_points_each: 32
 
 normal_config:
   mode: alm
@@ -147,12 +148,12 @@ optimizer_config:
   type: Adam
   learning_rate: 1.0e-5
   grad_clip_norm: 1.0
-  batch_size: 32
-  epochs: 1500
-  log_every: 50
-  validation_eval_every: 100
+  batch_size: 8
+  epochs: 5
+  log_every: 1
+  validation_eval_every: 1
   lr_decay_on_plateau:
-    enabled: true
+    enabled: false
     metric: val_drrms
     warmup_steps: 800
     patience: 2
@@ -164,7 +165,7 @@ elasticity_config:
   chunk_size: 0
   use_forward_mode: true
   check_nan: false
-  n_points_per_step: 8192
+  n_points_per_step: 512
   plasticity_model: j2
   stress_loss_weight: 1.0
 
@@ -194,34 +195,34 @@ loss_config:
     focus_terms: [w_eq, w_cn, w_bc, w_ct, w_data]
 
 output_config:
-  save_path: ./results/ansys_supervised
+  save_path: ./results/ansys_supervised_smoke
   save_best_on: val_drrms
-  viz_use_last_training_case: true
-  viz_samples_after_train: 1
+  viz_use_last_training_case: false
+  viz_samples_after_train: 0
   viz_eval_scope: assembly
   viz_force_pointwise: true
-  viz_plot_stages: true
+  viz_plot_stages: false
   viz_skip_release_stage_plot: true
   viz_use_shape_function_interp: true
-  viz_smooth_vector_iters: 6
+  viz_smooth_vector_iters: 0
   viz_smooth_vector_lambda: 0.45
-  viz_smooth_scalar_iters: 1
+  viz_smooth_scalar_iters: 0
   viz_smooth_scalar_lambda: 0.6
   viz_surface_source: part_top
-  viz_refine_subdivisions: 2
+  viz_refine_subdivisions: 1
   viz_write_reference_aligned: false
-  viz_supervision_compare_enabled: true
+  viz_supervision_compare_enabled: false
   viz_supervision_compare_split: test
   viz_supervision_compare_sources: [boundary, corner, interior]
-  viz_same_pipeline_supervision_debug: true
-  viz_export_final_and_best: true
+  viz_same_pipeline_supervision_debug: false
+  viz_export_final_and_best: false
 
 two_stage_training:
-  enabled: true
+  enabled: false
   phase1:
-    max_steps: 300
+    max_steps: 5
     learning_rate: 2.0e-5
-    validation_eval_every: 50
+    validation_eval_every: 1
     save_best_on: val_drrms
     supervision_contribution_floor_ratio: 0.2
     base_weights:
@@ -233,9 +234,9 @@ two_stage_training:
       w_sigma: 0.25
       w_eq: 0.25
   phase2:
-    max_steps: 150
+    max_steps: 5
     learning_rate: 2.5e-6
-    validation_eval_every: 50
+    validation_eval_every: 1
     save_best_on: val_ratio
     supervision_contribution_floor_ratio: 0.1
     base_weights:
@@ -256,4 +257,4 @@ tightening_config:
   angle_unit: deg
   clockwise: true
 
-contact_route_update_every: 25
+contact_route_update_every: 1

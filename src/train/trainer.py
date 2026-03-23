@@ -401,6 +401,11 @@ class Trainer(
         total = TotalEnergy(self.cfg.total_cfg)
         mixed_flags = dict(getattr(self, "_mixed_phase_flags", {}) or {})
         mixed_flags["contact_backend"] = self._resolve_contact_backend()
+        mixed_flags["max_tail_qn_iters"] = max(0, int(getattr(self.cfg, "max_tail_qn_iters", 0) or 0))
+        mixed_flags["normal_ready_max_inner_iters"] = max(
+            0,
+            int(getattr(self.cfg, "normal_ready_max_inner_iters", 0) or 0),
+        )
         total.set_mixed_bilevel_flags(mixed_flags)
         total.attach(
             elasticity=self.elasticity,

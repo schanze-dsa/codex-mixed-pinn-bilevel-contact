@@ -556,6 +556,8 @@ def _prepare_config_with_autoguess(config_path=None):
         viz_samples_after_train=5,   # 随机 5 组，标题包含螺母拧紧角度
     )
     cfg.training_profile = _resolve_training_profile(cfg_yaml, config_path)
+    if "max_tail_qn_iters" in cfg_yaml:
+        cfg.max_tail_qn_iters = max(0, int(cfg_yaml["max_tail_qn_iters"]))
     scale_cfg_yaml = cfg_yaml.get("physical_scales", {}) or {}
     cfg.physical_scales = PhysicalScaleConfig(
         L_ref=float(scale_cfg_yaml.get("L_ref", cfg_yaml.get("L_ref", cfg.physical_scales.L_ref))),
