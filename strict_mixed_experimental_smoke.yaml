@@ -1,0 +1,260 @@
+# Short smoke config derived from strict_mixed_experimental.yaml.
+
+training_profile: strict_mixed_experimental
+
+inp_path: mir111.cdb
+mirror_surface_name: MIRROR UP
+
+material_properties:
+  jingmian:
+    E: 6.9e4
+    nu: 0.33
+    sigma_y_tension: 2.8e2
+    sigma_y_compression: 2.8e2
+    sigma_u_tension: 3.1e2
+  structural_steel:
+    E: 2.0e5
+    nu: 0.30
+    sigma_y_tension: 2.5e2
+    sigma_y_compression: 2.5e2
+    sigma_u_tension: 4.6e2
+    hardening_modulus: 1.0e3
+  zhijia:
+    E: 7.42e4
+    nu: 0.36
+    sigma_y_tension: 2.8e2
+    sigma_y_compression: 2.8e2
+    sigma_u_tension: 3.1e2
+
+part2mat:
+  MIRROR: jingmian
+  luomu: structural_steel
+  luomu1: structural_steel
+  luomu2: structural_steel
+  luoshuan: structural_steel
+  luoshuan1: structural_steel
+  luoshuan2: structural_steel
+  auto1: zhijia
+  __CONTACT__: jingmian
+
+nuts:
+  - name: nut
+    part: luomu
+  - name: nut1
+    part: luomu1
+  - name: nut2
+    part: luomu2
+
+preload_staging:
+  mode: force_then_lock
+  enabled: true
+  randomize_order: false
+  append_release_stage: false
+
+preload_use_stages: true
+preload_randomize_order: false
+preload_append_release_stage: false
+
+supervision:
+  enabled: true
+  case_table_path: ../ansys_cases_180_deg2to6_step0p5_pinn.csv
+  stage_dir: ../rigid_removed_csv
+  stage_count: 3
+  split_group_key: base_id
+  split_stratify_key: source
+  test_group_quotas:
+    boundary: 1
+    corner: 1
+    interior: 3
+  cv_n_folds: 5
+  cv_fold_index: 0
+  train_splits: [train]
+  eval_splits: [val, test]
+  export_eval_reports: false
+  export_eval_plots: false
+  shuffle: true
+  seed: 42
+
+incremental_mode: true
+stage_inner_steps: 1
+stage_alm_every: 1
+reset_contact_state_per_case: true
+stage_schedule_steps: [5, 5, 5]
+
+mixed_bilevel_phase:
+  phase_name: phase1
+  normal_ift_enabled: true
+  tangential_ift_enabled: false
+  detach_inner_solution: false
+
+contact_backend: inner_solver
+max_tail_qn_iters: 4
+normal_ready_max_inner_iters: 16
+
+continuation_caps:
+  eps_shrink: 0.7
+  kt_growth: 1.3
+
+alm_update_every: 0
+
+contact_pairs: []
+contact_mode: mortar
+contact_mortar_gauss: 3
+contact_mortar_max_points: 256
+contact_two_pass: false
+n_contact_points_per_pair: 64
+tightening_n_points_each: 32
+
+normal_config:
+  mode: alm
+  beta: 50.0
+  mu_n: 1.0e3
+  residual_mode: fb
+  fb_eps: 1.0e-8
+
+friction_config:
+  enabled: true
+  k_t: 100
+  mu_t: 200
+  mu_f: 0.15
+  use_smooth_friction: true
+  use_delta_st_friction: false
+
+network_config:
+  model_type: pinn
+  input_dim: 3
+  output_dim: 1
+  graph_precompute: true
+  graph_k: 8
+  graph_width: 128
+  graph_layers: 3
+  adaptive_depth_enabled: true
+  adaptive_depth_mode: hard
+  adaptive_depth_shallow_layers: 1
+  adaptive_depth_route_source: contact_residual
+  adaptive_depth_threshold: 1.0
+  adaptive_depth_temperature: 1.0
+  stress_out_dim: 6
+  use_eps_guided_stress_head: true
+  use_engineering_semantics: true
+  semantic_feat_dim: 4
+  strict_mixed_default_eps_bridge: true
+  strict_mixed_contact_pointwise_stress: true
+  output_scale: 1.0e-3
+  output_scale_trainable: false
+  layers: [64, 64, 32]
+
+optimizer_config:
+  type: Adam
+  learning_rate: 1.0e-5
+  grad_clip_norm: 1.0
+  batch_size: 8
+  epochs: 5
+  log_every: 1
+  validation_eval_every: 1
+  lr_decay_on_plateau:
+    enabled: false
+    metric: val_drrms
+    warmup_steps: 800
+    patience: 2
+    factor: 0.5
+    min_lr: 2.5e-6
+
+elasticity_config:
+  coord_scale: 1.0
+  chunk_size: 0
+  use_forward_mode: true
+  check_nan: false
+  n_points_per_step: 512
+  plasticity_model: j2
+  stress_loss_weight: 1.0
+
+loss_config:
+  mode: residual
+  base_weights:
+    w_int: 1.0
+    w_cn: 1.0
+    w_ct: 1.0
+    w_bc: 1.0
+    w_tight: 1.0
+    w_sigma: 1.0
+    w_eq: 1.0
+    w_reg: 1.0e-4
+    w_data: 1.0
+    w_smooth: 1.0e-2
+  supervision_contribution_floor_enabled: true
+  supervision_contribution_floor_ratio: 1.0e-1
+  data_smoothing_k: 8
+  adaptive:
+    enabled: true
+    update_every: 50
+    ema_decay: 0.99
+    temperature: 1.0
+    min_weight: 1.0e-6
+    max_weight: 10.0
+    focus_terms: [w_eq, w_cn, w_bc, w_ct, w_data]
+
+output_config:
+  save_path: ./results/ansys_supervised_smoke
+  save_best_on: val_drrms
+  viz_use_last_training_case: false
+  viz_samples_after_train: 0
+  viz_eval_scope: assembly
+  viz_force_pointwise: true
+  viz_plot_stages: false
+  viz_skip_release_stage_plot: true
+  viz_use_shape_function_interp: true
+  viz_smooth_vector_iters: 0
+  viz_smooth_vector_lambda: 0.45
+  viz_smooth_scalar_iters: 0
+  viz_smooth_scalar_lambda: 0.6
+  viz_surface_source: part_top
+  viz_refine_subdivisions: 1
+  viz_write_reference_aligned: false
+  viz_supervision_compare_enabled: false
+  viz_supervision_compare_split: test
+  viz_supervision_compare_sources: [boundary, corner, interior]
+  viz_same_pipeline_supervision_debug: false
+  viz_export_final_and_best: false
+
+two_stage_training:
+  enabled: false
+  phase1:
+    max_steps: 5
+    learning_rate: 2.0e-5
+    validation_eval_every: 1
+    save_best_on: val_drrms
+    supervision_contribution_floor_ratio: 0.2
+    base_weights:
+      w_int: 0.25
+      w_cn: 0.25
+      w_ct: 0.25
+      w_bc: 0.25
+      w_tight: 0.25
+      w_sigma: 0.25
+      w_eq: 0.25
+  phase2:
+    max_steps: 5
+    learning_rate: 2.5e-6
+    validation_eval_every: 1
+    save_best_on: val_ratio
+    supervision_contribution_floor_ratio: 0.1
+    base_weights:
+      w_int: 0.5
+      w_cn: 0.5
+      w_ct: 0.5
+      w_bc: 0.5
+      w_tight: 0.5
+      w_sigma: 0.5
+      w_eq: 0.5
+
+mixed_precision: null
+tighten_angle_min: 2.0
+tighten_angle_max: 6.0
+
+tightening_config:
+  alpha: 1.0e3
+  angle_unit: deg
+  clockwise: true
+
+contact_route_update_every: 1

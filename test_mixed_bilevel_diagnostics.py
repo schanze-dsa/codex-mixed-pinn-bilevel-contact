@@ -32,6 +32,13 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
             "ift_linear_residual": 3.3,
             "grad_u_norm": 4.4,
             "grad_sigma_norm": 5.5,
+            "strict_phase_hold": 1.0,
+            "strict_continuation_backoff": 1.0,
+            "continuation_backoff_applied": 1.0,
+            "strict_force_detach": 1.0,
+            "strict_traction_scale": 0.25,
+            "phase_hold_reason": "fallback,penetration",
+            "inner_solver_not_stable_count": 3.0,
         }
 
         inject_bilevel_diagnostics(stats, diagnostics)
@@ -48,6 +55,13 @@ class MixedBilevelDiagnosticsTests(unittest.TestCase):
         self.assertEqual(picked["ift_linear_residual"], 3.3)
         self.assertEqual(picked["grad_u_norm"], 4.4)
         self.assertEqual(picked["grad_sigma_norm"], 5.5)
+        self.assertEqual(picked["strict_phase_hold"], 1.0)
+        self.assertEqual(picked["strict_continuation_backoff"], 1.0)
+        self.assertEqual(picked["continuation_backoff_applied"], 1.0)
+        self.assertEqual(picked["strict_force_detach"], 1.0)
+        self.assertEqual(picked["strict_traction_scale"], 0.25)
+        self.assertEqual(picked["phase_hold_reason"], "fallback,penetration")
+        self.assertEqual(picked["inner_solver_not_stable_count"], 3.0)
 
     def test_monitor_reports_aggregate_strict_bilevel_rates(self):
         picked = TrainerMonitorMixin.extract_bilevel_diagnostics(

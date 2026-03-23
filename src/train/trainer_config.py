@@ -129,6 +129,8 @@ class TrainerConfig:
     training_profile: str = "locked"
     mixed_bilevel_phase: MixedBilevelPhaseConfig = field(default_factory=MixedBilevelPhaseConfig)
     contact_backend: str = "auto"
+    max_tail_qn_iters: int = 0
+    normal_ready_max_inner_iters: int = 0
     continuation_eps_shrink_cap: float = 0.7
     continuation_kt_growth_cap: float = 1.3
 

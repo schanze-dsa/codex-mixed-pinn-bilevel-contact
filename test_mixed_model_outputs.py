@@ -391,6 +391,109 @@ class MixedModelOutputsTests(unittest.TestCase):
             "contact-surface semantics should change the pointwise stress output",
         )
 
+    def test_strict_mixed_contact_surface_defaults_to_pointwise_eps_bridge(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=False,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+                strict_mixed_default_eps_bridge=True,
+                strict_mixed_contact_pointwise_stress=True,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        params = self._contact_surface_params(
+            P_hat=tf.zeros((1, 3), dtype=tf.float32),
+            normals=tf.tile(tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32), [4, 1]),
+            t1=tf.tile(tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32), [4, 1]),
+            t2=tf.tile(tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32), [4, 1]),
+        )
+        model.field.set_node_semantic_features(tf.zeros((4, 8), dtype=tf.float32))
+
+        captured_eps = []
+        original_predict = model.field.predict_stress_from_features
+
+        def _capture_eps(stress_feat, eps_bridge=None):
+            captured_eps.append(None if eps_bridge is None else tuple(eps_bridge.shape.as_list()))
+            return original_predict(stress_feat, eps_bridge=eps_bridge)
+
+        with patch.object(
+            model.field.graph_layers[0],
+            "call",
+            side_effect=RuntimeError("graph path should stay bypassed on strict-mixed contact stress"),
+        ):
+            with patch.object(model.field, "predict_stress_from_features", side_effect=_capture_eps):
+                u, sigma = model.us_fn(X, params)
+
+        self.assertEqual(tuple(u.shape), (4, 3))
+        self.assertEqual(tuple(sigma.shape), (4, 6))
+        self.assertEqual(len(captured_eps), 1)
+        self.assertIsNotNone(captured_eps[0])
+        self.assertEqual(captured_eps[0][-1], 6)
+
+    def test_contact_surface_frame_respects_disabled_strict_mixed_defaults(self):
+        cfg = ModelConfig(
+            encoder=EncoderConfig(out_dim=8),
+            field=FieldConfig(
+                cond_dim=8,
+                use_graph=True,
+                graph_layers=1,
+                graph_width=16,
+                graph_k=2,
+                stress_out_dim=6,
+                stress_branch_early_split=True,
+                use_eps_guided_stress_head=False,
+                use_engineering_semantics=True,
+                semantic_feat_dim=8,
+                strict_mixed_default_eps_bridge=False,
+                strict_mixed_contact_pointwise_stress=False,
+            ),
+        )
+        model = create_displacement_model(cfg)
+        X = tf.constant(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=tf.float32,
+        )
+        params = self._contact_surface_params(
+            P_hat=tf.zeros((1, 3), dtype=tf.float32),
+            normals=tf.tile(tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32), [4, 1]),
+            t1=tf.tile(tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32), [4, 1]),
+            t2=tf.tile(tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32), [4, 1]),
+        )
+        model.field.set_node_semantic_features(tf.zeros((4, 8), dtype=tf.float32))
+
+        with patch.object(
+            model.field.mlp_layers[0],
+            "call",
+            side_effect=RuntimeError("pointwise route should stay disabled when strict defaults are off"),
+        ):
+            u, sigma = model.us_fn(X, params)
+
+        self.assertEqual(tuple(u.shape), (4, 3))
+        self.assertEqual(tuple(sigma.shape), (4, 6))
+
     def test_strict_mixed_contact_route_passes_contact_surface_frame_to_pointwise_stress(self):
         cfg = ModelConfig(
             encoder=EncoderConfig(out_dim=8),

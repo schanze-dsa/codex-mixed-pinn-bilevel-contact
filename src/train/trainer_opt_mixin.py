@@ -10,6 +10,7 @@ import numpy as np
 import tensorflow as tf
 
 from model.loss_energy import TotalEnergy
+from physics.contact.strict_mixed_policy import resolve_strict_mixed_runtime_policy
 from train.loss_weights import combine_loss, update_loss_weights
 
 
@@ -67,8 +68,19 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
         "continuation_frozen": "continuation_frozen",
         "continuation_freeze_events": "continuation_freeze_events",
         "ift_linear_residual": "ift_linear_residual",
+        "normal_ift_ready": "normal_ift_ready",
+        "normal_ift_consumed": "normal_ift_consumed",
+        "normal_ift_condition_metric": "normal_ift_condition_metric",
+        "normal_ift_valid_ratio": "normal_ift_valid_ratio",
         "grad_u_norm": "grad_u_norm",
         "grad_sigma_norm": "grad_sigma_norm",
+        "strict_phase_hold": "strict_phase_hold",
+        "strict_continuation_backoff": "strict_continuation_backoff",
+        "continuation_backoff_applied": "continuation_backoff_applied",
+        "strict_force_detach": "strict_force_detach",
+        "strict_traction_scale": "strict_traction_scale",
+        "phase_hold_reason": "phase_hold_reason",
+        "inner_solver_not_stable_count": "inner_solver_not_stable_count",
     }
     for out_key, in_key in key_map.items():
         if in_key not in diagnostics:
@@ -84,16 +96,51 @@ def inject_bilevel_diagnostics(stats: Dict[str, Any], diagnostics: Mapping[str, 
                 stats[out_key] = float(value)
         except Exception:
             stats[out_key] = value
+    if "ft_residual_norm" not in stats and "inner_ft_norm" in stats:
+        stats["ft_residual_norm"] = stats["inner_ft_norm"]
+    trace = diagnostics.get("iteration_trace")
+    if isinstance(trace, Mapping):
+        fallback_reason = trace.get("fallback_trigger_reason")
+        if fallback_reason is not None:
+            stats["fallback_trigger_reason"] = str(fallback_reason)
+        iterations = trace.get("iterations")
+        if isinstance(iterations, Sequence) and len(iterations) > 0 and isinstance(iterations[-1], Mapping):
+            last_iter = iterations[-1]
+            trace_key_map = {
+                "tangential_step_mode": "tangential_step_mode",
+                "effective_alpha_scale": "effective_alpha_scale",
+                "tail_has_effective_step": "tail_has_effective_step",
+                "ft_residual_norm": "ft_residual_after",
+            }
+            for out_key, in_key in trace_key_map.items():
+                if in_key not in last_iter:
+                    continue
+                value = last_iter[in_key]
+                try:
+                    if isinstance(value, tf.Tensor):
+                        if value.dtype == tf.string:
+                            stats[out_key] = value.numpy().decode("utf-8")
+                        elif value.shape.rank == 0:
+                            stats[out_key] = float(tf.cast(value, tf.float32).numpy())
+                        else:
+                            stats[out_key] = value
+                    elif isinstance(value, str):
+                        stats[out_key] = value
+                    else:
+                        stats[out_key] = float(value)
+                except Exception:
+                    stats[out_key] = value
     return stats
 
 
 class TrainerOptMixin:
     _STRICT_MIXED_ALLOWED_KEYS = frozenset(
         {
-            "E_cn",
-            "E_ct",
-            "E_eq",
-            "E_bc",
+            "R_const",
+            "R_eq",
+            "R_u",
+            "R_t",
+            "R_tr",
             "E_tight",
             "E_data",
             "E_smooth",
@@ -104,7 +151,11 @@ class TrainerOptMixin:
     _STRICT_MIXED_DISABLED_KEYS = frozenset(
         {
             "E_int",
+            "E_cn",
+            "E_ct",
             "E_sigma",
+            "E_eq",
+            "E_bc",
             "E_bi",
             "E_ed",
             "path_penalty_total",
@@ -218,9 +269,11 @@ class TrainerOptMixin:
         if route_mode == "legacy":
             Pi, parts, stats = total.energy(self.model.u_fn, params=params, tape=tape, stress_fn=stress_fn)
         else:
-            if not hasattr(total, "strict_mixed_objective"):
-                raise RuntimeError("TotalEnergy.strict_mixed_objective() is required for strict mixed bilevel mode.")
-            Pi, parts, stats = total.strict_mixed_objective(
+            if not hasattr(total, "assemble_strict_mixed_outer_loss"):
+                raise RuntimeError(
+                    "TotalEnergy.assemble_strict_mixed_outer_loss() is required for strict mixed bilevel mode."
+                )
+            Pi, parts, stats = total.assemble_strict_mixed_outer_loss(
                 self.model.u_fn,
                 params=params,
                 tape=tape,
@@ -249,6 +302,11 @@ class TrainerOptMixin:
             out["strict_route_mode"] = route_mode
             out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
             out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
+            out["continuation_backoff_applied"] = 0.0
+            out["phase_hold_reason"] = ""
+            out["inner_solver_not_stable_count"] = float(
+                int(getattr(self, "_inner_solver_not_stable_count", 0) or 0)
+            )
             return out
 
         counters = getattr(self, "_strict_bilevel_stats", None)
@@ -275,12 +333,36 @@ class TrainerOptMixin:
         counters["skipped"] = int(counters.get("skipped", 0)) + int(skipped)
         total_count = max(1, int(counters["total"]))
 
-        if skipped or fallback or (not converged):
-            self._strict_bilevel_freeze_requested = True
+        policy = resolve_strict_mixed_runtime_policy(out, route_mode=route_mode)
+        if (not converged) and (not policy.phase_hold):
+            policy = resolve_strict_mixed_runtime_policy(
+                {
+                    **out,
+                    "skip_batch": 1.0 if skipped else out.get("skip_batch", 0.0),
+                    "fallback_used": 1.0 if fallback else out.get("fallback_used", 0.0),
+                    "inner_skip_batch": 1.0 if skipped else out.get("inner_skip_batch", 0.0),
+                    "inner_fallback_used": 1.0 if fallback else out.get("inner_fallback_used", 0.0),
+                    "not_converged": 1.0,
+                },
+                route_mode=route_mode,
+            )
+
+        self._strict_bilevel_freeze_requested = bool(policy.phase_hold)
+        self._strict_bilevel_backoff_requested = bool(policy.continuation_backoff)
+        self._strict_bilevel_force_detach = bool(policy.force_detach)
+        self._strict_bilevel_traction_scale = float(policy.traction_scale)
+        if policy.phase_hold:
+            self._inner_solver_not_stable_count = int(
+                getattr(self, "_inner_solver_not_stable_count", 0) or 0
+            ) + 1
 
         out["inner_convergence_rate"] = float(counters["converged"]) / float(total_count)
         out["inner_fallback_rate"] = float(counters["fallback"]) / float(total_count)
         out["inner_skip_rate"] = float(counters["skipped"]) / float(total_count)
+        out.update(policy.as_stats())
+        out["inner_solver_not_stable_count"] = float(
+            int(getattr(self, "_inner_solver_not_stable_count", 0) or 0)
+        )
         out["strict_route_mode"] = route_mode
         out["continuation_frozen"] = float(bool(getattr(self, "_contact_hardening_frozen", False)))
         out["continuation_freeze_events"] = float(int(getattr(self, "_continuation_freeze_events", 0) or 0))
@@ -584,7 +666,11 @@ class TrainerOptMixin:
             return weights, diag
 
         phys_contrib = zero
-        for key in ("E_sigma", "E_ct"):
+        if any(key in parts for key in ("R_const", "R_t", "R_tr")):
+            phys_keys = ("R_const", "R_t", "R_tr")
+        else:
+            phys_keys = ("E_sigma", "E_ct")
+        for key in phys_keys:
             idx = self._loss_key_index(key)
             if idx is None:
                 continue
@@ -617,6 +703,30 @@ class TrainerOptMixin:
             "data_eff_contrib": eff_weight * data_loss,
         }
         return weights, diag
+
+    @staticmethod
+    def _is_stress_trainable_variable(var: tf.Variable) -> bool:
+        name = str(getattr(var, "name", "") or "").strip().lower()
+        return ("stress" in name) or ("sigma" in name)
+
+    def _split_gradient_norm_stats(
+        self,
+        grads: Sequence[Optional[tf.Tensor]],
+        train_vars: Sequence[tf.Variable],
+    ) -> Dict[str, tf.Tensor]:
+        u_grads: List[tf.Tensor] = []
+        sigma_grads: List[tf.Tensor] = []
+        for grad, var in zip(grads, train_vars):
+            if grad is None:
+                continue
+            if self._is_stress_trainable_variable(var):
+                sigma_grads.append(grad)
+            else:
+                u_grads.append(grad)
+        return {
+            "grad_u_norm": self._safe_global_norm(u_grads),
+            "grad_sigma_norm": self._safe_global_norm(sigma_grads),
+        }
 
     @tf.function(reduce_retracing=True)
     def _compiled_step(self, params: Dict[str, Any], weights: tf.Tensor):
@@ -654,6 +764,7 @@ class TrainerOptMixin:
             grads = opt.get_unscaled_gradients(scaled_grads)
         else:
             grads = tape.gradient(loss_total, train_vars)
+        stats.update(self._split_gradient_norm_stats(grads, train_vars))
 
         return loss_total, loss_no_reg, parts, stats, grads
 
@@ -698,6 +809,7 @@ class TrainerOptMixin:
             grads = opt.get_unscaled_gradients(scaled_grads)
         else:
             grads = tape.gradient(loss_total, train_vars)
+        stats.update(self._split_gradient_norm_stats(grads, train_vars))
 
         return loss_total, loss_no_reg, parts, stats, grads
 

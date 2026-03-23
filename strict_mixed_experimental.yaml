@@ -85,9 +85,10 @@ mixed_bilevel_phase:
   phase_name: phase1
   normal_ift_enabled: true
   tangential_ift_enabled: false
-  detach_inner_solution: true
+  detach_inner_solution: false
 
 contact_backend: inner_solver
+max_tail_qn_iters: 4
 
 continuation_caps:
   eps_shrink: 0.7
@@ -133,6 +134,11 @@ network_config:
   adaptive_depth_threshold: 1.0
   adaptive_depth_temperature: 1.0
   stress_out_dim: 6
+  use_eps_guided_stress_head: true
+  use_engineering_semantics: true
+  semantic_feat_dim: 4
+  strict_mixed_default_eps_bridge: true
+  strict_mixed_contact_pointwise_stress: true
   output_scale: 1.0e-3
   output_scale_trainable: false
   layers: [64, 64, 32]

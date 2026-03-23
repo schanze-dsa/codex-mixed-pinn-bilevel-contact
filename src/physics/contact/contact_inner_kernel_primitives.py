@@ -34,6 +34,30 @@ def fb_normal_jacobian(g_n: tf.Tensor, lambda_n: tf.Tensor, eps_n) -> tf.Tensor:
     return lambda_n / (denom + 1.0e-12) - 1.0
 
 
+def smooth_penetration_target(g_n: tf.Tensor, eps_n) -> tf.Tensor:
+    """Smooth nonnegative penetration target derived from the FB kernel at ``lambda_n=0``."""
+
+    g_n = _to_float_tensor(g_n)
+    eps_n = _to_float_tensor(eps_n)
+    return 0.5 * (tf.sqrt(g_n * g_n + eps_n * eps_n) - g_n)
+
+
+def inner_normal_residual(g_n: tf.Tensor, lambda_n: tf.Tensor, eps_n) -> tf.Tensor:
+    """Residual used by the frozen-geometry inner normal solve."""
+
+    g_n = _to_float_tensor(g_n)
+    lambda_n = _to_float_tensor(lambda_n)
+    return lambda_n - smooth_penetration_target(g_n, eps_n)
+
+
+def inner_normal_jacobian(g_n: tf.Tensor, lambda_n: tf.Tensor, eps_n) -> tf.Tensor:
+    """Derivative of :func:`inner_normal_residual` with respect to ``lambda_n``."""
+
+    del g_n, eps_n
+    lambda_n = _to_float_tensor(lambda_n)
+    return tf.ones_like(lambda_n)
+
+
 def project_to_coulomb_disk(tau_trial: tf.Tensor, radius: tf.Tensor, eps=1.0e-6) -> tf.Tensor:
     """Project tangential traction onto the Coulomb disk ||tau|| <= radius."""
 
@@ -45,6 +69,40 @@ def project_to_coulomb_disk(tau_trial: tf.Tensor, radius: tf.Tensor, eps=1.0e-6)
     return tau_trial * scale[:, None]
 
 
+def tangential_update_map(
+    lambda_t: tf.Tensor,
+    ds_t: tf.Tensor,
+    lambda_n: tf.Tensor,
+    mu,
+    k_t,
+    eps=1.0e-6,
+) -> tf.Tensor:
+    """Tangential projection update map used by the current inner solver."""
+
+    lambda_t = _to_float_tensor(lambda_t)
+    ds_t = _to_float_tensor(ds_t)
+    lambda_n = _to_float_tensor(lambda_n)
+    mu = _to_float_tensor(mu)
+    k_t = _to_float_tensor(k_t)
+    tau_trial = lambda_t + k_t * ds_t
+    return project_to_coulomb_disk(tau_trial, mu * tf.maximum(lambda_n, 0.0), eps=eps)
+
+
+def tangential_fixed_point_gap(
+    lambda_t: tf.Tensor,
+    ds_t: tf.Tensor,
+    lambda_n: tf.Tensor,
+    mu,
+    k_t,
+    eps=1.0e-6,
+) -> tf.Tensor:
+    """Fixed-point gap for the current tangential update map."""
+
+    lambda_t = _to_float_tensor(lambda_t)
+    target = tangential_update_map(lambda_t, ds_t, lambda_n, mu, k_t, eps=eps)
+    return lambda_t - target
+
+
 def friction_fixed_point_residual(
     lambda_t: tf.Tensor,
     ds_t: tf.Tensor,
@@ -53,16 +111,9 @@ def friction_fixed_point_residual(
     k_t,
     eps=1.0e-6,
 ) -> tf.Tensor:
-    """Residual for the projection-based tangential fixed-point update."""
+    """Production tangential residual aligned with the current fixed-point map."""
 
-    lambda_t = _to_float_tensor(lambda_t)
-    ds_t = _to_float_tensor(ds_t)
-    lambda_n = _to_float_tensor(lambda_n)
-    mu = _to_float_tensor(mu)
-    k_t = _to_float_tensor(k_t)
-    tau_trial = lambda_t + k_t * ds_t
-    tau_proj = project_to_coulomb_disk(tau_trial, mu * tf.maximum(lambda_n, 0.0), eps=eps)
-    return tau_trial - tau_proj
+    return tangential_fixed_point_gap(lambda_t, ds_t, lambda_n, mu, k_t, eps=eps)
 
 
 def compose_contact_traction(

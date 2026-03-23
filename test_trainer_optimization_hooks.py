@@ -19,6 +19,7 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from train.trainer import Trainer, TrainerConfig, _SavedModelModule
+from train.trainer_opt_mixin import inject_bilevel_diagnostics
 from model.pinn_model import ModelConfig, FieldConfig, EncoderConfig, create_displacement_model
 from model.loss_energy import TotalEnergy
 from physics.contact.contact_normal_alm import NormalContactALM
@@ -340,6 +341,90 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertGreater(float(parts1["E_data"].numpy()), 0.0)
         self.assertGreater(float(Pi1.numpy()), 0.0)
 
+    def test_strict_bilevel_stats_request_phase_hold_backoff_and_downweight(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = TrainerConfig(training_profile="strict_mixed_experimental")
+        trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+        trainer._contact_hardening_frozen = False
+        trainer._continuation_freeze_events = 0
+        trainer._strict_bilevel_freeze_requested = False
+        trainer._strict_bilevel_backoff_requested = False
+
+        out = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 0.0,
+                "inner_fallback_used": 1.0,
+                "inner_skip_batch": 0.0,
+                "inner_fb_residual_norm": 2.0,
+                "inner_max_penetration": 1.5,
+                "inner_cone_violation": 0.25,
+                "inner_normal_step_norm": 0.4,
+                "inner_tangential_step_norm": 0.3,
+            },
+            route_mode="normal_ready",
+        )
+
+        self.assertEqual(out["strict_phase_hold"], 1.0)
+        self.assertEqual(out["strict_continuation_backoff"], 1.0)
+        self.assertEqual(out["strict_force_detach"], 1.0)
+        self.assertAlmostEqual(out["strict_traction_scale"], 0.25)
+        self.assertTrue(trainer._strict_bilevel_freeze_requested)
+        self.assertTrue(trainer._strict_bilevel_backoff_requested)
+
+    def test_strict_bilevel_stats_record_reason_and_instability_count(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = TrainerConfig(training_profile="strict_mixed_experimental")
+        trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+        trainer._contact_hardening_frozen = False
+        trainer._continuation_freeze_events = 0
+        trainer._strict_bilevel_freeze_requested = False
+        trainer._strict_bilevel_backoff_requested = False
+        trainer._inner_solver_not_stable_count = 0
+
+        out = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 0.0,
+                "inner_fallback_used": 1.0,
+                "inner_fb_residual_norm": 0.2,
+                "inner_max_penetration": 0.01,
+            },
+            route_mode="normal_ready",
+        )
+
+        self.assertEqual(out["continuation_backoff_applied"], 1.0)
+        self.assertIn("fallback", out["phase_hold_reason"])
+        self.assertEqual(out["inner_solver_not_stable_count"], 1.0)
+
+    def test_strict_bilevel_stats_leave_stable_batches_unmodified(self):
+        trainer = object.__new__(Trainer)
+        trainer.cfg = TrainerConfig(training_profile="strict_mixed_experimental")
+        trainer._strict_bilevel_stats = {"total": 0, "converged": 0, "fallback": 0, "skipped": 0}
+        trainer._contact_hardening_frozen = False
+        trainer._continuation_freeze_events = 0
+        trainer._strict_bilevel_freeze_requested = False
+        trainer._strict_bilevel_backoff_requested = False
+
+        out = trainer._accumulate_strict_bilevel_stats(
+            {
+                "inner_converged": 1.0,
+                "inner_fallback_used": 0.0,
+                "inner_skip_batch": 0.0,
+                "inner_fb_residual_norm": 1.0e-6,
+                "inner_max_penetration": 1.0e-6,
+                "inner_cone_violation": 1.0e-6,
+                "inner_normal_step_norm": 1.0e-6,
+                "inner_tangential_step_norm": 1.0e-6,
+            },
+            route_mode="forward_only",
+        )
+
+        self.assertEqual(out["strict_phase_hold"], 0.0)
+        self.assertEqual(out["strict_continuation_backoff"], 0.0)
+        self.assertEqual(out["strict_force_detach"], 0.0)
+        self.assertAlmostEqual(out["strict_traction_scale"], 1.0)
+        self.assertFalse(trainer._strict_bilevel_freeze_requested)
+        self.assertFalse(trainer._strict_bilevel_backoff_requested)
+
     def test_total_energy_data_loss_is_relative_to_observation_scale(self):
         cfg = SimpleNamespace(
             w_int=0.0,
@@ -589,7 +674,21 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         trainer = object.__new__(Trainer)
         trainer.loss_state = None
         trainer.cfg = SimpleNamespace(training_profile="strict_mixed_experimental")
-        trainer._loss_keys = ["E_int", "E_cn", "E_ct", "E_sigma", "E_eq", "E_bi", "E_data", "E_ed"]
+        trainer._loss_keys = [
+            "E_int",
+            "E_cn",
+            "E_ct",
+            "E_sigma",
+            "E_eq",
+            "E_bi",
+            "R_const",
+            "R_eq",
+            "R_u",
+            "R_t",
+            "R_tr",
+            "E_data",
+            "E_ed",
+        ]
         trainer._base_weights = {
             "E_int": 2.0,
             "E_cn": 3.0,
@@ -597,6 +696,11 @@ class TrainerOptimizationHookTests(unittest.TestCase):
             "E_sigma": 5.0,
             "E_eq": 6.0,
             "E_bi": 7.0,
+            "R_const": 5.0,
+            "R_eq": 6.0,
+            "R_u": 1.5,
+            "R_t": 3.0,
+            "R_tr": 4.0,
             "E_data": 8.0,
             "E_ed": 9.0,
         }
@@ -615,7 +719,10 @@ class TrainerOptimizationHookTests(unittest.TestCase):
 
         np.testing.assert_allclose(
             weights,
-            np.asarray([0.0, 3.0, 4.0, 0.0, 6.0, 0.0, 8.0, 0.0], dtype=np.float32),
+            np.asarray(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 6.0, 1.5, 3.0, 4.0, 8.0, 0.0],
+                dtype=np.float32,
+            ),
             rtol=0.0,
             atol=0.0,
         )
@@ -657,7 +764,7 @@ class TrainerOptimizationHookTests(unittest.TestCase):
                 calls["energy"] += 1
                 raise AssertionError("legacy total.energy() should not be used in strict mixed route")
 
-            def strict_mixed_objective(self, *args, **kwargs):
+            def assemble_strict_mixed_outer_loss(self, *args, **kwargs):
                 del args, kwargs
                 calls["strict"] += 1
                 return (
@@ -665,6 +772,10 @@ class TrainerOptimizationHookTests(unittest.TestCase):
                     {"E_cn": tf.constant(1.0, dtype=tf.float32)},
                     {},
                 )
+
+            def strict_mixed_objective(self, *args, **kwargs):
+                del args, kwargs
+                raise AssertionError("trainer should use assemble_strict_mixed_outer_loss()")
 
         _, parts, stats = trainer._evaluate_total_objective(_FakeTotal(), params={}, stress_fn=None, tape=None)
 
@@ -787,8 +898,10 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         Pi, parts, _ = total.strict_mixed_objective(zero_u, params={}, stress_fn=zero_us)
 
         self.assertEqual(calls["mixed"], 1)
-        self.assertIn("E_eq", parts)
-        self.assertAlmostEqual(float(parts["E_eq"].numpy()), 3.0, places=6)
+        self.assertIn("R_eq", parts)
+        self.assertIn("R_const", parts)
+        self.assertAlmostEqual(float(parts["R_eq"].numpy()), 3.0, places=6)
+        self.assertAlmostEqual(float(parts["R_const"].numpy()), 0.0, places=6)
         self.assertAlmostEqual(float(Pi.numpy()), 3.0, places=6)
 
     def test_total_energy_strict_mixed_mode_surfaces_inner_step_diagnostics(self):
@@ -1202,6 +1315,97 @@ class TrainerOptimizationHookTests(unittest.TestCase):
         self.assertIn("cback=inner_solver", postfix)
         self.assertIn("cfrz=1", postfix)
         self.assertIn("cfrze=2", postfix)
+
+    def test_inject_bilevel_diagnostics_lifts_inner_trace_fields(self):
+        stats = inject_bilevel_diagnostics(
+            {},
+            {
+                "normal_ift_ready": tf.constant(1.0, dtype=tf.float32),
+                "normal_ift_consumed": tf.constant(1.0, dtype=tf.float32),
+                "ft_norm": tf.constant(2.5e-3, dtype=tf.float32),
+                "iteration_trace": {
+                    "fallback_trigger_reason": "iteration_budget_exhausted",
+                    "iterations": [
+                        {
+                            "tangential_step_mode": "residual_driven_tail_qn",
+                            "effective_alpha_scale": 0.25,
+                            "tail_has_effective_step": True,
+                        }
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(stats["normal_ift_ready"], 1.0)
+        self.assertEqual(stats["normal_ift_consumed"], 1.0)
+        self.assertAlmostEqual(stats["ft_residual_norm"], 2.5e-3, places=7)
+        self.assertEqual(stats["fallback_trigger_reason"], "iteration_budget_exhausted")
+        self.assertEqual(stats["tangential_step_mode"], "residual_driven_tail_qn")
+        self.assertEqual(stats["effective_alpha_scale"], 0.25)
+        self.assertEqual(stats["tail_has_effective_step"], 1.0)
+
+    def test_format_train_log_postfix_includes_formal_route_debug_fields(self):
+        trainer = object.__new__(Trainer)
+        trainer.loss_state = None
+        trainer.contact = None
+        trainer._mixed_phase_flags = {
+            "phase_name": "phase1",
+            "normal_ift_enabled": True,
+            "tangential_ift_enabled": False,
+            "detach_inner_solution": False,
+        }
+        trainer.cfg = SimpleNamespace(
+            training_profile="strict_mixed_experimental",
+            contact_backend="inner_solver",
+            max_tail_qn_iters=4,
+            total_cfg=SimpleNamespace(
+                w_int=0.0,
+                w_cn=0.0,
+                w_ct=0.0,
+                w_bc=0.0,
+                w_tight=0.0,
+                w_sigma=0.0,
+                w_eq=0.0,
+                w_reg=0.0,
+                w_bi=0.0,
+                w_ed=0.0,
+                w_data=1.0,
+                w_smooth=0.0,
+            ),
+            uncertainty_loss_weight=0.0,
+            tightening_cfg=SimpleNamespace(angle_unit="deg"),
+            yield_strength=None,
+        )
+
+        postfix, _ = trainer._format_train_log_postfix(
+            P_np=np.asarray([2.0, 4.0, 6.0], dtype=np.float32),
+            Pi=tf.constant(1.0, dtype=tf.float32),
+            parts={"E_data": tf.constant(0.5, dtype=tf.float32)},
+            stats={
+                "strict_route_mode": "normal_ready",
+                "normal_ift_ready": 1.0,
+                "normal_ift_consumed": 1.0,
+                "ft_residual_norm": 2.5e-3,
+                "tangential_step_mode": "residual_driven_tail_qn",
+                "effective_alpha_scale": 0.25,
+                "tail_has_effective_step": 1.0,
+                "fallback_trigger_reason": "iteration_budget_exhausted",
+            },
+            grad_val=0.75,
+            rel_pi=0.1,
+            rel_delta=None,
+            order=np.asarray([0, 1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNotNone(postfix)
+        self.assertIn("normal_ift_ready=1", postfix)
+        self.assertIn("normal_ift_consumed=1", postfix)
+        self.assertIn("max_tail_qn_iters=4", postfix)
+        self.assertIn("tangential_step_mode=residual_driven_tail_qn", postfix)
+        self.assertIn("effective_alpha_scale=2.5000e-01", postfix)
+        self.assertIn("fallback_trigger_reason=iteration_budget_exhausted", postfix)
+        self.assertIn("ft_residual_norm=2.5000e-03", postfix)
+        self.assertIn("tail_has_effective_step=1", postfix)
 
     def test_format_train_log_postfix_includes_legacy_contact_backend_token(self):
         trainer = object.__new__(Trainer)

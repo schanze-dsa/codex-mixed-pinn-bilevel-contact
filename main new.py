@@ -556,6 +556,8 @@ def _prepare_config_with_autoguess(config_path=None):
         viz_samples_after_train=5,   # 随机 5 组，标题包含螺母拧紧角度
     )
     cfg.training_profile = _resolve_training_profile(cfg_yaml, config_path)
+    if "max_tail_qn_iters" in cfg_yaml:
+        cfg.max_tail_qn_iters = max(0, int(cfg_yaml["max_tail_qn_iters"]))
     scale_cfg_yaml = cfg_yaml.get("physical_scales", {}) or {}
     cfg.physical_scales = PhysicalScaleConfig(
         L_ref=float(scale_cfg_yaml.get("L_ref", cfg_yaml.get("L_ref", cfg.physical_scales.L_ref))),
@@ -932,6 +934,17 @@ def _prepare_config_with_autoguess(config_path=None):
     if "semantic_feat_dim" in net_cfg_yaml:
         cfg.model_cfg.field.semantic_feat_dim = int(net_cfg_yaml["semantic_feat_dim"])
         print(f"[main] Semantic feature dim: {cfg.model_cfg.field.semantic_feat_dim}")
+    if "strict_mixed_default_eps_bridge" in net_cfg_yaml:
+        cfg.model_cfg.field.strict_mixed_default_eps_bridge = bool(net_cfg_yaml["strict_mixed_default_eps_bridge"])
+        print(f"[main] Strict mixed default eps bridge: {cfg.model_cfg.field.strict_mixed_default_eps_bridge}")
+    if "strict_mixed_contact_pointwise_stress" in net_cfg_yaml:
+        cfg.model_cfg.field.strict_mixed_contact_pointwise_stress = bool(
+            net_cfg_yaml["strict_mixed_contact_pointwise_stress"]
+        )
+        print(
+            "[main] Strict mixed contact pointwise stress: "
+            f"{cfg.model_cfg.field.strict_mixed_contact_pointwise_stress}"
+        )
     if (
         bool(getattr(cfg.model_cfg.field, "use_engineering_semantics", False))
         and int(getattr(cfg.model_cfg.field, "semantic_feat_dim", 0) or 0) <= 0

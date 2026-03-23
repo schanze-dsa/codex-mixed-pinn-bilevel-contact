@@ -417,6 +417,7 @@ print(\"hello\")
         fake_yaml = _minimal_training_yaml(
             training_profile="strict_mixed_experimental",
             contact_backend="inner_solver",
+            max_tail_qn_iters=4,
             mixed_bilevel_phase={
                 "phase_name": "phase1",
                 "normal_ift_enabled": True,
@@ -440,6 +441,7 @@ print(\"hello\")
         self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
         self.assertFalse(cfg.mixed_bilevel_phase.tangential_ift_enabled)
         self.assertTrue(cfg.mixed_bilevel_phase.detach_inner_solution)
+        self.assertEqual(cfg.max_tail_qn_iters, 4)
         self.assertEqual(cfg.continuation_eps_shrink_cap, 0.65)
         self.assertEqual(cfg.continuation_kt_growth_cap, 1.25)
 
@@ -454,6 +456,29 @@ print(\"hello\")
         self.assertEqual(cfg.contact_backend, "inner_solver")
         self.assertEqual(cfg.mixed_bilevel_phase.phase_name, "phase1")
         self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
+        self.assertEqual(cfg.max_tail_qn_iters, 4)
+
+    def test_prepare_config_sets_v2_normal_only_ift_defaults(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertEqual(cfg.training_profile, "strict_mixed_experimental")
+        self.assertTrue(cfg.mixed_bilevel_phase.normal_ift_enabled)
+        self.assertFalse(cfg.mixed_bilevel_phase.tangential_ift_enabled)
+        self.assertFalse(cfg.mixed_bilevel_phase.detach_inner_solution)
+
+    def test_prepare_config_sets_strict_mixed_stress_defaults(self):
+        main_new = _load_main_new_module()
+        fake_asm = SimpleNamespace(surfaces={}, parts={}, nodes={1: (0.0, 0.0, 0.0)})
+
+        with patch.object(main_new, "load_cdb", return_value=fake_asm):
+            cfg, _ = main_new._prepare_config_with_autoguess(config_path="strict_mixed_experimental.yaml")
+
+        self.assertTrue(cfg.model_cfg.field.strict_mixed_default_eps_bridge)
+        self.assertTrue(cfg.model_cfg.field.strict_mixed_contact_pointwise_stress)
 
 
 if __name__ == "__main__":

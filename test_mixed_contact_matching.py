@@ -28,6 +28,11 @@ class MixedContactMatchingTests(unittest.TestCase):
         self.assertEqual(op.resolve_backend("legacy_alm"), "legacy_alm")
         self.assertFalse(op.uses_inner_solver_backend("legacy_alm"))
 
+    def test_total_energy_exposes_explicit_strict_outer_loss_assembler(self):
+        total = TotalEnergy(TotalConfig(loss_mode="residual"))
+
+        self.assertTrue(callable(total.assemble_strict_mixed_outer_loss))
+
     def test_outer_mixed_loss_consumes_inner_traction_result(self):
         sigma_s = tf.constant([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], dtype=tf.float32)
         sigma_m = tf.constant([[3.0, 2.0, 1.0, 0.0, 0.0, 0.0]], dtype=tf.float32)
@@ -156,6 +161,8 @@ class MixedContactMatchingTests(unittest.TestCase):
 
         inputs = contact.strict_mixed_inputs(u_fn, params={})
         self.assertIsInstance(inputs, StrictMixedContactInputs)
+        self.assertTrue(hasattr(inputs, "batch_meta"))
+        self.assertTrue(hasattr(inputs, "contact_ids"))
         warm_start = ContactInnerState(
             lambda_n=tf.constant([0.25], dtype=tf.float32),
             lambda_t=tf.constant([[0.05, 0.0]], dtype=tf.float32),
@@ -210,6 +217,55 @@ class MixedContactMatchingTests(unittest.TestCase):
         self.assertAlmostEqual(float(parts["E_ct"].numpy()), 0.0)
         self.assertAlmostEqual(float(stats["mixed_strict_skipped"].numpy()), 1.0)
         self.assertAlmostEqual(float(stats["inner_skip_batch"].numpy()), 1.0)
+
+    def test_strict_mixed_objective_exposes_explicit_outer_loss_terms(self):
+        cat = {
+            "xs": np.asarray([[0.05, 0.0, 0.0]], dtype=np.float32),
+            "xm": np.asarray([[0.0, 0.1, 0.0]], dtype=np.float32),
+            "n": np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32),
+            "t1": np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+            "t2": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+            "w_area": np.asarray([1.0], dtype=np.float32),
+        }
+        contact = ContactOperator()
+        contact.build_from_cat(cat, extra_weights=None, auto_orient=False)
+
+        total = TotalEnergy(
+            TotalConfig(
+                loss_mode="residual",
+                w_cn=1.0,
+                w_ct=1.0,
+                w_bc=1.0,
+                w_eq=1.0,
+                w_sigma=1.0,
+            )
+        )
+        total.attach(contact=contact)
+        total.set_mixed_bilevel_flags(
+            {
+                "phase_name": "phase2a",
+                "normal_ift_enabled": True,
+                "tangential_ift_enabled": False,
+                "detach_inner_solution": True,
+            }
+        )
+
+        def u_fn(X, params=None):
+            X = tf.convert_to_tensor(X, dtype=tf.float32)
+            return tf.zeros_like(X)
+
+        def stress_fn(X, params=None):
+            X = tf.convert_to_tensor(X, dtype=tf.float32)
+            sigma = tf.zeros((tf.shape(X)[0], 6), dtype=tf.float32)
+            return tf.zeros_like(X), sigma
+
+        _, parts, stats = total.strict_mixed_objective(u_fn, params={}, stress_fn=stress_fn)
+
+        for key in ("R_eq", "R_const", "R_u", "R_t", "R_tr"):
+            self.assertIn(key, parts)
+        self.assertEqual(float(stats["mixed_strict_active"].numpy()), 1.0)
+        self.assertGreaterEqual(float(parts["R_t"].numpy()), 0.0)
+        self.assertGreaterEqual(float(parts["R_tr"].numpy()), 0.0)
 
 
 if __name__ == "__main__":
