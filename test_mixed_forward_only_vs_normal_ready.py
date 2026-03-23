@@ -124,7 +124,8 @@ def _run_total_energy(
     normal_ift_enabled: bool,
     *,
     max_tail_qn_iters: int = 0,
-    normal_ready_max_inner_iters: int = 0,
+    max_inner_iters_signature_gate: str = "",
+    signature_gated_max_inner_iters: int = 0,
 ):
     total = TotalEnergy(TotalConfig(loss_mode="energy", w_cn=1.0, w_ct=1.0))
     contact = _RouteAwareFakeContact()
@@ -136,7 +137,8 @@ def _run_total_energy(
             "tangential_ift_enabled": False,
             "detach_inner_solution": True,
             "max_tail_qn_iters": max(0, int(max_tail_qn_iters)),
-            "normal_ready_max_inner_iters": max(0, int(normal_ready_max_inner_iters)),
+            "max_inner_iters_signature_gate": str(max_inner_iters_signature_gate or ""),
+            "signature_gated_max_inner_iters": max(0, int(signature_gated_max_inner_iters)),
         }
     )
 
@@ -174,19 +176,31 @@ class MixedForwardOnlyVsNormalReadyTests(unittest.TestCase):
 
         self.assertEqual(contact.kwargs, [{"max_tail_qn_iters": 4}])
 
-    def test_normal_ready_route_forwards_route_local_max_inner_iters_only(self):
+    def test_b_signature_gated_inner_budget_is_forwarded_only_for_normal_ready(self):
         normal_contact, _ = _run_total_energy(
             normal_ift_enabled=True,
             max_tail_qn_iters=4,
-            normal_ready_max_inner_iters=16,
+            max_inner_iters_signature_gate="b",
+            signature_gated_max_inner_iters=16,
         )
         forward_contact, _ = _run_total_energy(
             normal_ift_enabled=False,
             max_tail_qn_iters=4,
-            normal_ready_max_inner_iters=16,
+            max_inner_iters_signature_gate="b",
+            signature_gated_max_inner_iters=16,
         )
 
-        self.assertEqual(normal_contact.kwargs, [{"max_tail_qn_iters": 4, "max_inner_iters": 16}])
+        self.assertEqual(
+            normal_contact.kwargs,
+            [
+                {
+                    "max_tail_qn_iters": 4,
+                    "return_iteration_trace": True,
+                    "max_inner_iters_signature_gate": "b",
+                    "signature_gated_max_inner_iters": 16,
+                }
+            ],
+        )
         self.assertEqual(forward_contact.kwargs, [{"max_tail_qn_iters": 4}])
 
     def test_strict_mixed_route_surfaces_inner_trace_debug_fields(self):

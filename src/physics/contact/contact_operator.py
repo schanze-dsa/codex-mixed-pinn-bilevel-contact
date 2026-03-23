@@ -102,6 +102,67 @@ def _clone_inner_state(state: Optional[ContactInnerState]) -> Optional[ContactIn
     )
 
 
+def _as_python_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _iteration_acceptance_label(iteration: Dict[str, object]) -> str:
+    before = _as_python_float(iteration.get("ft_residual_before"), default=float("nan"))
+    after = _as_python_float(iteration.get("ft_residual_after"), default=float("nan"))
+    if not np.isfinite(before) or not np.isfinite(after):
+        return "unknown"
+    return "accepted" if after < (before - 1.0e-12) else "rejected"
+
+
+def _matches_inner_budget_signature(result: ContactInnerResult, gate_name: str) -> bool:
+    gate_name = str(gate_name or "").strip().lower()
+    if not gate_name:
+        return False
+    if gate_name != "b":
+        raise ValueError(f"Unsupported inner-budget signature gate '{gate_name}'.")
+
+    diagnostics = dict(getattr(result, "diagnostics", {}) or {})
+    trace = diagnostics.get("iteration_trace")
+    if not isinstance(trace, dict):
+        return False
+    if str(trace.get("fallback_trigger_reason", "") or "") != "iteration_budget_exhausted":
+        return False
+    iterations = trace.get("iterations")
+    if not isinstance(iterations, (list, tuple)) or len(iterations) == 0 or not isinstance(iterations[-1], dict):
+        return False
+
+    tail_rows = list(iterations[-3:])
+    accepted_pattern = [_iteration_acceptance_label(row) for row in tail_rows]
+    if "accepted" not in accepted_pattern:
+        return False
+    if accepted_pattern == ["rejected", "rejected", "rejected"]:
+        return False
+
+    last_iter = tail_rows[-1]
+    if _as_python_float(last_iter.get("effective_alpha_scale")) <= 1.0e-12:
+        return False
+
+    ft_after = _as_python_float(last_iter.get("ft_residual_after"), default=_as_python_float(diagnostics.get("ft_residual_norm")))
+    tol_t = _as_python_float(diagnostics.get("tol_t"), default=1.0e-5)
+    if ft_after <= tol_t:
+        return False
+
+    if not any(
+        _as_python_float(row.get("ft_residual_after")) < (_as_python_float(row.get("ft_residual_before")) - 1.0e-12)
+        for row in tail_rows
+    ):
+        return False
+
+    return True
+
+
 def traction_matching_terms(sigma_s, sigma_m, normals, t1, t2, inner_result):
     """Residual matching terms based on solved inner-contact traction."""
 
@@ -502,6 +563,8 @@ class ContactOperator:
         tol_fb: Optional[float] = None,
         max_inner_iters: int = 8,
         max_tail_qn_iters: int = 0,
+        max_inner_iters_signature_gate: str = "",
+        signature_gated_max_inner_iters: int = 0,
         damping: float = 1.0,
         normal_correction_cap_scale: float = 1.0,
     ) -> ContactInnerResult:
@@ -534,6 +597,34 @@ class ContactOperator:
             damping=damping,
             normal_correction_cap_scale=normal_correction_cap_scale,
         )
+        gate_name = str(max_inner_iters_signature_gate or "").strip().lower()
+        gate_applied = False
+        gated_inner_iters = max(0, int(signature_gated_max_inner_iters or 0))
+        if gated_inner_iters > int(max_inner_iters) and _matches_inner_budget_signature(result, gate_name):
+            result = solve_contact_inner(
+                strict_inputs.g_n,
+                strict_inputs.ds_t,
+                strict_inputs.normals,
+                strict_inputs.t1,
+                strict_inputs.t2,
+                mu=strict_inputs.mu,
+                eps_n=strict_inputs.eps_n,
+                k_t=strict_inputs.k_t,
+                init_state=init_state,
+                return_linearization=return_linearization,
+                return_iteration_trace=return_iteration_trace,
+                tol_n=tol_n,
+                tol_t=tol_t,
+                tol_fb=tol_fb,
+                max_inner_iters=gated_inner_iters,
+                max_tail_qn_iters=max_tail_qn_iters,
+                damping=damping,
+                normal_correction_cap_scale=normal_correction_cap_scale,
+            )
+            gate_applied = True
+        result.diagnostics = dict(getattr(result, "diagnostics", {}) or {})
+        result.diagnostics["signature_gate_applied"] = tf.cast(1.0 if gate_applied else 0.0, tf.float32)
+        result.diagnostics["signature_gate_name"] = gate_name if gate_applied else ""
         if tf.executing_eagerly():
             self._last_inner_state = _clone_inner_state(result.state)
         else:

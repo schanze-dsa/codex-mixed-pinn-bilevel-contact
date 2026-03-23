@@ -151,11 +151,12 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
 
         self.assertEqual(total.mixed_bilevel_flags["contact_backend"], "inner_solver")
 
-    def test_assemble_total_propagates_normal_ready_route_local_inner_budget(self):
+    def test_assemble_total_propagates_b_signature_gated_inner_budget_controls(self):
         trainer = object.__new__(Trainer)
         trainer.cfg = TrainerConfig(
             training_profile="strict_mixed_experimental",
-            normal_ready_max_inner_iters=16,
+            max_inner_iters_signature_gate="b",
+            signature_gated_max_inner_iters=16,
             mixed_bilevel_phase=MixedBilevelPhaseConfig(
                 phase_name="phase2a",
                 normal_ift_enabled=True,
@@ -171,8 +172,8 @@ class MixedTrainingPhaseControlTests(unittest.TestCase):
 
         total = trainer._assemble_total()
 
-        self.assertEqual(total.mixed_bilevel_flags["normal_ready_max_inner_iters"], 16)
-
+        self.assertEqual(total.mixed_bilevel_flags["max_inner_iters_signature_gate"], "b")
+        self.assertEqual(total.mixed_bilevel_flags["signature_gated_max_inner_iters"], 16)
 
 if __name__ == "__main__":
     unittest.main()

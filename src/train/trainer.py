@@ -402,9 +402,12 @@ class Trainer(
         mixed_flags = dict(getattr(self, "_mixed_phase_flags", {}) or {})
         mixed_flags["contact_backend"] = self._resolve_contact_backend()
         mixed_flags["max_tail_qn_iters"] = max(0, int(getattr(self.cfg, "max_tail_qn_iters", 0) or 0))
-        mixed_flags["normal_ready_max_inner_iters"] = max(
+        mixed_flags["max_inner_iters_signature_gate"] = str(
+            getattr(self.cfg, "max_inner_iters_signature_gate", "") or ""
+        ).strip()
+        mixed_flags["signature_gated_max_inner_iters"] = max(
             0,
-            int(getattr(self.cfg, "normal_ready_max_inner_iters", 0) or 0),
+            int(getattr(self.cfg, "signature_gated_max_inner_iters", 0) or 0),
         )
         total.set_mixed_bilevel_flags(mixed_flags)
         total.attach(

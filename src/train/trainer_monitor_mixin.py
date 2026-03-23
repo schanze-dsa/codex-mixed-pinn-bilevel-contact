@@ -135,6 +135,7 @@ class TrainerMonitorMixin:
             "normal_ift_condition_metric",
             "normal_ift_valid_ratio",
             "ft_residual_norm",
+            "signature_gate_applied",
             "tangential_step_mode",
             "effective_alpha_scale",
             "tail_has_effective_step",
@@ -605,6 +606,7 @@ class TrainerMonitorMixin:
             normal_ift_ready = _get_stat_float("normal_ift_ready")
             normal_ift_consumed = _get_stat_float("normal_ift_consumed")
             ft_residual_norm = _get_stat_float("ft_residual_norm", "inner_ft_norm")
+            signature_gate_applied = _get_stat_float("signature_gate_applied")
             effective_alpha_scale = _get_stat_float("effective_alpha_scale")
             tail_has_effective_step = _get_stat_float("tail_has_effective_step")
             tangential_step_mode = _get_stat_text("tangential_step_mode")
@@ -635,6 +637,8 @@ class TrainerMonitorMixin:
             strict_terms.append(
                 f"max_tail_qn_iters={max(0, int(getattr(self.cfg, 'max_tail_qn_iters', 0) or 0))}"
             )
+            if signature_gate_applied is not None:
+                strict_terms.append(f"gate_applied={int(signature_gate_applied > 0.5)}")
             if tangential_step_mode:
                 strict_terms.append(f"tangential_step_mode={tangential_step_mode}")
             if effective_alpha_scale is not None:

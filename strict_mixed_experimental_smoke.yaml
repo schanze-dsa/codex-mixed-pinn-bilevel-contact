@@ -89,7 +89,6 @@ mixed_bilevel_phase:
 
 contact_backend: inner_solver
 max_tail_qn_iters: 4
-normal_ready_max_inner_iters: 16
 
 continuation_caps:
   eps_shrink: 0.7

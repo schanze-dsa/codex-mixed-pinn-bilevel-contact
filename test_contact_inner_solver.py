@@ -20,7 +20,7 @@ if SRC not in sys.path:
 import numpy as np
 
 from physics.contact.contact_operator import ContactOperator, StrictMixedContactInputs
-from physics.contact.contact_inner_solver import ContactInnerState, solve_contact_inner
+from physics.contact.contact_inner_solver import ContactInnerResult, ContactInnerState, solve_contact_inner
 from physics.contact.contact_inner_kernel_primitives import (
     friction_fixed_point_residual,
     inner_normal_residual,
@@ -30,6 +30,60 @@ from physics.contact.contact_inner_kernel_primitives import (
 
 
 class ContactInnerSolverTests(unittest.TestCase):
+    def _strict_inputs(self):
+        return StrictMixedContactInputs(
+            g_n=tf.constant([-0.5], dtype=tf.float32),
+            ds_t=tf.constant([[0.25, 0.05]], dtype=tf.float32),
+            normals=tf.constant([[0.0, 1.0, 0.0]], dtype=tf.float32),
+            t1=tf.constant([[1.0, 0.0, 0.0]], dtype=tf.float32),
+            t2=tf.constant([[0.0, 0.0, 1.0]], dtype=tf.float32),
+            weights=tf.ones((1,), dtype=tf.float32),
+            xs=tf.zeros((1, 3), dtype=tf.float32),
+            xm=tf.zeros((1, 3), dtype=tf.float32),
+            mu=tf.constant(0.3, dtype=tf.float32),
+            eps_n=tf.constant(1.0e-6, dtype=tf.float32),
+            k_t=tf.constant(10.0, dtype=tf.float32),
+        )
+
+    def _mock_inner_result(self, iterations, *, mode, alpha, reason="iteration_budget_exhausted"):
+        trace_rows = []
+        ft_after = None
+        for index, (before, after) in enumerate(iterations, start=1):
+            trace_rows.append(
+                {
+                    "iter": 5 + index,
+                    "ft_residual_before": before,
+                    "ft_residual_after": after,
+                    "tangential_step_mode": mode,
+                    "effective_alpha_scale": alpha,
+                    "tail_has_effective_step": after < before,
+                }
+            )
+            ft_after = after
+        state = ContactInnerState(
+            lambda_n=tf.constant([0.5], dtype=tf.float32),
+            lambda_t=tf.constant([[0.1, 0.0]], dtype=tf.float32),
+            converged=False,
+            iters=len(trace_rows),
+            res_norm=float(ft_after or 0.0),
+            fallback_used=True,
+        )
+        return ContactInnerResult(
+            state=state,
+            traction_vec=tf.constant([[0.0, 0.1, 0.0]], dtype=tf.float32),
+            traction_tangent=tf.constant([[0.1, 0.0]], dtype=tf.float32),
+            diagnostics={
+                "ft_residual_norm": tf.constant(float(ft_after or 0.0), dtype=tf.float32),
+                "fallback_used": tf.constant(1.0, dtype=tf.float32),
+                "converged": tf.constant(0.0, dtype=tf.float32),
+                "iteration_trace": {
+                    "fallback_trigger_reason": reason,
+                    "iterations": trace_rows,
+                },
+            },
+            linearization=None,
+        )
+
     def test_contact_operator_inner_solver_backend_marks_strict_mixed_path(self):
         op = ContactOperator()
 
@@ -280,6 +334,63 @@ class ContactInnerSolverTests(unittest.TestCase):
 
         self.assertAlmostEqual(first["target_lambda_t_norm"], expected_target_norm, places=6)
         self.assertAlmostEqual(first["ft_reduction_ratio"], expected_ratio, places=6)
+
+    def test_contact_operator_replays_with_inner16_only_for_b_signature(self):
+        op = ContactOperator()
+        strict_inputs = self._strict_inputs()
+        baseline = self._mock_inner_result(
+            [(1.8e-3, 1.6e-3), (1.6e-3, 1.5e-3), (1.5e-3, 1.47e-3)],
+            mode="residual_driven",
+            alpha=1.0,
+        )
+        replay = self._mock_inner_result(
+            [(1.03e-3, 1.00e-3), (1.00e-3, 9.8e-4), (9.8e-4, 9.5e-4)],
+            mode="residual_driven",
+            alpha=1.0,
+        )
+
+        with patch("physics.contact.contact_operator.solve_contact_inner", side_effect=[baseline, replay]) as mock_solve:
+            result = op.solve_strict_inner(
+                lambda X, params=None: tf.zeros_like(X),
+                params={},
+                strict_inputs=strict_inputs,
+                return_iteration_trace=True,
+                max_inner_iters=8,
+                max_inner_iters_signature_gate="b",
+                signature_gated_max_inner_iters=16,
+            )
+
+        self.assertEqual(mock_solve.call_count, 2)
+        self.assertEqual(mock_solve.call_args_list[0].kwargs["max_inner_iters"], 8)
+        self.assertEqual(mock_solve.call_args_list[1].kwargs["max_inner_iters"], 16)
+        self.assertAlmostEqual(float(result.diagnostics["signature_gate_applied"]), 1.0, places=7)
+        self.assertEqual(result.diagnostics["signature_gate_name"], "b")
+        self.assertAlmostEqual(float(result.diagnostics["ft_residual_norm"].numpy()), 9.5e-4, places=7)
+
+    def test_contact_operator_keeps_non_b_case_on_baseline_budget(self):
+        op = ContactOperator()
+        strict_inputs = self._strict_inputs()
+        non_b = self._mock_inner_result(
+            [(1.75e-2, 1.75e-2), (1.75e-2, 1.75e-2), (1.75e-2, 1.75e-2)],
+            mode="residual_driven_tail_qn",
+            alpha=0.0,
+        )
+
+        with patch("physics.contact.contact_operator.solve_contact_inner", return_value=non_b) as mock_solve:
+            result = op.solve_strict_inner(
+                lambda X, params=None: tf.zeros_like(X),
+                params={},
+                strict_inputs=strict_inputs,
+                return_iteration_trace=True,
+                max_inner_iters=8,
+                max_inner_iters_signature_gate="b",
+                signature_gated_max_inner_iters=16,
+            )
+
+        self.assertEqual(mock_solve.call_count, 1)
+        self.assertEqual(mock_solve.call_args.kwargs["max_inner_iters"], 8)
+        self.assertAlmostEqual(float(result.diagnostics["signature_gate_applied"]), 0.0, places=7)
+        self.assertEqual(result.diagnostics["signature_gate_name"], "")
 
     def test_residual_driven_tangential_step_reduces_aligned_residual_on_first_iteration(self):
         g_n = tf.constant([-0.5], dtype=tf.float32)

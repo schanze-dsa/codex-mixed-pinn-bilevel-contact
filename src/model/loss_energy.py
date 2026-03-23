@@ -337,9 +337,14 @@ class TotalEnergy:
         max_tail_qn_iters = int(self.mixed_bilevel_flags.get("max_tail_qn_iters", 0) or 0)
         if max_tail_qn_iters > 0:
             solve_kwargs["max_tail_qn_iters"] = max_tail_qn_iters
-        normal_ready_max_inner_iters = int(self.mixed_bilevel_flags.get("normal_ready_max_inner_iters", 0) or 0)
-        if route_mode == "normal_ready" and normal_ready_max_inner_iters > 0:
-            solve_kwargs["max_inner_iters"] = normal_ready_max_inner_iters
+        signature_gate = str(self.mixed_bilevel_flags.get("max_inner_iters_signature_gate", "") or "").strip()
+        signature_gated_max_inner_iters = int(
+            self.mixed_bilevel_flags.get("signature_gated_max_inner_iters", 0) or 0
+        )
+        if route_mode == "normal_ready" and signature_gate and signature_gated_max_inner_iters > 0:
+            solve_kwargs["return_iteration_trace"] = True
+            solve_kwargs["max_inner_iters_signature_gate"] = signature_gate
+            solve_kwargs["signature_gated_max_inner_iters"] = signature_gated_max_inner_iters
         if route_mode in {"normal_ready", "full_ift"}:
             solve_kwargs["return_linearization"] = True
         while True:
@@ -353,7 +358,13 @@ class TotalEnergy:
             except TypeError as exc:
                 message = str(exc)
                 removed = False
-                for key in ("return_linearization", "max_tail_qn_iters", "max_inner_iters"):
+                for key in (
+                    "return_linearization",
+                    "max_tail_qn_iters",
+                    "return_iteration_trace",
+                    "max_inner_iters_signature_gate",
+                    "signature_gated_max_inner_iters",
+                ):
                     if key in message and key in solve_kwargs:
                         solve_kwargs.pop(key, None)
                         removed = True
@@ -430,11 +441,13 @@ class TotalEnergy:
         tangential_step_norm = tf.cast(diagnostics.get("tangential_step_norm", zero), dtype)
         fallback_used = tf.cast(diagnostics.get("fallback_used", zero), dtype)
         converged = tf.cast(diagnostics.get("converged", tf.cast(1.0, dtype) - fallback_used), dtype)
+        signature_gate_applied = tf.cast(diagnostics.get("signature_gate_applied", zero), dtype)
         ft_residual_norm = ft_norm
         effective_alpha_scale = zero
         tail_has_effective_step = zero
         tangential_step_mode = ""
         fallback_trigger_reason = ""
+        signature_gate_name = str(diagnostics.get("signature_gate_name", "") or "")
         trace = diagnostics.get("iteration_trace")
         if isinstance(trace, dict):
             fallback_trigger_reason = str(trace.get("fallback_trigger_reason", "") or "")
@@ -492,6 +505,7 @@ class TotalEnergy:
             "inner_normal_step_norm": normal_step_norm,
             "inner_tangential_step_norm": tangential_step_norm,
             "inner_fallback_used": fallback_used,
+            "signature_gate_applied": signature_gate_applied,
             "ft_residual_norm": ft_residual_norm,
             "effective_alpha_scale": effective_alpha_scale,
             "tail_has_effective_step": tail_has_effective_step,
@@ -505,6 +519,8 @@ class TotalEnergy:
             stats["tangential_step_mode"] = tf.constant(tangential_step_mode, dtype=tf.string)
         if fallback_trigger_reason:
             stats["fallback_trigger_reason"] = tf.constant(fallback_trigger_reason, dtype=tf.string)
+        if signature_gate_name:
+            stats["signature_gate_name"] = tf.constant(signature_gate_name, dtype=tf.string)
         stats.update(normal_ift_stats)
         stats.update(
             {
